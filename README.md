@@ -85,6 +85,11 @@ Changed current or historical symlinks always fail the claim check. Root-level
 Sergeant transport files are excluded because Sergeant, not a Specialist, owns
 them.
 
+Opaque project/task/fleet/model/risk/correlation IDs are 1-128 ASCII characters
+from `[A-Za-z0-9._-]`; exact `.` and every `..` substring are rejected at the
+manifest, command, fleet, and durable-state seams. The published schema is
+compiled in tests and shares negative lexical fixtures with runtime validation.
+
 Semantic claims are normalized to lowercase hyphenated names. Migration, state
 machine, authorization, identity, recovery, purge, release, destructive, and
 repository-integration claims are repository-exclusive, including qualified
@@ -97,13 +102,14 @@ into Platoon state.
 
 ## Lifecycle
 
-An applied start snapshots the canonical intent into the restrictive run
-directory, binds both source and normalized manifest digests, and writes a local
-run before invoking dagr. Dagr workflows contain no hooks: readiness can enqueue
-work, but only the fenced admission transaction can dispatch Sergeant. Workflow
-and stage IDs are persisted before run start. If start output is lost, read-only
-dagr inspection recovers exactly one full run ID, starts only after proven
-absence, and blocks on multiple matches.
+An applied start reads and validates one immutable manifest byte snapshot,
+publishes the canonical intent and generated workflow into the restrictive run
+directory, then publishes `state.json` last. A crash before state publication
+leaves no authoritative run. Dagr workflows contain no hooks: readiness can
+enqueue work, but only the fenced admission transaction can dispatch Sergeant.
+Workflow and stage IDs are persisted before run start. If start output is lost,
+read-only dagr inspection recovers exactly one full run ID, starts only after
+proven absence, and blocks on multiple matches.
 
 Admission writes a generation-bound `prepared` reservation, then durably moves
 it to `dispatching` immediately before the command. Recovery may dispatch a
@@ -111,8 +117,10 @@ still-prepared reservation exactly once. A dispatching reservation requires
 correlation evidence; proven absence permits one bounded retry, while exhaustion
 or multiple matches blocks. One restrictive user-global lock independent of
 state and fleet roots serializes every local Sergeant dispatch sharing the
-user's credential helper. A verified receipt commits only matching
-one-repository fleet evidence with the exact callback correlation.
+user's credential helper. The stable per-UID authority is derived from the
+operating-system account database, never `HOME`, `TMPDIR`, or XDG variables;
+all lock waits honor the applied command context. A verified receipt commits
+only matching one-repository fleet evidence with the exact callback correlation.
 
 Reconciliation reads Sergeant-owned durable state without modifying it. A token
 is released only after verified `done` plus a non-empty result, or a verified
@@ -120,8 +128,13 @@ is released only after verified `done` plus a non-empty result, or a verified
 dispatch base. Out-of-claim work becomes `out_of_claim`, emits only bounded
 path diagnostics, and never advances dagr.
 
-In-claim success pins the child worktree, dispatch base, result digest, and fleet
-ID in a durable repository queue. At most one candidate per repository is
+In-claim success pins the child worktree, dispatch base, result digest, fleet ID,
+exact `.git` pointer, and physical Git directory in a durable repository queue.
+Diff commands use that pinned directory, a private temporary index, no
+replacement objects, and a filtered `GIT_*` environment, so child index flags or
+redirected metadata cannot hide changes. A user-global registry blocks
+overlapping claims across arbitrary state roots, and a global integration lock
+serializes candidate commands across those roots. At most one candidate is
 `integrating`. The child must contain the current repository base; repository
 and stage acceptance commands then run in its worktree. Terminal identity and
 all claims are checked both before and after those commands. Evidence drift or a
@@ -143,7 +156,8 @@ the complete stage, reservation, lease, and recovery model.
 - Prior generations fail closed. Live, foreign-host, or ambiguous leases cannot
   be stolen.
 - Adapter execution has timeouts and separate bounded stdout/stderr. Failed
-  command output is not returned in errors or persisted.
+  command output is not returned in errors or persisted. Commands run in their
+  own process group; timeout kills descendants and bounds pipe waiting.
 - Fleet files are bounded, stable-read, regular non-symlinks with strict binding
   to exactly one repository plus project, task, stage, issue branch, callback
   correlation, and intent revision.
@@ -168,10 +182,16 @@ dispatch, terminal evidence, claim verification, merge queue, dependency unlock,
 and completion. GitHub Actions runs tests on macOS and Linux, the race detector,
 vet, and the fake demonstration.
 
+CI also compares each push or pull-request change set with its proper Git base.
+Operator-visible source, schema, examples, installation, or lifecycle changes
+fail unless the `README.md` blob changes in the same change set.
+
 ## Limitations
 
 - The first release provides one active Commander per local state root, not
   distributed consensus across hosts.
+- The per-user cross-root claim registry is conservative after ambiguous owner
+  loss: stale active claims continue blocking rather than being discarded.
 - Dagr and Sergeant expose human-oriented command receipts and file-state
   contracts rather than versioned JSON APIs. Platoon parses only the documented
   compatibility profile. Dagr crash recovery additionally performs one bounded

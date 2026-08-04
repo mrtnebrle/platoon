@@ -54,3 +54,16 @@ func TestSergeantDispatchRejectsAmbiguousReceiptWithoutLeakingOutput(t *testing.
 		})
 	}
 }
+
+func TestSergeantDispatchRejectsPathUnsafeIDsBeforeExecution(t *testing.T) {
+	executor := &sequenceExecutor{}
+	client := NewSergeantCLI(manifest.Command{Executable: "sgt-dispatch"}, executor, time.Minute, 4096)
+	_, err := client.Dispatch(context.Background(), DispatchRequest{
+		Project: "synthetic-project", Task: "task-a", Repository: "..", Branch: "feat/test",
+		Harness: "opencode", Stage: "stage-a", IntentFile: "intent.md",
+		OriginProfile: "platoon-local", CorrelationID: "run-a-stage-a",
+	})
+	if err == nil || len(executor.invocations) != 0 {
+		t.Fatalf("unsafe ID reached executor: err=%v invocations=%d", err, len(executor.invocations))
+	}
+}

@@ -2,15 +2,18 @@ package manifest
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/mrtnebrle/platoon/internal/opaqueid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -117,30 +120,39 @@ type Claims struct {
 }
 
 func LoadFile(file string) (*Manifest, error) {
+	result, _, err := LoadFileSnapshot(file)
+	return result, err
+}
+
+func LoadFileSnapshot(file string) (*Manifest, []byte, error) {
 	info, err := os.Lstat(file)
 	if err != nil {
-		return nil, fmt.Errorf("manifest: %w", err)
+		return nil, nil, fmt.Errorf("manifest: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("manifest must be a regular file, not a symlink or device")
+		return nil, nil, errors.New("manifest must be a regular file, not a symlink or device")
 	}
 	if info.Size() > maxManifestSize {
-		return nil, fmt.Errorf("manifest exceeds %d bytes", maxManifestSize)
+		return nil, nil, fmt.Errorf("manifest exceeds %d bytes", maxManifestSize)
 	}
 	handle, err := os.Open(file)
 	if err != nil {
-		return nil, fmt.Errorf("manifest: %w", err)
+		return nil, nil, fmt.Errorf("manifest: %w", err)
 	}
 	defer handle.Close()
 	opened, err := handle.Stat()
 	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
-		return nil, errors.New("manifest changed while opening")
+		return nil, nil, errors.New("manifest changed while opening")
 	}
 	raw, err := io.ReadAll(io.LimitReader(handle, maxManifestSize+1))
 	if err != nil || len(raw) > maxManifestSize {
-		return nil, errors.New("manifest could not be read within its size limit")
+		return nil, nil, errors.New("manifest could not be read within its size limit")
 	}
-	return Load(raw)
+	result, err := Load(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, bytes.Clone(raw), nil
 }
 
 func Load(raw []byte) (*Manifest, error) {
@@ -434,6 +446,58 @@ func (m *Manifest) Stage(id string) (Stage, bool) {
 	return Stage{}, false
 }
 
+func ResolveRuntimePaths(source *Manifest, sourceFile string) (*Manifest, error) {
+	raw, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	var result Manifest
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	manifestPath, err := filepath.Abs(sourceFile)
+	if err != nil {
+		return nil, err
+	}
+	base := filepath.Dir(manifestPath)
+	result.Spec.Adapters.Dagr.Database = resolveRuntimePath(base, result.Spec.Adapters.Dagr.Database)
+	result.Spec.Adapters.Dagr.Executable = resolveRuntimeExecutable(base, result.Spec.Adapters.Dagr.Executable)
+	result.Spec.Adapters.Dagr.InspectExecutable = resolveRuntimeExecutable(base, result.Spec.Adapters.Dagr.InspectExecutable)
+	result.Spec.Adapters.Sergeant.FleetRoot = resolveRuntimePath(base, result.Spec.Adapters.Sergeant.FleetRoot)
+	result.Spec.Adapters.Sergeant.Dispatch.Executable = resolveRuntimeExecutable(base, result.Spec.Adapters.Sergeant.Dispatch.Executable)
+	result.Spec.Adapters.Sergeant.Watch.Executable = resolveRuntimeExecutable(base, result.Spec.Adapters.Sergeant.Watch.Executable)
+	result.Spec.Adapters.Sergeant.Wake.Executable = resolveRuntimeExecutable(base, result.Spec.Adapters.Sergeant.Wake.Executable)
+	result.Spec.Adapters.Sergeant.Drain.Executable = resolveRuntimeExecutable(base, result.Spec.Adapters.Sergeant.Drain.Executable)
+	for repositoryIndex := range result.Spec.Repositories {
+		repository := &result.Spec.Repositories[repositoryIndex]
+		repository.Path = resolveRuntimePath(base, repository.Path)
+		for commandIndex := range repository.Integration {
+			repository.Integration[commandIndex].Executable = resolveRuntimeExecutable(base, repository.Integration[commandIndex].Executable)
+		}
+	}
+	for stageIndex := range result.Spec.Stages {
+		for commandIndex := range result.Spec.Stages[stageIndex].Acceptance {
+			command := &result.Spec.Stages[stageIndex].Acceptance[commandIndex]
+			command.Executable = resolveRuntimeExecutable(base, command.Executable)
+		}
+	}
+	return &result, nil
+}
+
+func resolveRuntimePath(base, value string) string {
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	return filepath.Join(base, filepath.FromSlash(value))
+}
+
+func resolveRuntimeExecutable(base, value string) string {
+	if filepath.IsAbs(value) || (!strings.Contains(value, "/") && !strings.Contains(value, `\`)) {
+		return value
+	}
+	return resolveRuntimePath(base, value)
+}
+
 func ValidateClaimPath(value string) error {
 	if value == "" || path.IsAbs(value) || strings.Contains(value, "\\") || strings.ContainsRune(value, 0) || hasControl(value) {
 		return errors.New("claim must be a non-empty relative slash path")
@@ -526,6 +590,9 @@ func validateYAMLTypes(node *yaml.Node, field string) error {
 			}
 		} else if node.Tag != "!!str" {
 			return fmt.Errorf("%s must be a string", field)
+		}
+		if field == "spec.stages[].adoptFleet" && node.Value == "" {
+			return errors.New("spec.stages[].adoptFleet must not be empty when present")
 		}
 	}
 	return nil
@@ -686,7 +753,7 @@ func validateExecutable(name, executable string, args []string) error {
 }
 
 func validateSlug(name, value string) error {
-	if !slugPattern.MatchString(value) {
+	if !slugPattern.MatchString(value) || !opaqueid.Valid(value) {
 		return fmt.Errorf("%s must be a lowercase slug", name)
 	}
 	return nil
@@ -718,15 +785,7 @@ func validateDuration(name, value string) error {
 }
 
 func validOpaqueID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	for _, r := range value {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
-			return false
-		}
-	}
-	return true
+	return opaqueid.Valid(value)
 }
 
 func validHarness(value string) bool {

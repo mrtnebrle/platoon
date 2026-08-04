@@ -9,7 +9,7 @@ as state-machine changes rather than ordinary CLI refactors.
 2. Add one failing behavioral test at a public seam.
 3. Implement only enough of that vertical slice to pass.
 4. Run focused tests while iterating.
-5. Update `README.md` in the same commit whenever a command, manifest field,
+5. Update `README.md` in the same change set whenever a command, manifest field,
    lifecycle transition, installation step, safety invariant, limitation, or
    example changes.
 6. Before review, run `make test`, `make race`, `make vet`, and `make demo`.
@@ -25,7 +25,7 @@ credentials, command output, fleet evidence, or internal product names.
 - Journal intent before external mutation and make recovery idempotent.
 - Treat missing, stale, malformed, or ambiguous evidence as a blocker.
 - Invoke commands with argument arrays and bounded output; do not add shell
-  interpolation.
+  interpolation. Preserve process-group cancellation and bounded pipe waiting.
 - Do not write Sergeant child state, change global identity, merge, or push.
 - Preserve restrictive state permissions and symlink defenses.
 

@@ -72,6 +72,14 @@ func TestFleetReaderFailsClosedOnMismatchedOrSymlinkEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
+		"git pointer mismatch": func(t *testing.T, repoDir string) {
+			raw, err := os.ReadFile(filepath.Join(repoDir, "worktree"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			worktree := strings.TrimSpace(string(raw))
+			writeOwned(t, filepath.Join(worktree, ".git"), "gitdir: /different/git-dir\n")
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "fleets")
@@ -135,6 +143,41 @@ func TestFleetReaderRequiresDispatchCorrelationWhenRequested(t *testing.T) {
 	}
 }
 
+func TestFleetReaderRejectsSamePathGitDirectoryReplacement(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fleets")
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	revision := strings.Repeat("b", 64)
+	writeFleet(t, root, "synthetic-fleet-a", "synthetic-api", worktree, revision)
+	reader := NewFleetReader(root)
+	binding := FleetBinding{
+		Project: "synthetic-project", Task: "task-build-api", Stage: "build-api",
+		Branch: "feat/synthetic-build-api", IntentRevision: revision,
+	}
+	evidence, err := reader.Read("synthetic-fleet-a", "synthetic-api", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.Worktree = evidence.Worktree
+	binding.WorktreeGitPointer = evidence.WorktreeGitPointer
+	binding.WorktreeGitDir = evidence.WorktreeGitDir
+	binding.InitialSHA = evidence.InitialSHA
+	binding.WorktreeIdentity = evidence.WorktreeIdentity
+	binding.GitDirIdentity = evidence.GitDirIdentity
+	oldGitDir := evidence.WorktreeGitDir + "-old"
+	if err := os.Rename(evidence.WorktreeGitDir, oldGitDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(evidence.WorktreeGitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read("synthetic-fleet-a", "synthetic-api", binding); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("same-path Git directory replacement error = %v", err)
+	}
+}
+
 func TestFleetReaderFindsExactlyCorrelatedFleets(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "fleets")
 	for _, fleet := range []string{"synthetic-fleet-b", "synthetic-fleet-a"} {
@@ -168,6 +211,7 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 	writeFile(t, filepath.Join(repository, "internal", "api", "existing.go"), "package api\n")
 	writeFile(t, filepath.Join(repository, "internal", "old", "move.go"), "package old\n")
 	writeFile(t, filepath.Join(repository, "docs", "delete.md"), "delete me\n")
+	writeFile(t, filepath.Join(repository, "outside", "hidden.go"), "package outside\n")
 	writeFile(t, filepath.Join(repository, ".gitignore"), "ignored.tmp\n")
 	if err := os.Symlink("delete.md", filepath.Join(repository, "docs", "old-link")); err != nil {
 		t.Fatal(err)
@@ -178,6 +222,13 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 	runGit(t, repository, "add", ".")
 	runGit(t, repository, "commit", "-m", "base")
 	base := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repository, "outside", "hidden.go"), "package outside\n// committed change\n")
+	runGit(t, repository, "add", "outside/hidden.go")
+	runGit(t, repository, "commit", "-m", "hidden change")
+	changedHead := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	runGit(t, repository, "replace", base, changedHead)
+	runGit(t, repository, "update-index", "--assume-unchanged", "outside/hidden.go")
+	writeFile(t, filepath.Join(repository, "outside", "hidden.go"), "package outside\n// concealed working change\n")
 
 	writeFile(t, filepath.Join(repository, "internal", "api", "existing.go"), "package api\n// changed\n")
 	if err := os.Rename(filepath.Join(repository, "internal", "old", "move.go"), filepath.Join(repository, "outside.go")); err != nil {
@@ -201,7 +252,10 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 	}
 
 	inspector := NewGitInspector(OSExecutor{}, time.Minute, 64<<10)
-	changed, err := inspector.ChangedPaths(context.Background(), repository, base)
+	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "decoy-git-dir"))
+	t.Setenv("GIT_WORK_TREE", filepath.Join(t.TempDir(), "decoy-worktree"))
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(t.TempDir(), "decoy-index"))
+	changed, err := inspector.ChangedPaths(context.Background(), repository, filepath.Join(repository, ".git"), base)
 	if err != nil {
 		t.Fatalf("ChangedPaths() error = %v", err)
 	}
@@ -210,7 +264,7 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 		got = append(got, item.Path)
 	}
 	sort.Strings(got)
-	want := []string{"docs/delete.md", "docs/old-link", "docs/replaced-link", "ignored.tmp", "internal/api/existing.go", "internal/api/link.go", "internal/api/new.go", "internal/old/move.go", "outside.go"}
+	want := []string{"docs/delete.md", "docs/old-link", "docs/replaced-link", "ignored.tmp", "internal/api/existing.go", "internal/api/link.go", "internal/api/new.go", "internal/old/move.go", "outside.go", "outside/hidden.go"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ChangedPaths() = %#v, want %#v", got, want)
 	}
@@ -233,7 +287,7 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 		}
 	}
 	sort.Strings(violationPaths)
-	wantViolations := []string{"docs/delete.md", "docs/old-link", "docs/replaced-link", "ignored.tmp", "internal/api/link.go", "internal/old/move.go", "outside.go"}
+	wantViolations := []string{"docs/delete.md", "docs/old-link", "docs/replaced-link", "ignored.tmp", "internal/api/link.go", "internal/old/move.go", "outside.go", "outside/hidden.go"}
 	if !reflect.DeepEqual(violationPaths, wantViolations) {
 		t.Fatalf("violations = %#v, want %#v", violationPaths, wantViolations)
 	}
@@ -241,6 +295,12 @@ func TestGitInspectorAccountsForTrackedRenamedDeletedUntrackedAndSymlinkPaths(t 
 
 func writeFleet(t *testing.T, root, fleet, repo, worktree, revision string) string {
 	t.Helper()
+	gitDir := filepath.Join(worktree, "git-data")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitPointer := "gitdir: " + gitDir
+	writeOwned(t, filepath.Join(worktree, ".git"), gitPointer+"\n")
 	repoDir := filepath.Join(root, fleet, repo)
 	if err := os.MkdirAll(repoDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -253,6 +313,8 @@ func writeFleet(t *testing.T, root, fleet, repo, worktree, revision string) stri
 	writeOwned(t, filepath.Join(repoDir, "branch"), "feat/synthetic-build-api\n")
 	writeOwned(t, filepath.Join(repoDir, "status"), "in_progress\n")
 	writeOwned(t, filepath.Join(repoDir, "worktree"), worktree+"\n")
+	writeOwned(t, filepath.Join(repoDir, "worktree_git_pointer"), gitPointer+"\n")
+	writeOwned(t, filepath.Join(repoDir, "worktree_git_dir"), gitDir+"\n")
 	writeOwned(t, filepath.Join(repoDir, "initial_sha"), strings.Repeat("c", 40)+"\n")
 	return repoDir
 }

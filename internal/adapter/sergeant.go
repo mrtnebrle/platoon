@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mrtnebrle/platoon/internal/manifest"
+	"github.com/mrtnebrle/platoon/internal/opaqueid"
 )
 
 type DispatchRequest struct {
@@ -37,9 +38,9 @@ func NewSergeantCLI(command manifest.Command, executor Executor, timeout time.Du
 }
 
 func (s *SergeantCLI) Dispatch(ctx context.Context, request DispatchRequest) (string, error) {
-	if request.Project == "" || request.Task == "" || request.Repository == "" || request.Branch == "" ||
-		request.Harness == "" || request.Stage == "" || request.IntentFile == "" ||
-		request.OriginProfile == "" || request.CorrelationID == "" {
+	if !opaqueid.Valid(request.Project) || !opaqueid.Valid(request.Task) || !opaqueid.Valid(request.Repository) ||
+		request.Branch == "" || request.Harness == "" || !opaqueid.Valid(request.Stage) || request.IntentFile == "" ||
+		!opaqueid.Valid(request.OriginProfile) || !opaqueid.Valid(request.CorrelationID) {
 		return "", errors.New("Sergeant dispatch request is incomplete")
 	}
 	args := append([]string(nil), s.command.Args...)
@@ -87,13 +88,5 @@ func parseDispatchReceipt(output []byte) (string, error) {
 }
 
 func safeOpaqueID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	for _, r := range value {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
-			return false
-		}
-	}
-	return true
+	return opaqueid.Valid(value)
 }

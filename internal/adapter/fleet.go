@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mrtnebrle/platoon/internal/manifest"
@@ -48,16 +49,26 @@ type FleetBinding struct {
 	RequireCorrelation bool
 	OriginProfile      string
 	CorrelationID      string
+	Worktree           string
+	WorktreeGitPointer string
+	WorktreeGitDir     string
+	InitialSHA         string
+	WorktreeIdentity   string
+	GitDirIdentity     string
 }
 
 type FleetEvidence struct {
-	FleetID        string
-	Repository     string
-	Status         FleetStatus
-	ResultDigest   string
-	Worktree       string
-	InitialSHA     string
-	IntentRevision string
+	FleetID            string
+	Repository         string
+	Status             FleetStatus
+	ResultDigest       string
+	Worktree           string
+	InitialSHA         string
+	IntentRevision     string
+	WorktreeGitPointer string
+	WorktreeGitDir     string
+	WorktreeIdentity   string
+	GitDirIdentity     string
 }
 
 type FleetReader struct {
@@ -139,6 +150,25 @@ func (r *FleetReader) Read(fleetID, repository string, binding FleetBinding) (Fl
 	if err := requireRealDirectory(worktree); err != nil {
 		return FleetEvidence{}, errors.New("fleet worktree is not a real directory")
 	}
+	gitPointer, err := readStableText(filepath.Join(repoDir, "worktree_git_pointer"), maxFleetField, true)
+	if err != nil {
+		return FleetEvidence{}, errors.New("fleet Git pointer evidence is unavailable")
+	}
+	gitDir, err := readStableText(filepath.Join(repoDir, "worktree_git_dir"), maxFleetField, true)
+	if err != nil {
+		return FleetEvidence{}, errors.New("fleet Git directory evidence is unavailable")
+	}
+	if err := VerifyWorktreeGitIdentity(worktree, gitPointer, gitDir); err != nil {
+		return FleetEvidence{}, err
+	}
+	worktreeIdentity, err := filesystemIdentity(worktree)
+	if err != nil {
+		return FleetEvidence{}, err
+	}
+	gitDirIdentity, err := filesystemIdentity(gitDir)
+	if err != nil {
+		return FleetEvidence{}, err
+	}
 	initialSHA, err := readStableText(filepath.Join(repoDir, "initial_sha"), 256, true)
 	if err != nil || !validGitHash(initialSHA) {
 		return FleetEvidence{}, errors.New("fleet dispatch base evidence is invalid")
@@ -146,6 +176,16 @@ func (r *FleetReader) Read(fleetID, repository string, binding FleetBinding) (Fl
 	evidence := FleetEvidence{
 		FleetID: fleetID, Repository: repository, Status: status, Worktree: worktree,
 		InitialSHA: initialSHA, IntentRevision: binding.IntentRevision,
+		WorktreeGitPointer: gitPointer, WorktreeGitDir: gitDir,
+		WorktreeIdentity: worktreeIdentity, GitDirIdentity: gitDirIdentity,
+	}
+	if (binding.Worktree != "" && binding.Worktree != evidence.Worktree) ||
+		(binding.WorktreeGitPointer != "" && binding.WorktreeGitPointer != evidence.WorktreeGitPointer) ||
+		(binding.WorktreeGitDir != "" && binding.WorktreeGitDir != evidence.WorktreeGitDir) ||
+		(binding.InitialSHA != "" && binding.InitialSHA != evidence.InitialSHA) ||
+		(binding.WorktreeIdentity != "" && binding.WorktreeIdentity != evidence.WorktreeIdentity) ||
+		(binding.GitDirIdentity != "" && binding.GitDirIdentity != evidence.GitDirIdentity) {
+		return FleetEvidence{}, errors.New("fleet Git identity changed after initial verification")
 	}
 	if status == FleetDone {
 		result, err := readStableBytes(filepath.Join(repoDir, "result"), maxFleetField)
@@ -156,6 +196,41 @@ func (r *FleetReader) Read(fleetID, repository string, binding FleetBinding) (Fl
 		evidence.ResultDigest = hex.EncodeToString(sum[:])
 	}
 	return evidence, nil
+}
+
+func filesystemIdentity(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", errors.New("filesystem identity is unavailable")
+	}
+	return fmt.Sprintf("%d:%d", stat.Dev, stat.Ino), nil
+}
+
+func VerifyWorktreeGitIdentity(worktree, pointer, recordedGitDir string) error {
+	if !filepath.IsAbs(worktree) || !filepath.IsAbs(recordedGitDir) {
+		return errors.New("fleet Git identity paths must be absolute")
+	}
+	livePointer, err := readStableText(filepath.Join(worktree, ".git"), maxFleetField, true)
+	if err != nil || livePointer != pointer || !strings.HasPrefix(pointer, "gitdir: ") {
+		return errors.New("worktree Git pointer does not match durable evidence")
+	}
+	target := strings.TrimPrefix(pointer, "gitdir: ")
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(worktree, target)
+	}
+	targetInfo, err := os.Stat(filepath.Clean(target))
+	if err != nil || !targetInfo.IsDir() {
+		return errors.New("worktree Git directory target is unavailable")
+	}
+	recordedInfo, err := os.Stat(recordedGitDir)
+	if err != nil || !recordedInfo.IsDir() || !os.SameFile(targetInfo, recordedInfo) {
+		return errors.New("worktree Git directory does not match durable evidence")
+	}
+	return nil
 }
 
 func (r *FleetReader) FindByCorrelation(profile, correlationID string) ([]string, error) {
@@ -250,24 +325,38 @@ func NewGitInspector(executor Executor, timeout time.Duration, maxOutput int) *G
 	return &GitInspector{executor: executor, timeout: timeout, maxOutput: maxOutput}
 }
 
-func (g *GitInspector) ChangedPaths(ctx context.Context, worktree, initialSHA string) ([]ChangedPath, error) {
+func (g *GitInspector) ChangedPaths(ctx context.Context, worktree, gitDir, initialSHA string) ([]ChangedPath, error) {
 	before, statErr := os.Lstat(worktree)
-	if statErr != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 || !validGitHash(initialSHA) {
+	gitBefore, gitStatErr := os.Lstat(gitDir)
+	if statErr != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 ||
+		gitStatErr != nil || !gitBefore.IsDir() || gitBefore.Mode()&os.ModeSymlink != 0 || !validGitHash(initialSHA) {
 		return nil, errors.New("changed-path evidence inputs are invalid")
 	}
-	tracked, err := g.git(ctx, "-C", worktree, "diff", "--name-only", "-z", "--no-renames", initialSHA, "--")
+	temporary, err := os.MkdirTemp("", "platoon-git-index-")
 	if err != nil {
 		return nil, err
 	}
-	untracked, err := g.git(ctx, "-C", worktree, "ls-files", "--others", "-z")
+	defer os.RemoveAll(temporary)
+	if err := os.Chmod(temporary, 0o700); err != nil {
+		return nil, err
+	}
+	environment := gitEvidenceEnvironment(filepath.Join(temporary, "index"))
+	common := []string{
+		"--no-replace-objects", "--no-optional-locks", "--git-dir=" + gitDir, "--work-tree=" + worktree,
+		"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.ignoreStat=false", "-c", "core.sparseCheckout=false",
+	}
+	if _, err := g.git(ctx, environment, append(common, "read-tree", "--no-sparse-checkout", initialSHA+"^{tree}")...); err != nil {
+		return nil, err
+	}
+	rawChanges, err := g.git(ctx, environment, append(common, "diff", "--raw", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", initialSHA, "--")...)
 	if err != nil {
 		return nil, err
 	}
-	rawModes, err := g.git(ctx, "-C", worktree, "diff", "--raw", "-z", "--no-renames", initialSHA, "--")
+	tracked, symlinkPaths, err := parseRawChanges(rawChanges)
 	if err != nil {
 		return nil, err
 	}
-	symlinkPaths, err := parseRawSymlinkPaths(rawModes)
+	untracked, err := g.git(ctx, environment, append(common, "ls-files", "--others", "-z", "--")...)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +364,11 @@ func (g *GitInspector) ChangedPaths(ctx context.Context, worktree, initialSHA st
 	if err != nil || !os.SameFile(before, after) || !after.IsDir() || after.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("worktree identity changed during diff inspection")
 	}
-	paths, err := parseNULPaths(append(tracked, untracked...))
+	gitAfter, err := os.Lstat(gitDir)
+	if err != nil || !os.SameFile(gitBefore, gitAfter) || !gitAfter.IsDir() || gitAfter.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("Git directory identity changed during diff inspection")
+	}
+	paths, err := parseNULPaths(append(encodeNULPaths(tracked), untracked...))
 	if err != nil {
 		return nil, err
 	}
@@ -337,8 +430,8 @@ var sergeantControlFiles = map[string]struct{}{
 	".sergeant-wake-condition":      {},
 }
 
-func (g *GitInspector) git(ctx context.Context, args ...string) ([]byte, error) {
-	result, err := g.executor.Run(ctx, Invocation{Executable: "git", Args: args, Timeout: g.timeout, MaxOutput: g.maxOutput})
+func (g *GitInspector) git(ctx context.Context, environment []string, args ...string) ([]byte, error) {
+	result, err := g.executor.Run(ctx, Invocation{Executable: "git", Args: args, Timeout: g.timeout, MaxOutput: g.maxOutput, Env: environment})
 	if err != nil {
 		return nil, fmt.Errorf("Git evidence command failed: %w", err)
 	}
@@ -493,29 +586,60 @@ func parseNULPaths(raw []byte) ([]string, error) {
 	return result, nil
 }
 
-func parseRawSymlinkPaths(raw []byte) (map[string]bool, error) {
-	result := map[string]bool{}
+func parseRawChanges(raw []byte) ([]string, map[string]bool, error) {
+	symlinks := map[string]bool{}
+	var paths []string
 	if len(raw) == 0 {
-		return result, nil
+		return paths, symlinks, nil
 	}
 	if raw[len(raw)-1] != 0 {
-		return nil, errors.New("Git raw diff output was truncated")
+		return nil, nil, errors.New("Git raw diff output was truncated")
 	}
 	parts := bytes.Split(raw[:len(raw)-1], []byte{0})
 	if len(parts)%2 != 0 {
-		return nil, errors.New("Git raw diff output was malformed")
+		return nil, nil, errors.New("Git raw diff output was malformed")
 	}
 	for index := 0; index < len(parts); index += 2 {
 		fields := strings.Fields(string(parts[index]))
 		if len(fields) != 5 || !strings.HasPrefix(fields[0], ":") || len(parts[index+1]) == 0 {
-			return nil, errors.New("Git raw diff row was malformed")
+			return nil, nil, errors.New("Git raw diff row was malformed")
 		}
 		path := string(parts[index+1])
+		paths = append(paths, path)
 		if strings.TrimPrefix(fields[0], ":") == "120000" || fields[1] == "120000" {
-			result[path] = true
+			symlinks[path] = true
 		}
 	}
-	return result, nil
+	return paths, symlinks, nil
+}
+
+func encodeNULPaths(paths []string) []byte {
+	var result []byte
+	for _, path := range paths {
+		result = append(result, []byte(path)...)
+		result = append(result, 0)
+	}
+	return result
+}
+
+func gitEvidenceEnvironment(indexPath string) []string {
+	environment := make([]string, 0, len(os.Environ())+6)
+	for _, variable := range os.Environ() {
+		name, _, _ := strings.Cut(variable, "=")
+		if strings.HasPrefix(name, "GIT_") {
+			continue
+		}
+		environment = append(environment, variable)
+	}
+	environment = append(environment,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_NO_REPLACE_OBJECTS=1",
+		"GIT_NO_LAZY_FETCH=1",
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_INDEX_FILE="+indexPath,
+	)
+	return environment
 }
 
 func validGitHash(value string) bool {

@@ -45,12 +45,27 @@
   "$defs": {
     "slug": {
       "type": "string",
+	  "maxLength": 128,
       "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "opaqueID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "not": { "pattern": "(^\\.$|\\.\\.)" }
     },
     "relativePath": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^[^/\\\\].*"
+      "pattern": "^[^/\\\\\\x00-\\x1F\\x7F](?:[^\\\\\\x00-\\x1F\\x7F]*[^/\\\\\\x00-\\x1F\\x7F])?$",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.{1,2}(/|$)" },
+          { "pattern": "//" },
+          { "pattern": "[*?\\[\\]{}]" }
+        ]
+      }
     },
     "claimPath": {
       "allOf": [
@@ -100,7 +115,7 @@
           "required": ["fleetRoot", "originProfile", "dispatch", "watch", "wake", "drain"],
           "properties": {
             "fleetRoot": { "type": "string", "minLength": 1 },
-            "originProfile": { "type": "string", "minLength": 1 },
+            "originProfile": { "$ref": "#/$defs/opaqueID" },
             "dispatch": { "$ref": "#/$defs/command" },
             "watch": { "$ref": "#/$defs/command" },
             "wake": { "$ref": "#/$defs/command" },
@@ -114,8 +129,8 @@
       "additionalProperties": false,
       "required": ["model", "risk", "harness"],
       "properties": {
-        "model": { "type": "string", "minLength": 1 },
-        "risk": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "#/$defs/opaqueID" },
+        "risk": { "$ref": "#/$defs/opaqueID" },
         "harness": { "enum": ["opencode", "goose", "claude"] }
       }
     },
@@ -147,15 +162,15 @@
       "properties": {
         "id": { "$ref": "#/$defs/slug", "maxLength": 24 },
         "repository": { "$ref": "#/$defs/slug" },
-        "task": { "type": "string", "minLength": 1 },
+        "task": { "$ref": "#/$defs/opaqueID" },
         "mode": { "enum": ["implementation", "review"] },
         "harness": { "enum": ["opencode", "goose", "claude"] },
-        "model": { "type": "string", "minLength": 1 },
-        "risk": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "#/$defs/opaqueID" },
+        "risk": { "$ref": "#/$defs/opaqueID" },
         "dependsOn": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
         "claims": { "$ref": "#/$defs/claims" },
         "acceptance": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/command" } },
-        "adoptFleet": { "type": "string", "minLength": 1 }
+        "adoptFleet": { "$ref": "#/$defs/opaqueID" }
       }
     }
   }

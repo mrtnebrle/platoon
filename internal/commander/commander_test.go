@@ -2,6 +2,8 @@ package commander
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"github.com/mrtnebrle/platoon/internal/adapter"
 	"github.com/mrtnebrle/platoon/internal/manifest"
 	"github.com/mrtnebrle/platoon/internal/state"
+	"gopkg.in/yaml.v3"
 )
 
 func TestStartAtomicallyHonorsTokenLimits(t *testing.T) {
@@ -45,6 +48,33 @@ func TestStartAtomicallyHonorsTokenLimits(t *testing.T) {
 	}
 	if active != 2 || queued != 1 {
 		t.Fatalf("stage accounting active=%d queued=%d: %#v", active, queued, run.Stages)
+	}
+}
+
+func TestStartUsesValidatedManifestByteSnapshotAfterSourceReplacement(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(implementationStage("build-api", "internal/api", "api-contract"))
+	input := fixture.startInput()
+	expected := sha256.Sum256(input.ManifestBytes)
+	if err := os.WriteFile(fixture.manifestPath, []byte("replaced source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run, err := fixture.commander.Start(context.Background(), m, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ManifestSourceDigest != hex.EncodeToString(expected[:]) {
+		t.Fatalf("manifest source digest = %q", run.ManifestSourceDigest)
+	}
+}
+
+func TestStartRejectsManifestObjectThatDoesNotMatchSnapshot(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(implementationStage("build-api", "internal/api", "api-contract"))
+	input := fixture.startInput()
+	m.Metadata.Name = "different-platoon"
+	if _, err := fixture.commander.Start(context.Background(), m, input); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched manifest error = %v", err)
 	}
 }
 
@@ -274,6 +304,50 @@ func TestStartAdoptsVerifiedFleetAndAccountsForItsToken(t *testing.T) {
 	}
 }
 
+func TestTerminalAdoptedDependentWaitsForDagrReadiness(t *testing.T) {
+	fixture := newFixture(t)
+	first := implementationStage("first", "internal/first", "first-contract")
+	adopted := implementationStage("adopted", "internal/adopted", "adopted-contract")
+	adopted.DependsOn = []string{"first"}
+	adopted.AdoptFleet = "existing-adopted"
+	last := implementationStage("last", "internal/last", "last-contract")
+	last.DependsOn = []string{"adopted"}
+	m := fixture.manifest(first, adopted, last)
+	fixture.fleets.put(adapter.FleetEvidence{
+		FleetID: "existing-adopted", Repository: "synthetic-repo", Status: adapter.FleetDone,
+		ResultDigest: strings.Repeat("e", 64), Worktree: "worktree-adopted",
+		InitialSHA: strings.Repeat("a", 40), IntentRevision: fixture.intentRevision,
+	})
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Stages["adopted"].Status == state.StageDone || fixture.integrator.runCalls != 0 || fixture.dagr.terminalCalls != 0 {
+		t.Fatalf("pending adopted stage advanced: stage=%#v integration=%d dagr=%d", blocked.Stages["adopted"], fixture.integrator.runCalls, fixture.dagr.terminalCalls)
+	}
+	if fixture.dispatcher.count() != 1 || blocked.Stages["last"].FleetID != "" {
+		t.Fatalf("descendant advanced before adopted readiness: %#v", blocked.Stages)
+	}
+	fixture.fleets.setStatus("fleet-first", adapter.FleetDone)
+	afterFirst, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFirst.Stages["adopted"].Status == state.StageDone || fixture.dagr.terminalCalls != 1 {
+		t.Fatalf("adopted stage advanced in stale readiness cycle: %#v", afterFirst.Stages["adopted"])
+	}
+	if _, err := fixture.commander.Reconcile(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.dagr.terminalCalls != 2 {
+		t.Fatalf("ready adopted stage did not advance exactly once: %d", fixture.dagr.terminalCalls)
+	}
+}
+
 func TestConflictingAdoptedClaimsBlockFurtherAdmission(t *testing.T) {
 	fixture := newFixture(t)
 	first := implementationStage("adopt-a", "internal/shared", "shared-contract")
@@ -358,6 +432,111 @@ func TestQueuedCandidateCannotAdvanceAfterLaterOutOfClaimEvidence(t *testing.T) 
 	}
 	if fixture.integrator.runCalls != 1 || fixture.dagr.terminalCalls != 1 {
 		t.Fatalf("invalid candidate advanced: integrations=%d dagr=%d", fixture.integrator.runCalls, fixture.dagr.terminalCalls)
+	}
+}
+
+func TestOutOfClaimStageFreezesAllRunIntegration(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(
+		implementationStage("api", "internal/api", "api-contract"),
+		implementationStage("worker", "internal/worker", "worker-contract"),
+	)
+	m.Spec.Limits.Implementation = 2
+	m.Spec.Repositories[0].MaxWriters = 2
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fleets.setStatus("fleet-api", adapter.FleetDone)
+	fixture.fleets.setStatus("fleet-worker", adapter.FleetDone)
+	fixture.diff.paths["worktree-worker"] = []adapter.ChangedPath{{Path: "outside/worker.go"}}
+	blocked, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Stages["worker"].Status != state.StageOutOfClaim || fixture.integrator.runCalls != 0 || fixture.dagr.terminalCalls != 0 {
+		t.Fatalf("out-of-claim run advanced: stages=%#v integration=%d dagr=%d", blocked.Stages, fixture.integrator.runCalls, fixture.dagr.terminalCalls)
+	}
+}
+
+func TestNewOutOfClaimEvidenceBlocksPendingDagrReplay(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(
+		implementationStage("api", "internal/api", "api-contract"),
+		implementationStage("worker", "internal/worker", "worker-contract"),
+	)
+	m.Spec.Limits.Implementation = 2
+	m.Spec.Repositories[0].MaxWriters = 2
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fleets.setStatus("fleet-api", adapter.FleetDone)
+	fixture.dagr.failTerminal = 1
+	pending, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err == nil || pending.Stages["api"].DagrTerminalPending != "done" {
+		t.Fatalf("pending transition not journaled: %#v err=%v", pending.Stages["api"], err)
+	}
+	fixture.fleets.setStatus("fleet-worker", adapter.FleetDone)
+	fixture.diff.paths["worktree-worker"] = []adapter.ChangedPath{{Path: "outside/worker.go"}}
+	blocked, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Stages["worker"].Status != state.StageOutOfClaim || fixture.dagr.terminalCalls != 0 {
+		t.Fatalf("pending dagr replay bypassed new violation: stages=%#v dagr=%d", blocked.Stages, fixture.dagr.terminalCalls)
+	}
+}
+
+func TestNonSuccessOutOfClaimChildFreezesRun(t *testing.T) {
+	for _, childStatus := range []adapter.FleetStatus{adapter.FleetInProgress, adapter.FleetFailed} {
+		t.Run(string(childStatus), func(t *testing.T) {
+			fixture := newFixture(t)
+			m := fixture.manifest(
+				implementationStage("api", "internal/api", "api-contract"),
+				implementationStage("worker", "internal/worker", "worker-contract"),
+			)
+			m.Spec.Limits.Implementation = 2
+			m.Spec.Repositories[0].MaxWriters = 2
+			run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.fleets.setStatus("fleet-api", adapter.FleetDone)
+			fixture.fleets.setStatus("fleet-worker", childStatus)
+			fixture.diff.paths["worktree-worker"] = []adapter.ChangedPath{{Path: "outside/worker.go"}}
+			blocked, err := fixture.commander.Reconcile(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blocked.Stages["worker"].Status != state.StageOutOfClaim || fixture.integrator.runCalls != 0 || fixture.dagr.terminalCalls != 0 {
+				t.Fatalf("non-success violation advanced: status=%s stages=%#v integration=%d dagr=%d", childStatus, blocked.Stages, fixture.integrator.runCalls, fixture.dagr.terminalCalls)
+			}
+		})
+	}
+}
+
+func TestRecoveredOutOfClaimChildFreezesRunBeforeTransitions(t *testing.T) {
+	for _, childStatus := range []adapter.FleetStatus{adapter.FleetInProgress, adapter.FleetFailed} {
+		t.Run(string(childStatus), func(t *testing.T) {
+			fixture := newFixture(t)
+			fixture.dispatcher.failAfterCreate = true
+			m := fixture.manifest(implementationStage("build-api", "internal/api", "api-contract"))
+			run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+			if err == nil {
+				t.Fatal("Start() unexpectedly passed lost receipt")
+			}
+			fixture.dispatcher.failAfterCreate = false
+			fixture.fleets.setStatus("fleet-build-api", childStatus)
+			fixture.diff.paths["worktree-build-api"] = []adapter.ChangedPath{{Path: "outside/recovered.go"}}
+			blocked, err := fixture.commander.Reconcile(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blocked.Stages["build-api"].Status != state.StageOutOfClaim || fixture.integrator.runCalls != 0 || fixture.dagr.terminalCalls != 0 {
+				t.Fatalf("recovered violation advanced: status=%s stage=%#v integration=%d dagr=%d", childStatus, blocked.Stages["build-api"], fixture.integrator.runCalls, fixture.dagr.terminalCalls)
+			}
+		})
 	}
 }
 
@@ -639,6 +818,64 @@ func TestBaseChangeDuringIntegrationRequeuesCandidate(t *testing.T) {
 	}
 }
 
+func TestCompletedRunReopensStaleMergeReadyCandidate(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(implementationStage("build-api", "internal/api", "api-contract"))
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fleets.setStatus("fleet-build-api", adapter.FleetDone)
+	completed, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil || completed.Status != state.RunCompleted {
+		t.Fatalf("initial completion: status=%q err=%v", completed.Status, err)
+	}
+	fixture.integrator.mu.Lock()
+	fixture.integrator.head = strings.Repeat("f", 40)
+	fixture.integrator.mu.Unlock()
+	reopened, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := reopened.MergeQueue["synthetic-repo"][0]
+	if reopened.Status == state.RunCompleted || candidate.Status != state.CandidateQueued || fixture.integrator.runCalls != 1 {
+		t.Fatalf("terminal stale candidate was not reopened: status=%q candidate=%#v calls=%d", reopened.Status, candidate, fixture.integrator.runCalls)
+	}
+	refreshed, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil || refreshed.Status != state.RunCompleted || fixture.integrator.runCalls != 2 {
+		t.Fatalf("reopened candidate did not reintegrate: status=%q calls=%d err=%v", refreshed.Status, fixture.integrator.runCalls, err)
+	}
+}
+
+func TestActiveRunReopensCompletedStageAfterBaseChange(t *testing.T) {
+	fixture := newFixture(t)
+	m := fixture.manifest(
+		implementationStage("api", "internal/api", "api-contract"),
+		implementationStage("worker", "internal/worker", "worker-contract"),
+	)
+	m.Spec.Limits.Implementation = 2
+	m.Spec.Repositories[0].MaxWriters = 2
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fleets.setStatus("fleet-api", adapter.FleetDone)
+	active, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil || active.Status == state.RunCompleted || active.Stages["api"].Status != state.StageDone {
+		t.Fatalf("expected partially active run: %#v err=%v", active, err)
+	}
+	fixture.integrator.mu.Lock()
+	fixture.integrator.head = strings.Repeat("f", 40)
+	fixture.integrator.mu.Unlock()
+	reopened, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.MergeQueue["synthetic-repo"][0].Status != state.CandidateQueued || reopened.Stages["api"].Status != state.StageCandidate {
+		t.Fatalf("active run retained stale merge-ready evidence: %#v", reopened)
+	}
+}
+
 func TestConcurrentReconciliationCannotDoubleAdmit(t *testing.T) {
 	fixture := newFixture(t)
 	m := fixture.manifest(
@@ -676,13 +913,83 @@ func TestConcurrentReconciliationCannotDoubleAdmit(t *testing.T) {
 	}
 }
 
+func TestSeparateStateRootsRejectOverlappingGlobalClaims(t *testing.T) {
+	authority, err := state.OpenAuthorityAt(filepath.Join(t.TempDir(), "authority"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := t.TempDir()
+	repositoryAlias := filepath.Join(t.TempDir(), "repository-alias")
+	if err := os.Symlink(repository, repositoryAlias); err != nil {
+		t.Fatal(err)
+	}
+	first := newFixture(t)
+	second := newFixture(t)
+	first.commander.authority = authority
+	second.commander.authority = authority
+	firstManifest := first.manifest(implementationStage("first", "internal/shared", "shared-contract"))
+	secondManifest := second.manifest(implementationStage("second", "internal/shared/child", "other-contract"))
+	firstManifest.Spec.Repositories[0].Path = repository
+	secondManifest.Spec.Repositories[0].Path = repositoryAlias
+	if _, err := first.commander.Start(context.Background(), firstManifest, first.startInput()); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := second.commander.Start(context.Background(), secondManifest, second.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.dispatcher.count() != 0 || blocked.Stages["second"].Status != state.StageQueued {
+		t.Fatalf("cross-root overlap admitted: stage=%#v dispatches=%d", blocked.Stages["second"], second.dispatcher.count())
+	}
+}
+
+func TestConflictingCrossRootAdoptionCannotIntegrate(t *testing.T) {
+	authority, err := state.OpenAuthorityAt(filepath.Join(t.TempDir(), "authority"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := t.TempDir()
+	first := newFixture(t)
+	second := newFixture(t)
+	first.commander.authority = authority
+	second.commander.authority = authority
+	firstManifest := first.manifest(implementationStage("first", "internal/shared", "shared-contract"))
+	firstManifest.Spec.Repositories[0].Path = repository
+	if _, err := first.commander.Start(context.Background(), firstManifest, first.startInput()); err != nil {
+		t.Fatal(err)
+	}
+	adopted := implementationStage("adopted", "internal/shared/child", "adopted-contract")
+	adopted.AdoptFleet = "existing-adopted"
+	secondManifest := second.manifest(adopted)
+	secondManifest.Spec.Repositories[0].Path = repository
+	second.fleets.put(adapter.FleetEvidence{
+		FleetID: "existing-adopted", Repository: "synthetic-repo", Status: adapter.FleetDone,
+		ResultDigest: strings.Repeat("e", 64), Worktree: "worktree-adopted",
+		InitialSHA: strings.Repeat("a", 40), IntentRevision: second.intentRevision,
+	})
+	blocked, err := second.commander.Start(context.Background(), secondManifest, second.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked.Stages["adopted"].GlobalClaimConflict {
+		t.Fatalf("adoption conflict not persisted: %#v", blocked.Stages["adopted"])
+	}
+	blocked, err = second.commander.Reconcile(context.Background(), blocked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.integrator.runCalls != 0 || second.dagr.terminalCalls != 0 || !blocked.Stages["adopted"].GlobalClaimConflict {
+		t.Fatalf("conflicting adoption advanced: stage=%#v integration=%d dagr=%d", blocked.Stages["adopted"], second.integrator.runCalls, second.dagr.terminalCalls)
+	}
+}
+
 func TestReservationRemainsPreparedWhileWaitingForDispatchLock(t *testing.T) {
 	fixture := newFixture(t)
 	lockEntered := make(chan struct{})
 	releaseLock := make(chan struct{})
 	lockDone := make(chan error, 1)
 	go func() {
-		lockDone <- fixture.store.WithDispatchLock(func() error {
+		lockDone <- fixture.store.WithDispatchLock(context.Background(), func() error {
 			close(lockEntered)
 			<-releaseLock
 			return nil
@@ -724,7 +1031,7 @@ func TestIntentChangeWhileWaitingForDispatchLockPreventsAdapterCall(t *testing.T
 	releaseLock := make(chan struct{})
 	lockDone := make(chan error, 1)
 	go func() {
-		lockDone <- fixture.store.WithDispatchLock(func() error {
+		lockDone <- fixture.store.WithDispatchLock(context.Background(), func() error {
 			close(lockEntered)
 			<-releaseLock
 			return nil
@@ -943,6 +1250,7 @@ type fixture struct {
 	manifestPath   string
 	store          *state.Store
 	leaseOptions   state.LeaseOptions
+	lastManifest   *manifest.Manifest
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -1010,12 +1318,23 @@ func (f *fixture) manifest(stages ...manifest.Stage) *manifest.Manifest {
 	if err := manifest.Validate(m); err != nil {
 		f.t.Fatalf("test manifest invalid: %v", err)
 	}
+	f.lastManifest = m
 	f.dagr.setManifest(m)
 	return m
 }
 
 func (f *fixture) startInput() StartInput {
-	return StartInput{ManifestPath: f.manifestPath, IntentPath: f.intentPath}
+	if f.lastManifest == nil {
+		f.t.Fatal("test manifest must be created before start input")
+	}
+	raw, err := yaml.Marshal(f.lastManifest)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(f.manifestPath, raw, 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+	return StartInput{ManifestPath: f.manifestPath, ManifestBytes: raw, IntentPath: f.intentPath}
 }
 
 func implementationStage(id, pathClaim, semantic string) manifest.Stage {
@@ -1249,6 +1568,14 @@ func (f *fakeFleets) Read(fleetID, repository string, binding adapter.FleetBindi
 			return adapter.FleetEvidence{}, errors.New("unverified fake correlation")
 		}
 	}
+	if (binding.Worktree != "" && binding.Worktree != evidence.Worktree) ||
+		(binding.WorktreeGitPointer != "" && binding.WorktreeGitPointer != evidence.WorktreeGitPointer) ||
+		(binding.WorktreeGitDir != "" && binding.WorktreeGitDir != evidence.WorktreeGitDir) ||
+		(binding.InitialSHA != "" && binding.InitialSHA != evidence.InitialSHA) ||
+		(binding.WorktreeIdentity != "" && binding.WorktreeIdentity != evidence.WorktreeIdentity) ||
+		(binding.GitDirIdentity != "" && binding.GitDirIdentity != evidence.GitDirIdentity) {
+		return adapter.FleetEvidence{}, errors.New("unverified fake Git identity")
+	}
 	return evidence, nil
 }
 
@@ -1261,6 +1588,18 @@ func (f *fakeFleets) FindByCorrelation(profile, correlation string) ([]string, e
 func (f *fakeFleets) put(evidence adapter.FleetEvidence) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if evidence.WorktreeGitPointer == "" {
+		evidence.WorktreeGitPointer = "gitdir: git-dir-" + evidence.FleetID
+	}
+	if evidence.WorktreeGitDir == "" {
+		evidence.WorktreeGitDir = "git-dir-" + evidence.FleetID
+	}
+	if evidence.WorktreeIdentity == "" {
+		evidence.WorktreeIdentity = "worktree-identity-" + evidence.FleetID
+	}
+	if evidence.GitDirIdentity == "" {
+		evidence.GitDirIdentity = "git-identity-" + evidence.FleetID
+	}
 	f.evidence[evidence.FleetID] = evidence
 }
 
@@ -1300,7 +1639,7 @@ type fakeDiff struct {
 	paths map[string][]adapter.ChangedPath
 }
 
-func (f *fakeDiff) ChangedPaths(_ context.Context, worktree, _ string) ([]adapter.ChangedPath, error) {
+func (f *fakeDiff) ChangedPaths(_ context.Context, worktree, _, _ string) ([]adapter.ChangedPath, error) {
 	return append([]adapter.ChangedPath(nil), f.paths[worktree]...), nil
 }
 
@@ -1336,7 +1675,7 @@ func (f *fakeIntegrator) Head(_ context.Context, _ manifest.Repository) (string,
 	return f.head, nil
 }
 
-func (f *fakeIntegrator) Run(_ context.Context, _ string, _ []manifest.Command) error {
+func (f *fakeIntegrator) Run(_ context.Context, _, _, _ string, _ []manifest.Command) error {
 	f.mu.Lock()
 	f.runCalls++
 	entered := f.entered
@@ -1354,7 +1693,7 @@ func (f *fakeIntegrator) Run(_ context.Context, _ string, _ []manifest.Command) 
 	return f.runError
 }
 
-func (f *fakeIntegrator) ContainsBase(_ context.Context, _, _ string) (bool, error) {
+func (f *fakeIntegrator) ContainsBase(_ context.Context, _, _, _ string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.containsBase, nil

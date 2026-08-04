@@ -7,7 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -57,6 +61,38 @@ func TestOSExecutorDoesNotLeakFailedCommandOutput(t *testing.T) {
 	}
 }
 
+func TestOSExecutorTimeoutKillsDescendantProcessGroup(t *testing.T) {
+	t.Setenv("PLATOON_HELPER_PROCESS", "descendant")
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv("PLATOON_DESCENDANT_PID_FILE", pidFile)
+	started := time.Now()
+	_, err := (OSExecutor{}).Run(context.Background(), Invocation{
+		Executable: os.Args[0], Args: []string{"-test.run=TestAdapterHelperProcess"},
+		Timeout: 200 * time.Millisecond, MaxOutput: 1024,
+	})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("Run() error = %v, want ErrTimeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("timeout waited on descendant pipes for %s", elapsed)
+	}
+	rawPID, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	deadline := time.Now().Add(time.Second)
+	for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("descendant process %d survived timeout: %v", pid, err)
+	}
+}
+
 func TestAdapterHelperProcess(t *testing.T) {
 	mode := os.Getenv("PLATOON_HELPER_PROCESS")
 	if mode == "" {
@@ -77,6 +113,17 @@ func TestAdapterHelperProcess(t *testing.T) {
 	case "fail":
 		_, _ = os.Stderr.WriteString("secret-canary")
 		os.Exit(9)
+	case "descendant":
+		child := exec.Command("sleep", "30")
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(8)
+		}
+		if err := os.WriteFile(os.Getenv("PLATOON_DESCENDANT_PID_FILE"), []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+			os.Exit(7)
+		}
+		time.Sleep(30 * time.Second)
 	}
 	os.Exit(0)
 }

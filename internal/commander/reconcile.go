@@ -35,13 +35,24 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 	if err != nil {
 		return nil, err
 	}
-	if run.Status == state.RunCompleted || run.Status == state.RunFailed {
-		return run, nil
-	}
 	if err := c.verifyProvenance(run); err != nil {
 		return run, err
 	}
 	run.Generation = lease.Generation()
+	if run.Status == state.RunCompleted || run.Status == state.RunFailed {
+		reopened, reopenErr := c.reopenStaleTerminalCandidates(ctx, run, lease)
+		if reopenErr != nil || reopened {
+			return run, reopenErr
+		}
+		if released, err := c.releaseTerminalGlobalClaims(ctx, run); err != nil {
+			return run, err
+		} else if released {
+			if err := c.save(run, lease); err != nil {
+				return run, err
+			}
+		}
+		return run, nil
+	}
 	switch run.Dagr.Phase {
 	case "starting", "loading_workflow", "workflow_loaded":
 		workflow, workflowErr := adapter.WorkflowYAML(run.Dagr.Workflow, run.Manifest.Spec.Stages)
@@ -107,115 +118,133 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 		cause := errors.New("dagr run requires manual identity reconciliation")
 		return run, errors.Join(cause, c.save(run, lease))
 	}
+	if reopened, err := c.reopenStaleTerminalCandidates(ctx, run, lease); err != nil || reopened {
+		return run, err
+	}
 	if run.Status == state.RunReconcileRequired {
 		run.Status = state.RunActive
 	} else if run.Status == state.RunDrained && run.PreDrainStatus == state.RunReconcileRequired {
 		run.PreDrainStatus = state.RunActive
 	}
-	for _, configured := range prioritizedStages(&run.Manifest) {
-		stage := run.Stages[configured.ID]
-		if stage.DagrTerminalPending == "" {
-			continue
-		}
-		success := stage.DagrTerminalPending == "done"
-		if success {
-			candidate := candidateForStage(run, configured.Repository, configured.ID)
-			evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
-			if evidenceErr != nil || candidate == nil || !candidateEvidenceMatches(candidate, evidence) {
-				invalidateCandidate(run, configured.Repository, configured.ID, "pending completion evidence changed")
-				stage.Status = state.StageBlocked
-				stage.Blocker = "pending completion evidence changed"
-				addBlocker(run, configured.ID, "candidate_evidence_changed", stage.Blocker)
-				if saveErr := c.save(run, lease); saveErr != nil {
-					return run, errors.Join(evidenceErr, saveErr)
-				}
-				return run, evidenceErr
+	cycleSnapshot, err := c.dagr.Snapshot(ctx, run.Dagr.RunID, sortedStageNames(&run.Manifest))
+	if err != nil {
+		return run, err
+	}
+	foundViolation, err := c.scanRunWideClaimSafety(ctx, run)
+	if err != nil {
+		return run, err
+	}
+	if foundViolation || hasOutOfClaim(run) {
+		markReconcileRequired(run)
+		return run, c.save(run, lease)
+	}
+	deferPendingReplay := needsChildRecovery(run)
+	if !deferPendingReplay {
+		for _, configured := range prioritizedStages(&run.Manifest) {
+			stage := run.Stages[configured.ID]
+			if stage.DagrTerminalPending == "" {
+				continue
 			}
-			changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.InitialSHA)
-			if diffErr != nil {
-				return run, diffErr
-			}
-			if violations := adapter.CheckPathClaims(changed, configured.Claims.Paths); len(violations) != 0 {
-				message := sanitizeViolationMessage(violations)
-				invalidateCandidate(run, configured.Repository, configured.ID, message)
-				stage.Status = state.StageOutOfClaim
-				stage.Blocker = message
-				addBlocker(run, configured.ID, "out_of_claim", message)
-				return run, c.save(run, lease)
-			}
-			dagrSnapshot, snapshotErr := c.dagr.Snapshot(ctx, run.Dagr.RunID, sortedStageNames(&run.Manifest))
-			if snapshotErr != nil {
-				return run, snapshotErr
-			}
-			if dagrSnapshot[configured.ID] != adapter.DagrDone {
-				repository, _ := run.Manifest.Repository(configured.Repository)
-				head, headErr := c.integrator.Head(ctx, repository)
-				if headErr != nil {
-					return run, headErr
-				}
-				containsBase, ancestryErr := c.integrator.ContainsBase(ctx, evidence.Worktree, head)
-				if ancestryErr != nil {
-					return run, ancestryErr
-				}
-				if head != candidate.BaseSHA || !containsBase {
-					candidate.BaseSHA = head
-					candidate.Status = state.CandidateQueued
-					candidate.Diagnostic = "repository base changed before pending dagr completion"
-					stage.DagrTerminalPending = ""
-					stage.Status = state.StageCandidate
-					return run, c.save(run, lease)
-				}
-			}
-		} else {
-			switch stage.FailureSource {
-			case "child":
-				evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
-				if evidenceErr != nil || evidence.Status != adapter.FleetFailed {
-					stage.DagrTerminalPending = ""
-					stage.Status = state.StageBlocked
-					stage.Blocker = "pending child failure evidence changed"
-					addBlocker(run, configured.ID, "candidate_evidence_changed", stage.Blocker)
-					return run, errors.Join(evidenceErr, c.save(run, lease))
-				}
-			case "integration":
+			success := stage.DagrTerminalPending == "done"
+			if success {
 				candidate := candidateForStage(run, configured.Repository, configured.ID)
 				evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
 				if evidenceErr != nil || candidate == nil || !candidateEvidenceMatches(candidate, evidence) {
-					stage.DagrTerminalPending = ""
+					invalidateCandidate(run, configured.Repository, configured.ID, "pending completion evidence changed")
 					stage.Status = state.StageBlocked
-					stage.Blocker = "pending integration failure evidence changed"
+					stage.Blocker = "pending completion evidence changed"
 					addBlocker(run, configured.ID, "candidate_evidence_changed", stage.Blocker)
-					return run, errors.Join(evidenceErr, c.save(run, lease))
+					if saveErr := c.save(run, lease); saveErr != nil {
+						return run, errors.Join(evidenceErr, saveErr)
+					}
+					return run, evidenceErr
 				}
-				changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.InitialSHA)
+				changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.WorktreeGitDir, evidence.InitialSHA)
 				if diffErr != nil {
 					return run, diffErr
 				}
 				if violations := adapter.CheckPathClaims(changed, configured.Claims.Paths); len(violations) != 0 {
 					message := sanitizeViolationMessage(violations)
-					stage.DagrTerminalPending = ""
+					invalidateCandidate(run, configured.Repository, configured.ID, message)
 					stage.Status = state.StageOutOfClaim
 					stage.Blocker = message
 					addBlocker(run, configured.ID, "out_of_claim", message)
 					return run, c.save(run, lease)
 				}
-			default:
-				return run, errors.New("pending failure source is invalid")
+				dagrSnapshot, snapshotErr := c.dagr.Snapshot(ctx, run.Dagr.RunID, sortedStageNames(&run.Manifest))
+				if snapshotErr != nil {
+					return run, snapshotErr
+				}
+				if dagrSnapshot[configured.ID] != adapter.DagrDone {
+					repository, _ := run.Manifest.Repository(configured.Repository)
+					head, headErr := c.integrator.Head(ctx, repository)
+					if headErr != nil {
+						return run, headErr
+					}
+					containsBase, ancestryErr := c.integrator.ContainsBase(ctx, evidence.Worktree, evidence.WorktreeGitDir, head)
+					if ancestryErr != nil {
+						return run, ancestryErr
+					}
+					if head != candidate.BaseSHA || !containsBase {
+						candidate.BaseSHA = head
+						candidate.Status = state.CandidateQueued
+						candidate.Diagnostic = "repository base changed before pending dagr completion"
+						stage.DagrTerminalPending = ""
+						stage.Status = state.StageCandidate
+						return run, c.save(run, lease)
+					}
+				}
+			} else {
+				switch stage.FailureSource {
+				case "child":
+					evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
+					if evidenceErr != nil || evidence.Status != adapter.FleetFailed {
+						stage.DagrTerminalPending = ""
+						stage.Status = state.StageBlocked
+						stage.Blocker = "pending child failure evidence changed"
+						addBlocker(run, configured.ID, "candidate_evidence_changed", stage.Blocker)
+						return run, errors.Join(evidenceErr, c.save(run, lease))
+					}
+				case "integration":
+					candidate := candidateForStage(run, configured.Repository, configured.ID)
+					evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
+					if evidenceErr != nil || candidate == nil || !candidateEvidenceMatches(candidate, evidence) {
+						stage.DagrTerminalPending = ""
+						stage.Status = state.StageBlocked
+						stage.Blocker = "pending integration failure evidence changed"
+						addBlocker(run, configured.ID, "candidate_evidence_changed", stage.Blocker)
+						return run, errors.Join(evidenceErr, c.save(run, lease))
+					}
+					changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.WorktreeGitDir, evidence.InitialSHA)
+					if diffErr != nil {
+						return run, diffErr
+					}
+					if violations := adapter.CheckPathClaims(changed, configured.Claims.Paths); len(violations) != 0 {
+						message := sanitizeViolationMessage(violations)
+						stage.DagrTerminalPending = ""
+						stage.Status = state.StageOutOfClaim
+						stage.Blocker = message
+						addBlocker(run, configured.ID, "out_of_claim", message)
+						return run, c.save(run, lease)
+					}
+				default:
+					return run, errors.New("pending failure source is invalid")
+				}
 			}
+			if err := c.advanceDagr(ctx, run, configured.ID, success); err != nil {
+				markReconcileRequired(run)
+				addBlocker(run, configured.ID, "dagr_terminal_uncertain", "dagr terminal transition remains unverified")
+				return run, errors.Join(err, c.save(run, lease))
+			}
+			stage.DagrTerminalPending = ""
+			stage.FailureSource = ""
+			if success {
+				stage.Status = state.StageDone
+			} else {
+				stage.Status = state.StageFailed
+			}
+			clearBlocker(run, configured.ID, "dagr_terminal_uncertain")
 		}
-		if err := c.advanceDagr(ctx, run, configured.ID, success); err != nil {
-			markReconcileRequired(run)
-			addBlocker(run, configured.ID, "dagr_terminal_uncertain", "dagr terminal transition remains unverified")
-			return run, errors.Join(err, c.save(run, lease))
-		}
-		stage.DagrTerminalPending = ""
-		stage.FailureSource = ""
-		if success {
-			stage.Status = state.StageDone
-		} else {
-			stage.Status = state.StageFailed
-		}
-		clearBlocker(run, configured.ID, "dagr_terminal_uncertain")
 	}
 	if err := c.save(run, lease); err != nil {
 		return run, err
@@ -282,6 +311,7 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 				continue
 			}
 			stage.FleetID = evidence.FleetID
+			pinFleetEvidence(stage, evidence)
 			stage.Reservation.FleetID = evidence.FleetID
 			stage.Reservation.Phase = state.ReservationCommitted
 			stage.Status = stageStatusFromFleet(evidence.Status)
@@ -300,7 +330,30 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 				continue
 			}
 			c.commitAdoption(run, configured, evidence, lease.Generation())
+			if claimErr := c.reserveGlobalClaim(ctx, run, configured, stage); claimErr != nil {
+				if errors.Is(claimErr, state.ErrGlobalClaimConflict) {
+					stage.GlobalClaimConflict = true
+					stage.Status = state.StageReconcileRequired
+					stage.Blocker = "adopted fleet conflicts with global repository claims"
+					addBlocker(run, configured.ID, "global_claim_conflict", stage.Blocker)
+					unresolved = true
+					continue
+				}
+				return run, claimErr
+			}
 			clearBlocker(run, configured.ID, "adoption_unverified")
+		}
+		if stage.GlobalClaimConflict {
+			if claimErr := c.reserveGlobalClaim(ctx, run, configured, stage); claimErr != nil {
+				if errors.Is(claimErr, state.ErrGlobalClaimConflict) {
+					unresolved = true
+					continue
+				}
+				return run, claimErr
+			}
+			stage.Status = state.StageDispatched
+			stage.Blocker = ""
+			clearBlocker(run, configured.ID, "global_claim_conflict")
 		}
 	}
 	if err := c.save(run, lease); err != nil {
@@ -309,10 +362,25 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 	if c.adoptedPolicyConflict(run) {
 		unresolved = true
 	}
+	foundRecoveredViolation, err := c.scanRunWideClaimSafety(ctx, run)
+	if err != nil {
+		return run, err
+	}
+	if foundRecoveredViolation || hasOutOfClaim(run) {
+		markReconcileRequired(run)
+		if err := c.save(run, lease); err != nil {
+			return run, err
+		}
+		return run, nil
+	}
 
 	for _, configured := range prioritizedStages(&run.Manifest) {
 		stage := run.Stages[configured.ID]
 		if stage.FleetID == "" || stage.Status == state.StageDone || stage.Status == state.StageFailed || stage.Status == state.StageOutOfClaim {
+			continue
+		}
+		if stage.GlobalClaimConflict {
+			unresolved = true
 			continue
 		}
 		evidence, evidenceErr := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
@@ -325,10 +393,18 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 			continue
 		}
 		clearBlocker(run, configured.ID, "fleet_unverified")
+		dagrTerminalRecheck := cycleSnapshot[configured.ID] == adapter.DagrDone && candidateForStage(run, configured.Repository, configured.ID) != nil
+		if (evidence.Status == adapter.FleetDone || evidence.Status == adapter.FleetFailed) && cycleSnapshot[configured.ID] != adapter.DagrReady && !dagrTerminalRecheck {
+			stage.Status = state.StageWaiting
+			stage.Blocker = "verified child terminal evidence is waiting for dagr readiness"
+			addBlocker(run, configured.ID, "dagr_not_ready", stage.Blocker)
+			continue
+		}
+		clearBlocker(run, configured.ID, "dagr_not_ready")
 		switch evidence.Status {
 		case adapter.FleetDone:
 			releaseReservation(stage, c.now().UTC())
-			changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.InitialSHA)
+			changed, diffErr := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.WorktreeGitDir, evidence.InitialSHA)
 			if diffErr != nil {
 				stage.Status = state.StageBlocked
 				stage.Blocker = "changed paths could not be verified"
@@ -398,6 +474,13 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 	if err := c.save(run, lease); err != nil {
 		return run, err
 	}
+	if hasOutOfClaim(run) {
+		markReconcileRequired(run)
+		if err := c.save(run, lease); err != nil {
+			return run, err
+		}
+		return run, nil
+	}
 
 	if err := c.processMergeQueues(ctx, run, lease); err != nil {
 		return run, err
@@ -427,10 +510,97 @@ func (c *Commander) Reconcile(ctx context.Context, runID string) (run *state.Run
 	if err := c.save(run, lease); err != nil {
 		return run, err
 	}
+	if released, err := c.releaseTerminalGlobalClaims(ctx, run); err != nil {
+		return run, err
+	} else if released {
+		if err := c.save(run, lease); err != nil {
+			return run, err
+		}
+	}
 	return run, nil
 }
 
+func (c *Commander) scanRunWideClaimSafety(ctx context.Context, run *state.Run) (bool, error) {
+	found := false
+	for _, configured := range prioritizedStages(&run.Manifest) {
+		stage := run.Stages[configured.ID]
+		if stage == nil || stage.FleetID == "" || stage.Status == state.StageOutOfClaim {
+			continue
+		}
+		evidence, err := c.fleets.Read(stage.FleetID, configured.Repository, c.bindingForStage(run, configured, stage))
+		if err != nil {
+			return false, err
+		}
+		changed, err := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.WorktreeGitDir, evidence.InitialSHA)
+		if err != nil {
+			return false, err
+		}
+		violations := adapter.CheckPathClaims(changed, configured.Claims.Paths)
+		if len(violations) == 0 {
+			continue
+		}
+		if evidence.Status == adapter.FleetDone || evidence.Status == adapter.FleetFailed {
+			releaseReservation(stage, c.now().UTC())
+		}
+		message := sanitizeViolationMessage(violations)
+		invalidateCandidate(run, configured.Repository, configured.ID, message)
+		stage.Status = state.StageOutOfClaim
+		stage.Blocker = message
+		addBlocker(run, configured.ID, "out_of_claim", message)
+		found = true
+	}
+	return found, nil
+}
+
+func needsChildRecovery(run *state.Run) bool {
+	for _, configured := range run.Manifest.Spec.Stages {
+		stage := run.Stages[configured.ID]
+		if stage == nil {
+			continue
+		}
+		if configured.AdoptFleet != "" && stage.FleetID == "" {
+			return true
+		}
+		if stage.Reservation == nil {
+			continue
+		}
+		switch stage.Reservation.Phase {
+		case state.ReservationPrepared, state.ReservationDispatching, state.ReservationReconcileRequired:
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Commander) releaseTerminalGlobalClaims(ctx context.Context, run *state.Run) (bool, error) {
+	released := false
+	for _, stage := range run.Stages {
+		if stage == nil || stage.GlobalClaimID == "" {
+			continue
+		}
+		terminal := stage.Status == state.StageDone || stage.Status == state.StageFailed ||
+			(stage.Reservation != nil && stage.Reservation.Phase == state.ReservationAbsent)
+		if !terminal {
+			continue
+		}
+		if err := c.releaseGlobalClaim(ctx, stage); err != nil {
+			return released, err
+		}
+		released = true
+	}
+	return released, nil
+}
+
 func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, lease *state.Lease) error {
+	if c.authority != nil {
+		return c.authority.WithIntegrationLock(ctx, func() error {
+			return c.processMergeQueuesUnlocked(ctx, run, lease)
+		})
+	}
+	return c.processMergeQueuesUnlocked(ctx, run, lease)
+}
+
+func (c *Commander) processMergeQueuesUnlocked(ctx context.Context, run *state.Run, lease *state.Lease) error {
 	repositories := append([]manifest.Repository(nil), run.Manifest.Spec.Repositories...)
 	sort.Slice(repositories, func(i, j int) bool { return repositories[i].ID < repositories[j].ID })
 	for _, repository := range repositories {
@@ -483,7 +653,7 @@ func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, leas
 			}
 			continue
 		}
-		changed, err := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.InitialSHA)
+		changed, err := c.diff.ChangedPaths(ctx, evidence.Worktree, evidence.WorktreeGitDir, evidence.InitialSHA)
 		if err != nil {
 			return err
 		}
@@ -500,7 +670,7 @@ func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, leas
 			addBlocker(run, candidate.Stage, "base_unverified", candidate.Diagnostic)
 			return errors.Join(err, c.save(run, lease))
 		}
-		containsBase, err := c.integrator.ContainsBase(ctx, evidence.Worktree, head)
+		containsBase, err := c.integrator.ContainsBase(ctx, evidence.Worktree, evidence.WorktreeGitDir, head)
 		if err != nil {
 			return err
 		}
@@ -524,7 +694,7 @@ func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, leas
 		}
 		commands := append([]manifest.Command(nil), repository.Integration...)
 		commands = append(commands, configured.Acceptance...)
-		integrationErr := c.integrator.Run(ctx, evidence.Worktree, commands)
+		integrationErr := c.integrator.Run(ctx, evidence.Worktree, evidence.WorktreeGitPointer, evidence.WorktreeGitDir, commands)
 		postEvidence, err := c.fleets.Read(candidate.FleetID, configured.Repository, c.bindingForStage(run, configured, stageState))
 		if err != nil || !candidateEvidenceMatches(candidate, postEvidence) {
 			invalidateCandidate(run, repository.ID, candidate.Stage, "candidate terminal evidence changed during integration")
@@ -539,7 +709,7 @@ func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, leas
 			}
 			continue
 		}
-		postChanged, err := c.diff.ChangedPaths(ctx, postEvidence.Worktree, postEvidence.InitialSHA)
+		postChanged, err := c.diff.ChangedPaths(ctx, postEvidence.Worktree, postEvidence.WorktreeGitDir, postEvidence.InitialSHA)
 		if err != nil {
 			return err
 		}
@@ -588,7 +758,7 @@ func (c *Commander) processMergeQueues(ctx context.Context, run *state.Run, leas
 			}
 			continue
 		}
-		containsBase, err = c.integrator.ContainsBase(ctx, postEvidence.Worktree, currentHead)
+		containsBase, err = c.integrator.ContainsBase(ctx, postEvidence.Worktree, postEvidence.WorktreeGitDir, currentHead)
 		if err != nil {
 			return err
 		}
@@ -671,7 +841,8 @@ func enqueueCandidate(run *state.Run, repository, stage string, evidence adapter
 	}
 	run.MergeQueue[repository] = append(run.MergeQueue[repository], &state.MergeCandidate{
 		Stage: stage, FleetID: evidence.FleetID, Status: state.CandidateQueued,
-		BaseSHA: evidence.InitialSHA, Worktree: evidence.Worktree, InitialSHA: evidence.InitialSHA,
+		BaseSHA: evidence.InitialSHA, Worktree: evidence.Worktree, WorktreeGitPointer: evidence.WorktreeGitPointer,
+		WorktreeGitDir: evidence.WorktreeGitDir, WorktreeIdentity: evidence.WorktreeIdentity, GitDirIdentity: evidence.GitDirIdentity, InitialSHA: evidence.InitialSHA,
 		ResultDigest: evidence.ResultDigest, Generation: generation,
 	})
 }
@@ -701,6 +872,8 @@ func removeCandidate(run *state.Run, repository, stage string) {
 func candidateEvidenceMatches(candidate *state.MergeCandidate, evidence adapter.FleetEvidence) bool {
 	return evidence.Status == adapter.FleetDone && evidence.FleetID == candidate.FleetID &&
 		evidence.Worktree == candidate.Worktree && evidence.InitialSHA == candidate.InitialSHA &&
+		evidence.WorktreeGitPointer == candidate.WorktreeGitPointer && evidence.WorktreeGitDir == candidate.WorktreeGitDir &&
+		evidence.WorktreeIdentity == candidate.WorktreeIdentity && evidence.GitDirIdentity == candidate.GitDirIdentity &&
 		evidence.ResultDigest == candidate.ResultDigest
 }
 
@@ -731,8 +904,70 @@ func hasSafetyBlock(run *state.Run) bool {
 		if stage != nil && stage.Reservation != nil && stage.Reservation.Phase == state.ReservationAbsent {
 			return true
 		}
+		if stage != nil && stage.GlobalClaimConflict {
+			return true
+		}
 	}
 	return false
+}
+
+func hasOutOfClaim(run *state.Run) bool {
+	for _, stage := range run.Stages {
+		if stage != nil && stage.Status == state.StageOutOfClaim {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Commander) reopenStaleTerminalCandidates(ctx context.Context, run *state.Run, lease *state.Lease) (bool, error) {
+	reopened := false
+	for repositoryID, queue := range run.MergeQueue {
+		hasMergeReady := false
+		for _, candidate := range queue {
+			if candidate != nil && candidate.Status == state.CandidateMergeReady {
+				hasMergeReady = true
+				break
+			}
+		}
+		if !hasMergeReady {
+			continue
+		}
+		repository, ok := run.Manifest.Repository(repositoryID)
+		if !ok {
+			return false, fmt.Errorf("repository %q is missing", repositoryID)
+		}
+		head, err := c.integrator.Head(ctx, repository)
+		if err != nil {
+			return false, err
+		}
+		for _, candidate := range queue {
+			if candidate == nil || candidate.Status != state.CandidateMergeReady || candidate.BaseSHA == head {
+				continue
+			}
+			candidate.Status = state.CandidateQueued
+			candidate.BaseSHA = head
+			candidate.Diagnostic = "repository base changed after terminal completion; candidate requeued"
+			stage := run.Stages[candidate.Stage]
+			configured, _ := run.Manifest.Stage(candidate.Stage)
+			if err := c.reserveGlobalClaim(ctx, run, configured, stage); err != nil {
+				return false, err
+			}
+			stage.Status = state.StageCandidate
+			stage.DagrTerminalPending = ""
+			stage.FailureSource = ""
+			reopened = true
+		}
+	}
+	if !reopened {
+		return false, nil
+	}
+	run.Status = state.RunActive
+	run.PreDrainStatus = ""
+	if err := c.save(run, lease); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func updateTerminalStatus(run *state.Run) {

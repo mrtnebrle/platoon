@@ -10,7 +10,8 @@ durable-state adapters.
   source or durable test fixtures.
 - Preserve fail-closed admission, fencing, explicit apply, and child ownership.
 - Never add automatic merge, push, identity switching, or child-state writes.
-- Update `README.md` in the same commit as every operator-visible behavior.
+- Update `README.md` in the same change set as every operator-visible behavior;
+  CI verifies the base-to-head README blob.
 - Run focused checks during implementation and the full native validation once
   before delivery.
 - Treat `.sergeant-*` files as local orchestration transport; never commit them.

@@ -28,12 +28,14 @@ secure the dagr, Sergeant, Git, and acceptance executables they configure.
 | Duplicate dispatch after a crash | Durable provisional reservation before dispatch; serialized dispatch; exact callback correlation; ambiguity blocks. |
 | Global credential race inside Sergeant | One user-global dispatch file lock across repositories, runs, state roots, and fleet roots. Platoon never switches identity. |
 | Dagr-ready work bypasses policy | Hookless generated workflows; only the admission transaction calls dispatch. |
-| Token or claim overcommit | Atomic policy evaluation under the Commander lease, including adopted fleets. |
+| Token or claim overcommit | Run-local capacity plus a restrictive per-user claim registry covering every state root, including adopted fleets. |
 | Case-insensitive path bypass | Case-folded overlap and coverage checks on normalized relative slash paths. |
 | Path traversal or symlink escape | No absolute/traversing claims; bounded NUL-delimited Git parsing; changed symlinks fail closed; authority paths reject symlinks. |
 | Forged child success | Exact one-repository project/task/stage/branch/intent/correlation binding; `done` requires non-empty result; stable bounded reads. |
 | Out-of-claim child work | Diff from Sergeant's recorded initial SHA; deleted, renamed, modified, ignored/untracked, and historical symlink paths checked before and after integration commands. |
+| Child-controlled Git metadata | Pinned worktree/Git-dir identity, private base index, replacement-object suppression, and filtered Git environment. |
 | Secret or content leakage | No shell interpolation; bounded separate output; failed output omitted from errors; only result digest and sanitized paths persist. |
+| Descendant process leak | Commands run in a new process group; deadline kills the group and bounds pipe wait. |
 | Stale candidate integration | Base SHA checked before and after commands; changed bases return to queued. |
 | Automatic publication | No merge or push operation exists in the Commander or command integrator. |
 
@@ -51,6 +53,8 @@ secure the dagr, Sergeant, Git, and acceptance executables they configure.
   record exists. Acceptance commands rerun on the current base.
 - A state write failure leaves either the old complete file or the new complete
   file authoritative; temporary files are never read as authority.
+- Initialization publishes supporting intent/workflow files before `state.json`;
+  a crash before the final write leaves no run authority.
 
 ## Residual Risks
 

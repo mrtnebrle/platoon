@@ -6,7 +6,9 @@
 2. Ensure the manifest directory contains the referenced canonical intent.
 3. Ensure each task exists in the configured Sergeant project/repository.
 4. Use distinct repository branch prefixes for unrelated Platoon runs.
-5. Validate and inspect the deterministic plan before applying.
+5. Ensure the passwd-account home permits creation of Platoon's restrictive
+   per-user authority directory.
+6. Validate and inspect the deterministic plan before applying.
 
 ```sh
 platoon validate --file platoon.yaml

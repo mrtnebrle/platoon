@@ -5,6 +5,10 @@ Platoon accepts one strict YAML document matching
 mapping keys, extra documents, unsupported versions, missing dependencies, and
 cycles fail validation.
 
+The published Draft 2020-12 schema is compiled in repository tests. Shared
+negative fixtures keep its opaque-ID and path lexing aligned with runtime
+validation.
+
 Relative runtime paths resolve from the manifest directory when an applied run
 starts. Bare executable names resolve through the operator's process `PATH`.
 
@@ -93,6 +97,10 @@ fails closed.
 Adoption does not bypass policy. Verified adopted fleets consume tokens and
 claims. Mismatched, malformed, over-capacity, or conflicting adoption evidence
 blocks new admission without changing the fleet.
+
+Opaque IDs use 1-128 ASCII characters from `[A-Za-z0-9._-]`. Exact `.` and any
+`..` substring are invalid, as are separators, whitespace, controls, and
+Unicode. An explicitly present empty `adoptFleet` is invalid.
 
 ## Claims
 

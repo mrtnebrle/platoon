@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type Invocation struct {
 	Directory  string
 	Timeout    time.Duration
 	MaxOutput  int
+	Env        []string
 }
 
 type Result struct {
@@ -43,8 +45,20 @@ func (OSExecutor) Run(ctx context.Context, invocation Invocation) (Result, error
 	commandContext, cancel := context.WithTimeout(ctx, invocation.Timeout)
 	defer cancel()
 	command := exec.CommandContext(commandContext, invocation.Executable, invocation.Args...)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error {
+		if command.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	}
+	command.WaitDelay = time.Second
 	command.Dir = invocation.Directory
-	command.Env = os.Environ()
+	if invocation.Env == nil {
+		command.Env = os.Environ()
+	} else {
+		command.Env = append([]string(nil), invocation.Env...)
+	}
 	stdout := &limitedBuffer{limit: invocation.MaxOutput, onOverflow: cancel}
 	stderr := &limitedBuffer{limit: invocation.MaxOutput, onOverflow: cancel}
 	command.Stdout = stdout

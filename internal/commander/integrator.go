@@ -20,8 +20,8 @@ type CommandIntegrator struct {
 
 func (c CommandIntegrator) Head(ctx context.Context, repository manifest.Repository) (string, error) {
 	result, err := c.Executor.Run(ctx, adapter.Invocation{
-		Executable: "git", Args: []string{"-C", repository.Path, "rev-parse", "HEAD"},
-		Timeout: c.Timeout, MaxOutput: c.MaxOutput,
+		Executable: "git", Args: []string{"--no-replace-objects", "-C", repository.Path, "rev-parse", "HEAD"},
+		Timeout: c.Timeout, MaxOutput: c.MaxOutput, Env: controlledGitEnvironment(),
 	})
 	if err != nil || len(result.Stderr) != 0 {
 		return "", errors.New("repository base command failed")
@@ -36,10 +36,10 @@ func (c CommandIntegrator) Head(ctx context.Context, repository manifest.Reposit
 	return head, nil
 }
 
-func (c CommandIntegrator) ContainsBase(ctx context.Context, worktree, base string) (bool, error) {
+func (c CommandIntegrator) ContainsBase(ctx context.Context, worktree, gitDir, base string) (bool, error) {
 	result, err := c.Executor.Run(ctx, adapter.Invocation{
-		Executable: "git", Args: []string{"-C", worktree, "merge-base", base, "HEAD"},
-		Timeout: c.Timeout, MaxOutput: c.MaxOutput,
+		Executable: "git", Args: []string{"--no-replace-objects", "--git-dir=" + gitDir, "--work-tree=" + worktree, "merge-base", base, "HEAD"},
+		Timeout: c.Timeout, MaxOutput: c.MaxOutput, Env: controlledGitEnvironment(),
 	})
 	if err != nil || len(result.Stderr) != 0 {
 		return false, errors.New("candidate ancestry command failed")
@@ -54,7 +54,10 @@ func (c CommandIntegrator) ContainsBase(ctx context.Context, worktree, base stri
 	return ancestor == base, nil
 }
 
-func (c CommandIntegrator) Run(ctx context.Context, worktree string, commands []manifest.Command) error {
+func (c CommandIntegrator) Run(ctx context.Context, worktree, gitPointer, gitDir string, commands []manifest.Command) error {
+	if err := adapter.VerifyWorktreeGitIdentity(worktree, gitPointer, gitDir); err != nil {
+		return err
+	}
 	before, err := os.Lstat(worktree)
 	if err != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
 		return errors.New("integration worktree is not a stable real directory")
@@ -72,5 +75,26 @@ func (c CommandIntegrator) Run(ctx context.Context, worktree string, commands []
 	if err != nil || !os.SameFile(before, after) || !after.IsDir() || after.Mode()&os.ModeSymlink != 0 {
 		return errors.New("integration worktree identity changed")
 	}
+	if err := adapter.VerifyWorktreeGitIdentity(worktree, gitPointer, gitDir); err != nil {
+		return err
+	}
 	return nil
+}
+
+func controlledGitEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ())+5)
+	for _, variable := range os.Environ() {
+		name, _, _ := strings.Cut(variable, "=")
+		if strings.HasPrefix(name, "GIT_") {
+			continue
+		}
+		environment = append(environment, variable)
+	}
+	return append(environment,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_NO_REPLACE_OBJECTS=1",
+		"GIT_NO_LAZY_FETCH=1",
+		"GIT_OPTIONAL_LOCKS=0",
+	)
 }

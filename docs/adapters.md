@@ -83,6 +83,8 @@ For fleet `<fleet>` and repository `<repo>`, Platoon reads:
 <fleetRoot>/<fleet>/<repo>/status
 <fleetRoot>/<fleet>/<repo>/result          # required only for done
 <fleetRoot>/<fleet>/<repo>/worktree
+<fleetRoot>/<fleet>/<repo>/worktree_git_pointer
+<fleetRoot>/<fleet>/<repo>/worktree_git_dir
 <fleetRoot>/<fleet>/<repo>/initial_sha
 ```
 
@@ -90,8 +92,9 @@ Every field must be a bounded regular non-symlink and stable across two reads.
 The fleet task must contain exactly one non-hidden repository directory.
 Project, task, stage, derived issue branch, callback origin (for dispatched
 work), repository, and both intent revisions must match the manifest/run
-binding. The worktree must be a real directory and `initial_sha` must be a full
-Git hash.
+binding. The worktree, `.git` pointer target, and recorded Git directory are
+pinned by filesystem device/inode identity on first observation and rechecked;
+`initial_sha` must be a full Git hash.
 
 Recognized nonterminal states are `dispatched`, `in_progress`, `needs_input`,
 `blocked`, `waiting`, `orphaned`, and `drained`. Success is exact `done` plus a
@@ -113,12 +116,14 @@ zero/multiple matches blocks recovery.
 
 ## Git Diff Profile
 
-Platoon executes bounded argument-array Git commands equivalent to:
+Platoon verifies Sergeant's recorded `.git` pointer and physical Git directory,
+builds a private temporary index from the dispatch tree, filters ambient
+`GIT_*` variables, and executes bounded argument-array commands equivalent to:
 
 ```text
-git -C <worktree> diff --name-only -z --no-renames <initial_sha> --
-git -C <worktree> ls-files --others -z
-git -C <worktree> diff --raw -z --no-renames <initial_sha> --
+git --no-replace-objects --git-dir=<git-dir> --work-tree=<worktree> read-tree <initial_sha>^{tree}
+git --no-replace-objects --git-dir=<git-dir> --work-tree=<worktree> diff --raw -z --no-renames <initial_sha> --
+git --no-replace-objects --git-dir=<git-dir> --work-tree=<worktree> ls-files --others -z --
 ```
 
 Disabling rename detection causes both old deletion and new addition paths to be
@@ -126,6 +131,8 @@ checked. Ignored untracked files remain visible. Raw old/new modes identify
 deleted and type-changed symlinks as well as current symlinks. NUL framing
 preserves unusual names; control characters are rejected. Root Sergeant
 control/transport files are excluded. Every changed symlink is out of claim.
+The child index, replacement refs, global/system Git configuration, fsmonitor,
+sparse checkout, and ambient Git directory variables are not authority.
 
 ## Sergeant Operational Controls
 

@@ -115,7 +115,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "start: --file is required")
 		return 2
 	}
-	m, err := manifest.LoadFile(*file)
+	m, manifestBytes, err := manifest.LoadFileSnapshot(*file)
 	if err != nil {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
@@ -141,8 +141,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
 	}
-	service := newCommander(store, runtimeManifest)
-	run, err := service.Start(context.Background(), runtimeManifest, commander.StartInput{ManifestPath: manifestPath, IntentPath: intentPath})
+	service, err := newCommander(store, runtimeManifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "start: %v\n", err)
+		return 1
+	}
+	startContext, cancelStart := context.WithTimeout(context.Background(), runtimeManifest.Spec.Limits.CommandDuration())
+	defer cancelStart()
+	run, err := service.Start(startContext, m, commander.StartInput{ManifestPath: manifestPath, ManifestBytes: manifestBytes, IntentPath: intentPath})
 	if err != nil {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		if run != nil {
@@ -229,14 +235,19 @@ func runReconcile(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "reconcile: %v\n", err)
 		return 1
 	}
-	service := newCommander(store, &current.Manifest)
+	service, err := newCommander(store, &current.Manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "reconcile: %v\n", err)
+		return 1
+	}
 	cycles := 1
 	if interval > 0 {
 		cycles = *maxCycles
 	}
-	ctx := context.Background()
 	for cycle := 0; cycle < cycles; cycle++ {
-		next, reconcileErr := service.Reconcile(ctx, *runID)
+		cycleContext, cancelCycle := context.WithTimeout(context.Background(), current.Manifest.Spec.Limits.CommandDuration())
+		next, reconcileErr := service.Reconcile(cycleContext, *runID)
+		cancelCycle()
 		if next != nil {
 			current = next
 		}
@@ -328,8 +339,14 @@ func runDrain(args []string, drained bool, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s: %v\n", name, err)
 		return 1
 	}
-	service := newCommander(store, &run.Manifest)
-	run, err = service.SetDrained(context.Background(), *runID, drained)
+	service, err := newCommander(store, &run.Manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", name, err)
+		return 1
+	}
+	drainContext, cancelDrain := context.WithTimeout(context.Background(), run.Manifest.Spec.Limits.CommandDuration())
+	defer cancelDrain()
+	run, err = service.SetDrained(drainContext, *runID, drained)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", name, err)
 		return 1
@@ -340,19 +357,23 @@ func runDrain(args []string, drained bool, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func newCommander(store *state.Store, m *manifest.Manifest) *commander.Commander {
+func newCommander(store *state.Store, m *manifest.Manifest) (*commander.Commander, error) {
 	executor := adapter.OSExecutor{}
 	timeout := m.Spec.Limits.CommandDuration()
 	maxOutput := m.Spec.Limits.MaxOutputBytes
+	authority, err := state.OpenUserAuthority()
+	if err != nil {
+		return nil, err
+	}
 	return commander.New(store, commander.Dependencies{
-		Dagr:         adapter.NewDagrCLI(m.Spec.Adapters.Dagr, executor, timeout, maxOutput),
-		Dispatcher:   adapter.NewSergeantCLI(m.Spec.Adapters.Sergeant.Dispatch, executor, timeout, maxOutput),
-		Fleets:       adapter.NewFleetReader(m.Spec.Adapters.Sergeant.FleetRoot),
-		Diff:         adapter.NewGitInspector(executor, timeout, maxOutput),
-		Integrator:   commander.CommandIntegrator{Executor: executor, Timeout: timeout, MaxOutput: maxOutput},
-		Lease:        state.LeaseOptions{TTL: m.Spec.Limits.LeaseDuration()},
-		DispatchLock: state.UserDispatchLockPath(),
-	})
+		Dagr:       adapter.NewDagrCLI(m.Spec.Adapters.Dagr, executor, timeout, maxOutput),
+		Dispatcher: adapter.NewSergeantCLI(m.Spec.Adapters.Sergeant.Dispatch, executor, timeout, maxOutput),
+		Fleets:     adapter.NewFleetReader(m.Spec.Adapters.Sergeant.FleetRoot),
+		Diff:       adapter.NewGitInspector(executor, timeout, maxOutput),
+		Integrator: commander.CommandIntegrator{Executor: executor, Timeout: timeout, MaxOutput: maxOutput},
+		Lease:      state.LeaseOptions{TTL: m.Spec.Limits.LeaseDuration()},
+		Authority:  authority,
+	}), nil
 }
 
 func resolveRuntimeManifest(source *manifest.Manifest, sourceFile string) (*manifest.Manifest, string, string, error) {

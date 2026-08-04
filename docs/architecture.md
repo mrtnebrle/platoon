@@ -20,7 +20,7 @@ dagr stage before all of its work is terminal.
   then atomically evaluates token, writer, path, semantic, and protected-claim
   policy.
 - `internal/state` owns restrictive atomic JSON, the generation-fenced lease,
-  and the fleet-root-shared dispatch lock.
+  and the stable per-user claim/dispatch/integration authority.
 - `internal/adapter` invokes commands as argument arrays, parses dagr receipts,
   parses Sergeant dispatch correlation, verifies fleet state, and inspects Git
   changed paths.
@@ -35,13 +35,14 @@ For every ready stage, the held Commander generation:
 
 1. Recomputes active implementation/review use and active repository claims.
 2. Evaluates deterministic priority and all limits under the Commander lock.
-3. Atomically writes a `prepared` reservation with correlation identity.
-4. Acquires the user-global Sergeant dispatch lock while state remains prepared.
-5. Atomically moves it to `dispatching` immediately before invocation.
-6. Invokes one single-repository dispatch.
-7. Requires matching early/final receipt IDs, callback correlation, and exactly
+3. Registers repository claims in the per-user authority across all state roots.
+4. Atomically writes a `prepared` reservation with correlation identity.
+5. Acquires the user-global Sergeant dispatch lock while state remains prepared.
+6. Atomically moves it to `dispatching` immediately before invocation.
+7. Invokes one single-repository dispatch.
+8. Requires matching early/final receipt IDs, callback correlation, and exactly
    one matching durable fleet repository.
-8. Atomically commits the fleet ID or retains `reconcile_required`.
+9. Atomically commits the fleet ID or retains `reconcile_required`.
 
 A crash before step 3 has no dispatch. A crash while `prepared` is proven to be
 pre-invocation and may dispatch once. A crash in `dispatching` never causes an
@@ -59,7 +60,7 @@ One applied reconciliation cycle is bounded:
 4. Verify each known fleet's immutable binding and current durable status.
 5. Release tokens only from verified terminal evidence.
 6. Diff successful work from the dispatch base and enforce path claims.
-7. Enqueue in-claim candidates and process at most one per repository.
+7. Acquire the user-global integration lock, then process in-claim candidates.
 8. Verify dagr's resulting state, read newly ready stages, and admit if active.
 9. Atomically persist the resulting run state.
 
@@ -75,12 +76,18 @@ converges without another child or another integration command.
   lease.json
   runs/<run-id>/
     state.json
+    intent.md
     workflow.yaml
 ```
 
-All Platoon state and fleet roots for one local user serialize dispatch through
-one restrictive lock in the operating system's temporary directory, namespaced
-by user ID. The shared lock is transport only; it is not a child fleet record.
+All state and fleet roots for one local user coordinate through a restrictive
+per-UID authority below the passwd-account home state directory. It contains a
+claim registry plus dispatch/integration kernel locks, but never child state or
+command output. Lock acquisition uses nonblocking retries bounded by context.
+
+Run initialization creates the run directory, `intent.md`, and `workflow.yaml`
+first. `state.json` is the final publication point, so partial initialization is
+not authoritative.
 
 Directories are `0700`; files are `0600`. JSON readers reject unknown fields,
 truncation, symlinks, devices, oversized input, and group/world-readable

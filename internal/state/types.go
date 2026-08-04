@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mrtnebrle/platoon/internal/manifest"
+	"github.com/mrtnebrle/platoon/internal/opaqueid"
 )
 
 const StateVersion = "platoon.state/v1alpha1"
@@ -99,6 +100,15 @@ type StageState struct {
 	ID                  string       `json:"id"`
 	Status              StageStatus  `json:"status"`
 	FleetID             string       `json:"fleetId"`
+	Worktree            string       `json:"worktree"`
+	WorktreeGitPointer  string       `json:"worktreeGitPointer"`
+	WorktreeGitDir      string       `json:"worktreeGitDir"`
+	InitialSHA          string       `json:"initialSha"`
+	WorktreeIdentity    string       `json:"worktreeIdentity"`
+	GitDirIdentity      string       `json:"gitDirIdentity"`
+	GlobalClaimID       string       `json:"globalClaimId"`
+	RepositoryKey       string       `json:"repositoryKey"`
+	GlobalClaimConflict bool         `json:"globalClaimConflict"`
 	Adopted             bool         `json:"adopted"`
 	Reservation         *Reservation `json:"reservation"`
 	DagrTerminalPending string       `json:"dagrTerminalPending"`
@@ -118,16 +128,20 @@ type Reservation struct {
 }
 
 type MergeCandidate struct {
-	Stage        string          `json:"stage"`
-	FleetID      string          `json:"fleetId"`
-	Status       CandidateStatus `json:"status"`
-	BaseSHA      string          `json:"baseSha"`
-	Worktree     string          `json:"worktree"`
-	InitialSHA   string          `json:"initialSha"`
-	ResultDigest string          `json:"resultDigest"`
-	Generation   uint64          `json:"generation"`
-	Attempts     int             `json:"attempts"`
-	Diagnostic   string          `json:"diagnostic"`
+	Stage              string          `json:"stage"`
+	FleetID            string          `json:"fleetId"`
+	Status             CandidateStatus `json:"status"`
+	BaseSHA            string          `json:"baseSha"`
+	Worktree           string          `json:"worktree"`
+	WorktreeGitPointer string          `json:"worktreeGitPointer"`
+	WorktreeGitDir     string          `json:"worktreeGitDir"`
+	WorktreeIdentity   string          `json:"worktreeIdentity"`
+	GitDirIdentity     string          `json:"gitDirIdentity"`
+	InitialSHA         string          `json:"initialSha"`
+	ResultDigest       string          `json:"resultDigest"`
+	Generation         uint64          `json:"generation"`
+	Attempts           int             `json:"attempts"`
+	Diagnostic         string          `json:"diagnostic"`
 }
 
 type Blocker struct {
@@ -217,6 +231,10 @@ func (r *Run) Validate() error {
 		if stage.FleetID != "" && !safeID(stage.FleetID) {
 			return fmt.Errorf("stage %q fleet identity is invalid", id)
 		}
+		if stage.FleetID != "" && (stage.Worktree == "" || stage.WorktreeGitPointer == "" || stage.WorktreeGitDir == "" || stage.WorktreeIdentity == "" || stage.GitDirIdentity == "" ||
+			(!validHex(stage.InitialSHA, 40) && !validHex(stage.InitialSHA, 64))) {
+			return fmt.Errorf("stage %q pinned Git identity is invalid", id)
+		}
 		if stage.Result != "" && !validHex(stage.Result, 64) {
 			return fmt.Errorf("stage %q result digest is invalid", id)
 		}
@@ -288,7 +306,7 @@ func (r *Run) Validate() error {
 			if candidate.BaseSHA != "" && !validHex(candidate.BaseSHA, 40) && !validHex(candidate.BaseSHA, 64) {
 				return fmt.Errorf("merge queue %q contains invalid base identity", repository)
 			}
-			if candidate.Worktree == "" || strings.ContainsAny(candidate.Worktree, "\x00\r\n") ||
+			if candidate.Worktree == "" || candidate.WorktreeGitPointer == "" || candidate.WorktreeGitDir == "" || candidate.WorktreeIdentity == "" || candidate.GitDirIdentity == "" || strings.ContainsAny(candidate.Worktree, "\x00\r\n") ||
 				(!validHex(candidate.InitialSHA, 40) && !validHex(candidate.InitialSHA, 64)) || !validHex(candidate.ResultDigest, 64) {
 				return fmt.Errorf("merge queue %q contains invalid terminal evidence", repository)
 			}
@@ -347,15 +365,7 @@ func candidateForStage(run *Run, stage string) *MergeCandidate {
 }
 
 func safeID(value string) bool {
-	if value == "" || len(value) > 128 || value == "." || value == ".." {
-		return false
-	}
-	for _, r := range value {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
-			return false
-		}
-	}
-	return !strings.Contains(value, "..")
+	return opaqueid.Valid(value)
 }
 
 func validStageStatus(status StageStatus) bool {

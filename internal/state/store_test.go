@@ -64,6 +64,42 @@ func TestStoreWritesValidatedStateWithRestrictivePermissions(t *testing.T) {
 	}
 }
 
+func TestSupportingFilesWithoutStateAreNotAuthoritative(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireLease(testLeaseOptions(time.Unix(100, 0), 101, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if _, err := store.WriteRunFile("run-a", "intent.md", []byte("synthetic intent\n"), lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadRun("run-a"); err == nil {
+		t.Fatal("supporting intent file became run authority without state.json")
+	}
+	if _, err := store.WriteRunFile("run-a", "workflow.yaml", []byte("name: synthetic\n"), lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadRun("run-a"); err == nil {
+		t.Fatal("intent and workflow became run authority without state.json")
+	}
+	run := testRun("run-a", lease.Generation())
+	runDir, err := store.RunDir(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.IntentPath = filepath.Join(runDir, "intent.md")
+	if err := store.SaveRun(run, lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadRun("run-a"); err != nil {
+		t.Fatalf("final state publication was not loadable: %v", err)
+	}
+}
+
 func TestLoadRunRejectsMalformedUnknownAndSymlinkState(t *testing.T) {
 	tests := map[string]func(t *testing.T, statePath string){
 		"truncated": func(t *testing.T, statePath string) {
@@ -249,6 +285,7 @@ func TestRunValidateRejectsConflictingTerminalChildIdentity(t *testing.T) {
 	run := testRun("run-a", 1)
 	run.Stages["stage"] = &StageState{
 		ID: "stage", Status: StageFailed, FleetID: "fleet-a", DagrTerminalPending: "failed", FailureSource: "child",
+		Worktree: "worktree", WorktreeGitPointer: "gitdir: git-dir", WorktreeGitDir: "git-dir", WorktreeIdentity: "1:1", GitDirIdentity: "1:2", InitialSHA: strings.Repeat("a", 40),
 		Reservation: &Reservation{
 			Phase: ReservationReleased, Generation: 1, FleetID: "fleet-b", CorrelationID: "run-a-stage",
 		},
@@ -262,6 +299,7 @@ func TestRunValidateRejectsForgedAdoptionProvenance(t *testing.T) {
 	run := testRun("run-a", 1)
 	run.Stages["stage"] = &StageState{
 		ID: "stage", Status: StageFailed, FleetID: "fleet-stage", Adopted: true,
+		Worktree: "worktree", WorktreeGitPointer: "gitdir: git-dir", WorktreeGitDir: "git-dir", WorktreeIdentity: "1:1", GitDirIdentity: "1:2", InitialSHA: strings.Repeat("a", 40),
 		DagrTerminalPending: "failed", FailureSource: "child",
 		Reservation: &Reservation{Phase: ReservationReleased, Generation: 1, FleetID: "fleet-stage"},
 	}

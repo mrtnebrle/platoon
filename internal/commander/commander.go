@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -29,13 +30,13 @@ type FleetEvidenceReader interface {
 }
 
 type DiffInspector interface {
-	ChangedPaths(context.Context, string, string) ([]adapter.ChangedPath, error)
+	ChangedPaths(context.Context, string, string, string) ([]adapter.ChangedPath, error)
 }
 
 type Integrator interface {
 	Head(context.Context, manifest.Repository) (string, error)
-	ContainsBase(context.Context, string, string) (bool, error)
-	Run(context.Context, string, []manifest.Command) error
+	ContainsBase(context.Context, string, string, string) (bool, error)
+	Run(context.Context, string, string, string, []manifest.Command) error
 }
 
 type Dependencies struct {
@@ -48,6 +49,7 @@ type Dependencies struct {
 	ID           func() (string, error)
 	Lease        state.LeaseOptions
 	DispatchLock string
+	Authority    *state.Authority
 }
 
 type Commander struct {
@@ -61,11 +63,13 @@ type Commander struct {
 	id           func() (string, error)
 	lease        state.LeaseOptions
 	dispatchLock string
+	authority    *state.Authority
 }
 
 type StartInput struct {
-	ManifestPath string
-	IntentPath   string
+	ManifestPath  string
+	ManifestBytes []byte
+	IntentPath    string
 }
 
 func New(store *state.Store, dependencies Dependencies) *Commander {
@@ -82,6 +86,7 @@ func New(store *state.Store, dependencies Dependencies) *Commander {
 		fleets: dependencies.Fleets, diff: dependencies.Diff, integrator: dependencies.Integrator,
 		now: now, id: id, lease: dependencies.Lease,
 		dispatchLock: dependencies.DispatchLock,
+		authority:    dependencies.Authority,
 	}
 }
 
@@ -92,17 +97,35 @@ func (c *Commander) Start(ctx context.Context, m *manifest.Manifest, input Start
 	if m == nil {
 		return nil, errors.New("manifest is required")
 	}
-	if err := manifest.Validate(m); err != nil {
+	if len(input.ManifestBytes) == 0 {
+		return nil, errors.New("validated manifest byte snapshot is required")
+	}
+	parsedManifest, err := manifest.Load(input.ManifestBytes)
+	if err != nil {
 		return nil, err
 	}
+	parsedComparable, err := normalizedManifest(parsedManifest)
+	if err != nil {
+		return nil, err
+	}
+	providedComparable, err := normalizedManifest(m)
+	if err != nil {
+		return nil, err
+	}
+	if !reflect.DeepEqual(parsedComparable, providedComparable) {
+		return nil, errors.New("manifest object does not match validated byte snapshot")
+	}
+	runtimeManifest, err := manifest.ResolveRuntimePaths(parsedManifest, input.ManifestPath)
+	if err != nil {
+		return nil, err
+	}
+	m = runtimeManifest
 	manifestDigest, err := valueSHA256(m)
 	if err != nil {
 		return nil, err
 	}
-	_, manifestSourceDigest, err := readSourceFile(input.ManifestPath)
-	if err != nil {
-		return nil, fmt.Errorf("manifest source is not a bounded regular file: %w", err)
-	}
+	manifestSourceSum := sha256.Sum256(input.ManifestBytes)
+	manifestSourceDigest := hex.EncodeToString(manifestSourceSum[:])
 	intentBytes, intentRevision, err := readSourceFile(input.IntentPath)
 	if err != nil {
 		return nil, fmt.Errorf("intent source is not a bounded regular file: %w", err)
@@ -156,9 +179,6 @@ func (c *Commander) Start(ctx context.Context, m *manifest.Manifest, input Start
 	for _, stage := range m.Spec.Stages {
 		run.Stages[stage.ID] = &state.StageState{ID: stage.ID, Status: state.StagePending}
 	}
-	if err := c.save(run, lease); err != nil {
-		return run, err
-	}
 	intentPath, err := c.store.WriteRunFile(run.ID, "intent.md", intentBytes, lease)
 	if err != nil {
 		return run, err
@@ -202,6 +222,17 @@ func (c *Commander) Start(ctx context.Context, m *manifest.Manifest, input Start
 			return run, errors.Join(fmt.Errorf("adopt stage %q: %w", stage.ID, err), c.save(run, lease))
 		}
 		c.commitAdoption(run, stage, evidence, lease.Generation())
+		if err := c.reserveGlobalClaim(ctx, run, stage, run.Stages[stage.ID]); err != nil {
+			if errors.Is(err, state.ErrGlobalClaimConflict) {
+				markReconcileRequired(run)
+				run.Stages[stage.ID].GlobalClaimConflict = true
+				run.Stages[stage.ID].Status = state.StageReconcileRequired
+				run.Stages[stage.ID].Blocker = "adopted fleet conflicts with global repository claims"
+				addBlocker(run, stage.ID, "global_claim_conflict", run.Stages[stage.ID].Blocker)
+				continue
+			}
+			return run, err
+		}
 	}
 	if c.adoptedPolicyConflict(run) {
 		markReconcileRequired(run)
@@ -357,6 +388,14 @@ func (c *Commander) admitReady(ctx context.Context, run *state.Run, lease *state
 			addBlocker(run, stage.ID, "provenance_mismatch", stageState.Blocker)
 			return errors.Join(err, c.save(run, lease))
 		}
+		if err := c.reserveGlobalClaim(ctx, run, stage, stageState); err != nil {
+			if errors.Is(err, state.ErrGlobalClaimConflict) {
+				stageState.Status = state.StageQueued
+				stageState.Blocker = "global repository claim conflict"
+				continue
+			}
+			return err
+		}
 		correlation := run.ID + "-" + stage.ID
 		stageState.Status = state.StageReserved
 		stageState.Blocker = ""
@@ -364,6 +403,7 @@ func (c *Commander) admitReady(ctx context.Context, run *state.Run, lease *state
 			Phase: state.ReservationPrepared, Generation: lease.Generation(), CorrelationID: correlation, ReservedAt: c.now().UTC(),
 		}
 		if err := c.save(run, lease); err != nil {
+			_ = c.releaseGlobalClaim(ctx, stageState)
 			return err
 		}
 		if err := c.dispatchPreparedStage(ctx, run, lease, stage, stageState); err != nil {
@@ -374,6 +414,41 @@ func (c *Commander) admitReady(ctx context.Context, run *state.Run, lease *state
 			Paths: append([]string(nil), stage.Claims.Paths...), Semantic: append([]string(nil), stage.Claims.Semantic...),
 		})
 	}
+	return nil
+}
+
+func (c *Commander) reserveGlobalClaim(ctx context.Context, run *state.Run, configured manifest.Stage, stage *state.StageState) error {
+	if c.authority == nil {
+		return nil
+	}
+	repository, _ := run.Manifest.Repository(configured.Repository)
+	repositoryKey, err := state.RepositoryKey(repository.Path)
+	if err != nil {
+		return err
+	}
+	claimID, reserveErr := c.authority.ReserveClaim(ctx, state.GlobalClaim{
+		RepositoryKey: repositoryKey, Mode: configured.Mode,
+		Paths: append([]string(nil), configured.Claims.Paths...), Semantic: append([]string(nil), configured.Claims.Semantic...),
+		MaxWriters: repository.MaxWriters, StateRoot: c.store.Root(), RunID: run.ID, StageID: configured.ID, Adopted: stage.Adopted,
+	})
+	if claimID != "" {
+		stage.GlobalClaimID = claimID
+		stage.RepositoryKey = repositoryKey
+	}
+	if reserveErr == nil {
+		stage.GlobalClaimConflict = false
+	}
+	return reserveErr
+}
+
+func (c *Commander) releaseGlobalClaim(ctx context.Context, stage *state.StageState) error {
+	if c.authority == nil || stage == nil || stage.GlobalClaimID == "" {
+		return nil
+	}
+	if err := c.authority.ReleaseClaim(ctx, stage.GlobalClaimID); err != nil {
+		return err
+	}
+	stage.GlobalClaimID = ""
 	return nil
 }
 
@@ -410,10 +485,12 @@ func (c *Commander) dispatchPreparedStage(ctx context.Context, run *state.Run, l
 		return err
 	}
 	var dispatchErr error
-	if c.dispatchLock == "" {
-		dispatchErr = c.store.WithDispatchLock(dispatchOperation)
+	if c.authority != nil {
+		dispatchErr = c.authority.WithDispatchLock(ctx, dispatchOperation)
+	} else if c.dispatchLock == "" {
+		dispatchErr = c.store.WithDispatchLock(ctx, dispatchOperation)
 	} else {
-		dispatchErr = c.store.WithDispatchLockAt(c.dispatchLock, dispatchOperation)
+		dispatchErr = c.store.WithDispatchLockAt(ctx, c.dispatchLock, dispatchOperation)
 	}
 	if dispatchErr != nil {
 		if !dispatchStarted {
@@ -437,6 +514,7 @@ func (c *Commander) dispatchPreparedStage(ctx context.Context, run *state.Run, l
 		return errors.Join(evidenceErr, c.save(run, lease))
 	}
 	stageState.FleetID = evidence.FleetID
+	pinFleetEvidence(stageState, evidence)
 	stageState.Status = state.StageDispatched
 	stageState.Reservation.Phase = state.ReservationCommitted
 	stageState.Reservation.FleetID = evidence.FleetID
@@ -531,6 +609,7 @@ func (c *Commander) applySnapshot(run *state.Run, snapshot map[string]adapter.Da
 func (c *Commander) commitAdoption(run *state.Run, configured manifest.Stage, evidence adapter.FleetEvidence, generation uint64) {
 	stage := run.Stages[configured.ID]
 	stage.FleetID = evidence.FleetID
+	pinFleetEvidence(stage, evidence)
 	stage.Adopted = true
 	stage.Status = stageStatusFromFleet(evidence.Status)
 	stage.Reservation = &state.Reservation{
@@ -556,9 +635,32 @@ func (c *Commander) correlatedBinding(run *state.Run, stage manifest.Stage, corr
 
 func (c *Commander) bindingForStage(run *state.Run, configured manifest.Stage, stage *state.StageState) adapter.FleetBinding {
 	if stage != nil && !stage.Adopted && stage.Reservation != nil && stage.Reservation.CorrelationID != "" {
-		return c.correlatedBinding(run, configured, stage.Reservation.CorrelationID)
+		binding := c.correlatedBinding(run, configured, stage.Reservation.CorrelationID)
+		return withPinnedFleetBinding(binding, stage)
 	}
-	return c.binding(run, configured)
+	return withPinnedFleetBinding(c.binding(run, configured), stage)
+}
+
+func pinFleetEvidence(stage *state.StageState, evidence adapter.FleetEvidence) {
+	stage.Worktree = evidence.Worktree
+	stage.WorktreeGitPointer = evidence.WorktreeGitPointer
+	stage.WorktreeGitDir = evidence.WorktreeGitDir
+	stage.InitialSHA = evidence.InitialSHA
+	stage.WorktreeIdentity = evidence.WorktreeIdentity
+	stage.GitDirIdentity = evidence.GitDirIdentity
+}
+
+func withPinnedFleetBinding(binding adapter.FleetBinding, stage *state.StageState) adapter.FleetBinding {
+	if stage == nil {
+		return binding
+	}
+	binding.Worktree = stage.Worktree
+	binding.WorktreeGitPointer = stage.WorktreeGitPointer
+	binding.WorktreeGitDir = stage.WorktreeGitDir
+	binding.InitialSHA = stage.InitialSHA
+	binding.WorktreeIdentity = stage.WorktreeIdentity
+	binding.GitDirIdentity = stage.GitDirIdentity
+	return binding
 }
 
 func (c *Commander) save(run *state.Run, lease *state.Lease) error {
@@ -710,6 +812,55 @@ func cloneManifest(source *manifest.Manifest) (*manifest.Manifest, error) {
 		return nil, err
 	}
 	return &destination, nil
+}
+
+func normalizedManifest(source *manifest.Manifest) (*manifest.Manifest, error) {
+	result, err := cloneManifest(source)
+	if err != nil {
+		return nil, err
+	}
+	normalizeCommand := func(command *manifest.Command) {
+		if command.Args == nil {
+			command.Args = []string{}
+		}
+	}
+	if result.Spec.Adapters.Dagr.Args == nil {
+		result.Spec.Adapters.Dagr.Args = []string{}
+	}
+	for _, command := range []*manifest.Command{
+		&result.Spec.Adapters.Sergeant.Dispatch, &result.Spec.Adapters.Sergeant.Watch,
+		&result.Spec.Adapters.Sergeant.Wake, &result.Spec.Adapters.Sergeant.Drain,
+	} {
+		normalizeCommand(command)
+	}
+	for repositoryIndex := range result.Spec.Repositories {
+		repository := &result.Spec.Repositories[repositoryIndex]
+		if repository.Integration == nil {
+			repository.Integration = []manifest.Command{}
+		}
+		for commandIndex := range repository.Integration {
+			normalizeCommand(&repository.Integration[commandIndex])
+		}
+	}
+	for stageIndex := range result.Spec.Stages {
+		stage := &result.Spec.Stages[stageIndex]
+		if stage.DependsOn == nil {
+			stage.DependsOn = []string{}
+		}
+		if stage.Claims.Paths == nil {
+			stage.Claims.Paths = []string{}
+		}
+		if stage.Claims.Semantic == nil {
+			stage.Claims.Semantic = []string{}
+		}
+		if stage.Acceptance == nil {
+			stage.Acceptance = []manifest.Command{}
+		}
+		for commandIndex := range stage.Acceptance {
+			normalizeCommand(&stage.Acceptance[commandIndex])
+		}
+	}
+	return result, nil
 }
 
 func randomRunID() (string, error) {
