@@ -1,0 +1,94 @@
+apiVersion: platoon.dev/v1alpha1
+kind: Platoon
+metadata:
+  name: synthetic-platoon
+spec:
+  project: synthetic-project
+  mission: docs/mission.md
+  intent: docs/intent.md
+  limits:
+    implementation: 6
+    review: 2
+    leaseTTL: 5m
+    commandTimeout: 2m
+    maxOutputBytes: 65536
+  adapters:
+    dagr:
+      executable: dagr
+      database: .platoon/dagr.db
+      inspectExecutable: sqlite3
+    sergeant:
+      fleetRoot: .platoon/fleets
+      originProfile: platoon-local
+      dispatch:
+        executable: sgt-dispatch
+      watch:
+        executable: sgt-watch
+      wake:
+        executable: sgt-wake
+      drain:
+        executable: sgt-drain
+  routing:
+    - model: reasoning
+      risk: high
+      harness: opencode
+    - model: fast
+      risk: low
+      harness: opencode
+  repositories:
+    - id: synthetic-api
+      path: repos/synthetic-api
+      branch: feat/synthetic-api
+      maxWriters: 2
+      integration:
+        - executable: go
+          args: [test, ./...]
+    - id: synthetic-docs
+      path: repos/synthetic-docs
+      branch: docs/synthetic-guide
+      integration:
+        - executable: make
+          args: [check]
+  stages:
+    - id: build-api
+      repository: synthetic-api
+      task: task-build-api
+      mode: implementation
+      harness: opencode
+      model: reasoning
+      risk: high
+      dependsOn: []
+      claims:
+        paths: [internal/api]
+        semantic: [api-contract]
+      acceptance:
+        - executable: go
+          args: [test, ./internal/api/...]
+    - id: write-guide
+      repository: synthetic-docs
+      task: task-write-guide
+      mode: implementation
+      harness: opencode
+      model: fast
+      risk: low
+      dependsOn: [build-api]
+      claims:
+        paths: [docs/guide]
+        semantic: [operator-guide]
+      acceptance:
+        - executable: make
+          args: [check]
+    - id: review-release
+      repository: synthetic-api
+      task: task-review-release
+      mode: review
+      harness: opencode
+      model: reasoning
+      risk: high
+      dependsOn: [build-api, write-guide]
+      claims:
+        paths: []
+        semantic: []
+      acceptance:
+        - executable: go
+          args: [test, ./...]

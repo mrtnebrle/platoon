@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - run: go test ./...
+      - run: go vet ./...
+      - run: make demo
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - run: go test -race ./...
+
+  readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - run: go run ./internal/compliance/readmecheck
+        env:
+          PLATOON_EVENT_NAME: ${{ github.event_name }}
+          PLATOON_BEFORE_SHA: ${{ github.event.before }}
+          PLATOON_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PLATOON_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PLATOON_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

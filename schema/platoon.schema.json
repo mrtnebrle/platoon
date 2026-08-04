@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platoon.example/schema/platoon-v1alpha1.json",
+  "title": "Platoon manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platoon.dev/v1alpha1" },
+    "kind": { "const": "Platoon" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": { "name": { "$ref": "#/$defs/slug" } }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "mission", "intent", "limits", "adapters", "routing", "repositories", "stages"],
+      "properties": {
+        "project": { "$ref": "#/$defs/slug" },
+        "mission": { "$ref": "#/$defs/relativePath" },
+        "intent": { "$ref": "#/$defs/relativePath" },
+        "limits": { "$ref": "#/$defs/limits" },
+        "adapters": { "$ref": "#/$defs/adapters" },
+        "routing": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/route" }
+        },
+        "repositories": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/repository" }
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/stage" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+	  "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "opaqueID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "not": { "pattern": "(^\\.$|\\.\\.)" }
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\\\x00-\\x1F\\x7F](?:[^\\\\\\x00-\\x1F\\x7F]*[^/\\\\\\x00-\\x1F\\x7F])?$",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.{1,2}(/|$)" },
+          { "pattern": "//" },
+          { "pattern": "[*?\\[\\]{}]" }
+        ]
+      }
+    },
+    "claimPath": {
+      "allOf": [
+        { "$ref": "#/$defs/relativePath" },
+        { "pattern": "^[^*?\\[\\]{}]+$" }
+      ]
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable"],
+      "properties": {
+        "executable": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" }, "default": [] }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "implementation": { "type": "integer", "minimum": 1, "maximum": 128, "default": 6 },
+        "review": { "type": "integer", "minimum": 1, "maximum": 128, "default": 2 },
+        "leaseTTL": { "type": "string", "default": "5m" },
+        "commandTimeout": { "type": "string", "default": "2m" },
+        "maxOutputBytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 }
+      }
+    },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dagr", "sergeant"],
+      "properties": {
+        "dagr": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["executable", "database", "inspectExecutable"],
+          "properties": {
+            "executable": { "type": "string", "minLength": 1 },
+            "args": { "type": "array", "items": { "type": "string" } },
+            "database": { "type": "string", "minLength": 1 },
+            "inspectExecutable": { "type": "string", "minLength": 1 }
+          }
+        },
+        "sergeant": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fleetRoot", "originProfile", "dispatch", "watch", "wake", "drain"],
+          "properties": {
+            "fleetRoot": { "type": "string", "minLength": 1 },
+            "originProfile": { "$ref": "#/$defs/opaqueID" },
+            "dispatch": { "$ref": "#/$defs/command" },
+            "watch": { "$ref": "#/$defs/command" },
+            "wake": { "$ref": "#/$defs/command" },
+            "drain": { "$ref": "#/$defs/command" }
+          }
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "risk", "harness"],
+      "properties": {
+        "model": { "$ref": "#/$defs/opaqueID" },
+        "risk": { "$ref": "#/$defs/opaqueID" },
+        "harness": { "enum": ["opencode", "goose", "claude"] }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "branch", "integration"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "path": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string", "minLength": 1 },
+        "maxWriters": { "type": "integer", "minimum": 1, "maximum": 128, "default": 1 },
+        "integration": { "type": "array", "items": { "$ref": "#/$defs/command" } }
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paths", "semantic"],
+      "properties": {
+        "paths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/claimPath" } },
+        "semantic": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "repository", "task", "mode", "harness", "model", "risk", "dependsOn", "claims", "acceptance"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug", "maxLength": 24 },
+        "repository": { "$ref": "#/$defs/slug" },
+        "task": { "$ref": "#/$defs/opaqueID" },
+        "mode": { "enum": ["implementation", "review"] },
+        "harness": { "enum": ["opencode", "goose", "claude"] },
+        "model": { "$ref": "#/$defs/opaqueID" },
+        "risk": { "$ref": "#/$defs/opaqueID" },
+        "dependsOn": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+        "claims": { "$ref": "#/$defs/claims" },
+        "acceptance": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/command" } },
+        "adoptFleet": { "$ref": "#/$defs/opaqueID" }
+      }
+    }
+  }
+}
