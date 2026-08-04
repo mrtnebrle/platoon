@@ -182,9 +182,10 @@ dispatch, terminal evidence, claim verification, merge queue, dependency unlock,
 and completion. GitHub Actions runs tests on macOS and Linux, the race detector,
 vet, and the fake demonstration.
 
-CI also compares each push or pull-request change set with its proper Git base.
-Operator-visible source, schema, examples, installation, or lifecycle changes
-fail unless the `README.md` blob changes in the same change set.
+CI compares each push or pull request with its proper Git base, then checks every
+commit in that range. Operator-visible source, schema, examples, documentation,
+installation, or lifecycle changes fail unless that same commit changes the
+`README.md` blob; a later documentation commit cannot satisfy an earlier change.
 
 ## Limitations
 

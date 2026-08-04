@@ -26,28 +26,56 @@ func run(repository string, getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
-	paths, err := changedPaths(repository, base, head)
+	commits, err := commitsInRange(repository, base, head)
 	if err != nil {
 		return err
 	}
-	visible := false
-	for _, path := range paths {
-		if operatorVisible(path) {
-			visible = true
-			break
+	for _, commit := range commits {
+		parent := ""
+		if gitObjectExists(repository, commit+"^") {
+			parent = commit + "^"
+		}
+		paths, err := changedPaths(repository, parent, commit)
+		if err != nil {
+			return err
+		}
+		visible := false
+		for _, path := range paths {
+			if operatorVisible(path) {
+				visible = true
+				break
+			}
+		}
+		if !visible {
+			continue
+		}
+		changed, err := readmeBlobChanged(repository, parent, commit)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("operator-visible commit %s requires a README.md content update", commit)
 		}
 	}
-	if !visible {
-		return nil
-	}
-	changed, err := readmeBlobChanged(repository, base, head)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return errors.New("operator-visible changes require a README.md content update")
-	}
 	return nil
+}
+
+func commitsInRange(repository, base, head string) ([]string, error) {
+	rangeSpec := head
+	if base != "" {
+		rangeSpec = base + ".." + head
+	}
+	output, err := exec.Command("git", "-C", repository, "rev-list", "--reverse", rangeSpec).Output()
+	if err != nil {
+		return nil, errors.New("Git commit range required for README reconciliation is unavailable")
+	}
+	var commits []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if line != "" {
+			commits = append(commits, line)
+		}
+	}
+	return commits, nil
 }
 
 func comparisonBase(repository, head string, getenv func(string) string) (string, error) {

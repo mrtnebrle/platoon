@@ -31,8 +31,18 @@ func TestREADMEReconciliation(t *testing.T) {
 	runGit(t, repository, "commit", "-m", "docs")
 	head = runGit(t, repository, "rev-parse", "HEAD")
 	env = testEnv(map[string]string{"PLATOON_EVENT_NAME": "push", "PLATOON_BEFORE_SHA": base, "PLATOON_HEAD_SHA": head})
+	if err := run(repository, env); err == nil {
+		t.Fatal("later README commit incorrectly satisfied earlier behavior commit")
+	}
+	base = head
+	write(t, filepath.Join(repository, "internal", "feature.go"), "package internal\n\nconst Enabled = false\n")
+	write(t, filepath.Join(repository, "README.md"), "# Synthetic\n\nDisabled behavior.\n")
+	runGit(t, repository, "add", ".")
+	runGit(t, repository, "commit", "-m", "behavior and docs")
+	head = runGit(t, repository, "rev-parse", "HEAD")
+	env = testEnv(map[string]string{"PLATOON_EVENT_NAME": "push", "PLATOON_BEFORE_SHA": base, "PLATOON_HEAD_SHA": head})
 	if err := run(repository, env); err != nil {
-		t.Fatalf("change set with README failed: %v", err)
+		t.Fatalf("same-commit README update failed: %v", err)
 	}
 }
 

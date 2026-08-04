@@ -639,6 +639,20 @@ func (c *Commander) processMergeQueuesUnlocked(ctx context.Context, run *state.R
 			}
 			continue
 		}
+		if stageState.GlobalClaimID == "" {
+			if err := c.reserveGlobalClaim(ctx, run, configured, stageState); err != nil {
+				if errors.Is(err, state.ErrGlobalClaimConflict) {
+					stageState.Blocker = "global repository claim conflict while candidate is queued"
+					addBlocker(run, candidate.Stage, "global_claim_conflict", stageState.Blocker)
+					continue
+				}
+				return err
+			}
+			if err := c.save(run, lease); err != nil {
+				_ = c.releaseGlobalClaim(ctx, stageState)
+				return err
+			}
+		}
 		evidence, err := c.fleets.Read(candidate.FleetID, configured.Repository, c.bindingForStage(run, configured, stageState))
 		if err != nil || !candidateEvidenceMatches(candidate, evidence) {
 			invalidateCandidate(run, repository.ID, candidate.Stage, "candidate terminal evidence changed before integration")
@@ -949,10 +963,6 @@ func (c *Commander) reopenStaleTerminalCandidates(ctx context.Context, run *stat
 			candidate.BaseSHA = head
 			candidate.Diagnostic = "repository base changed after terminal completion; candidate requeued"
 			stage := run.Stages[candidate.Stage]
-			configured, _ := run.Manifest.Stage(candidate.Stage)
-			if err := c.reserveGlobalClaim(ctx, run, configured, stage); err != nil {
-				return false, err
-			}
 			stage.Status = state.StageCandidate
 			stage.DagrTerminalPending = ""
 			stage.FailureSource = ""

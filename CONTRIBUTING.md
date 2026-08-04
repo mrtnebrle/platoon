@@ -9,7 +9,7 @@ as state-machine changes rather than ordinary CLI refactors.
 2. Add one failing behavioral test at a public seam.
 3. Implement only enough of that vertical slice to pass.
 4. Run focused tests while iterating.
-5. Update `README.md` in the same change set whenever a command, manifest field,
+5. Update `README.md` in the same commit whenever a command, manifest field,
    lifecycle transition, installation step, safety invariant, limitation, or
    example changes.
 6. Before review, run `make test`, `make race`, `make vet`, and `make demo`.

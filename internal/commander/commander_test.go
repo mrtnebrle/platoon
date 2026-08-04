@@ -876,6 +876,70 @@ func TestActiveRunReopensCompletedStageAfterBaseChange(t *testing.T) {
 	}
 }
 
+func TestTwoStaleCandidatesRequeueWithoutOrphaningGlobalClaim(t *testing.T) {
+	authority, err := state.OpenAuthorityAt(filepath.Join(t.TempDir(), "authority"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newFixture(t)
+	fixture.commander.authority = authority
+	m := fixture.manifest(
+		implementationStage("api", "internal/api", "api-contract"),
+		implementationStage("worker", "internal/worker", "worker-contract"),
+	)
+	m.Spec.Limits.Implementation = 2
+	m.Spec.Repositories[0].MaxWriters = 1
+	m.Spec.Repositories[0].Path = t.TempDir()
+	run, err := fixture.commander.Start(context.Background(), m, fixture.startInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStage := dispatchedStage(run)
+	fixture.fleets.setStatus("fleet-"+firstStage, adapter.FleetDone)
+	run, err = fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStage := "api"
+	if firstStage == secondStage {
+		secondStage = "worker"
+	}
+	if run.Stages[secondStage].FleetID == "" {
+		run, err = fixture.commander.Reconcile(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.fleets.setStatus("fleet-"+secondStage, adapter.FleetDone)
+	run, err = fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil || run.Status != state.RunCompleted {
+		t.Fatalf("initial sequential completion status=%q err=%v", run.Status, err)
+	}
+	fixture.integrator.mu.Lock()
+	fixture.integrator.head = strings.Repeat("f", 40)
+	fixture.integrator.mu.Unlock()
+	reopened, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range reopened.MergeQueue["synthetic-repo"] {
+		if candidate.Status != state.CandidateQueued || reopened.Stages[candidate.Stage].GlobalClaimID != "" {
+			t.Fatalf("stale candidate reserved before local requeue: candidate=%#v stage=%#v", candidate, reopened.Stages[candidate.Stage])
+		}
+	}
+	afterFirst, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFirst.Status == state.RunCompleted {
+		t.Fatal("both one-writer candidates integrated in one cycle")
+	}
+	completed, err := fixture.commander.Reconcile(context.Background(), run.ID)
+	if err != nil || completed.Status != state.RunCompleted || fixture.integrator.runCalls != 4 {
+		t.Fatalf("stale candidates did not converge: status=%q calls=%d err=%v", completed.Status, fixture.integrator.runCalls, err)
+	}
+}
+
 func TestConcurrentReconciliationCannotDoubleAdmit(t *testing.T) {
 	fixture := newFixture(t)
 	m := fixture.manifest(
