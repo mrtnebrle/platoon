@@ -473,6 +473,7 @@ Source kinds are closed and provenance labels are derived, never authored:
 | `dagr` | `dagr` | Configured Dagr adapter/snapshot schema | Workflow/run/stage identities, adapter version, observation time/digest |
 | `sergeant` | `sergeant` | Version-negotiated Sergeant query/file schema | Schema version, scope/correlation, observation time/digest |
 | `receiving-system` | `receiving_system` | Registered typed authority adapter plus `platoon.receiving-capability/v1alpha1` | Capability/authority/action revision, environment class, observation time, decision digest |
+| `environment-classifier` | `receiving_system` | Independently configured target-classification trust root / `platoon.target-proof/v1alpha1` | Issuer/trust-root revision, signature, target/endpoint/environment proof digest and expiry |
 | `validation-capability` | `platoon` | Operator-owned `platoon.validation-capability/v1alpha1` profile | Profile, executable, sandbox self-test, and policy digests |
 | `platoon-policy` | `platoon` | Snapshotted Platoon policy schema | Exact policy version and content digest |
 
@@ -495,6 +496,15 @@ qualities, observation times, and per-source freshness policy. Its bundle ID is
 the domain-separated RFC 8785 SHA-256 of that envelope. Raw source/transport
 bodies are excluded.
 
+Each observation carries separate identities. `contentDigest` covers canonical
+source ID/kind, negotiated schema/version, source-native revision, quality, and
+the complete substantive typed payload. It excludes `observedAt`, collection
+duration, adapter timing, freshness age, and transport metadata. `envelopeDigest`
+covers both content and those provenance fields. Bundle ID covers ordered
+envelopes; a separate `contentSetDigest` covers ordered source IDs and content
+digests. Freshness is evaluated from provenance and policy, never by changing
+content identity.
+
 `Compile`/`plan` never query mutable systems. They consume an optional bundle and
 produce deterministic readiness from its exact bytes. A required mutable source
 without a valid bundle, with expired freshness, or with inconclusive quality is
@@ -503,11 +513,14 @@ offline preview of declaration shape and static admission decisions.
 
 Applied typed `start` re-queries every source required for entry/authority after
 the common read/query gate and before packet/run file publication. Each current
-schema, revision, quality, and observation digest must match the compiled bundle
-and source freshness policy. Any change returns `replan_required` without packet
-files, Dagr/Sergeant call, or other effect. A match allows final packet
-publication with the revalidated observation/bundle digest. Survey and apply
-both resolve td only through `SergeantMissionSource`.
+schema, source revision, quality, and `contentDigest` must match the compiled
+bundle; the new `observedAt` must independently satisfy source freshness policy.
+An observation collected later with identical content therefore matches. Any
+substantive/schema/revision/quality change or stale current observation returns
+`replan_required` without packet files, Dagr/Sergeant call, or other effect. A
+match allows final packet publication with compiled bundle ID plus revalidated
+`contentSetDigest`; current envelope/provenance is recorded separately. Survey
+and apply both resolve td only through `SergeantMissionSource`.
 
 Required mission classes and completion rules are closed in v1alpha1. Effect
 ceilings list what a class may explicitly request; they grant nothing by
@@ -551,8 +564,24 @@ action registry. Each action declares environment class from `development`,
 `test`, or `staging`, `production:false`, `destructive:false`, mutability, and
 authority/receipt schema. Production, unknown/unclassified environment,
 destructive action, missing capability, or declaration/capability mismatch is
-invalid. Apply revalidates the same capability revision immediately before the
-effect; the receipt must echo action/environment and authority revision.
+invalid.
+
+The declaration also names one `environment-classifier` source independent of
+the action adapter. Its configured trust root verifies a signed
+`platoon.target-proof/v1alpha1` containing issuer/trust-root ID and revision,
+adapter identity digest, action ID, immutable target/resource ID, pinned endpoint
+public-key/certificate digest, environment class, `production:false`,
+`destructive:false`, authority/capability revisions, issued/expiry time, and
+proof digest. The action adapter cannot self-issue this proof.
+
+Immediately before invocation, Platoon resolves the actual target without
+following an unproved redirect, validates signature/expiry and every
+request/capability field, pins transport to the proved endpoint identity, and
+includes proof/target digests in the request digest. The receiving authority's
+receipt must echo proof, target, endpoint, action/environment, and authority
+revision. Forgery, self-assertion, unknown target, target/endpoint drift,
+redirect, expiry, or mismatch fails before effect or becomes `unknown` if the
+transport changed after invocation.
 
 | Adapter operation | Required effect | Authority evidence and accepted receipt |
 |---|---|---|
@@ -566,7 +595,7 @@ effect; the receipt must echo action/environment and authority revision.
 | Handoff offer/withdraw/accept/consume | `publish-handoff` | Current packet/stage/source evidence and local joint transition commit; withdrawal additionally requires current unaccepted offer plus drift/invalidation evidence |
 | Acceptance/integration command | `run-validation` | Pinned repository/worktree/head plus enforced `no-external-effect/v1` capability profile; bounded exit/evidence digest |
 | Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
-| Receiving-system action | `receiving-system-operation` | Named capability action with non-production/non-destructive environment proof, owner/revision, and matching authority decision receipt |
+| Receiving-system action | `receiving-system-operation` | Named capability action plus independently signed target/endpoint environment proof, pinned transport, owner/revision, and matching authority receipt |
 
 Typed mode also requires `spec.commandPolicies` to cover every repository
 integration and stage acceptance command by deterministic reference
@@ -677,8 +706,8 @@ media type enter the envelope.
 The canonical `platoon.packet/v1alpha1` envelope contains its schema, normalized
 manifest and declaration values, all three exact source digests, intent media
 type, selected handoff contracts sorted by ID, source descriptors sorted by ID
-including source-native revisions and revalidated bundle digest, and every
-nested schema version. Packet ID is
+including source-native revisions, compiled bundle ID, and revalidated
+`contentSetDigest`, plus every nested schema version. Packet ID is
 lowercase SHA-256 over the ASCII domain separator
 `platoon.packet/v1alpha1` followed by one NUL byte and the canonical envelope
 bytes. Golden fixtures SHALL prove that map-key input order and schema-set
@@ -1159,6 +1188,8 @@ adapter output only.
 | Survey | Read/query effect, caller, source, or stop is not allowed | Refuse before source adapter query; no bundle/state |
 | Compile | Required mutable source bundle is absent, stale, mismatched, or inconclusive | Deterministic not-ready result with explicit unknown |
 | Apply | Revalidated source/capability differs from compiled bundle | Return replan-required before packet/effect; create no run files |
+| Apply | Requery is later but schema/revision/quality/content digest match | Freshness passes and apply may publish; observedAt difference is provenance only |
+| Apply | Requery changes substantive payload, schema, revision, or quality | Content identity mismatch returns replan-required before publication/effect |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
 | Compile | Class-required output category is missing or duplicated | Invalid; completion rules are not inferred |
 | Compile | Output category is unknown or extra output reuses required category | Invalid declaration |
@@ -1270,6 +1301,9 @@ adapter output only.
 | External request | Receiving operation requests production activation | Invalid/global prohibition; never invoke adapter |
 | External request | Receiving action capability is absent, unknown, destructive, production, or changed | Compile/apply gate refuses before adapter invocation |
 | External request | Receipt action/environment/capability revision mismatches request | Record unknown; reconcile, never accept |
+| External request | Target proof is forged, self-issued by adapter, expired, or from unknown classifier | Refuse before invocation |
+| External request | Actual resource/endpoint differs or redirects from target proof | Refuse before effect; post-invocation drift is unknown/reconcile required |
+| External request | Receipt omits/mismatches target, endpoint, or proof digest | Reject as unknown; never accept production scope by label alone |
 | External request | Applicable stop, block, contradiction, exclusion, or drift is active | Pre-request gate refuses without adapter invocation |
 | External request | Continuation, packet, projection, or run generation is stale | Fenced compare refuses without adapter invocation |
 | External request | Receiving authority/revision is missing or stale | Pre-request gate refuses without adapter invocation |
