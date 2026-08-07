@@ -275,8 +275,10 @@ evidence for current behavior and authority.
 The following statements are implemented evidence at the pinned Platoon fixed
 point, not Atlas proposals.
 
-1. The manifest requires `spec.mission` and validates it as a relative reference
-   ([manifest model and validation][platoon-manifest]).
+1. The published manifest schema requires `spec.mission`
+   ([schema][platoon-manifest-schema]) and runtime validates it as a safe
+   relative reference
+   ([validation][platoon-manifest-validation]).
 2. Applied start accepts a manifest snapshot and `IntentPath`, reads and
    snapshots only the intent, and initializes run state without reading the
    mission reference ([Commander start][platoon-start]). The mission reference
@@ -399,10 +401,10 @@ Packet identity uses a versioned byte contract. Stable-read source bytes produce
 exact bytes. Strictly decoded manifest and declaration values are defaulted and
 normalized by their schema versions, schema-declared sets sort by normalized
 stable ID, and ordered arrays retain declaration order. The resulting envelope
-is encoded with RFC 8785 JSON Canonicalization Scheme; values outside its JSON
-domain, nulls where the schema has no null, and unknown fields are rejected. The
-intent body is not normalized; only its exact-byte digest and media type enter
-the envelope.
+is encoded with [RFC 8785 JSON Canonicalization Scheme][rfc-8785]; values outside
+its JSON domain, nulls where the schema has no null, and unknown fields are
+rejected. The intent body is not normalized; only its exact-byte digest and
+media type enter the envelope.
 
 The canonical `platoon.packet/v1alpha1` envelope contains its schema, normalized
 manifest and declaration values, all three exact source digests, intent media
@@ -464,7 +466,7 @@ Repeated observation returns the same offer.
 
 `Handoff` exposes the lifecycle inside the single Mission Control interface.
 `offer` is accepted only from the verified reconciliation path; `withdraw`
-requires drift or invalidation evidence and is forbidden after consumption;
+requires drift or invalidation evidence and is forbidden after acceptance;
 `accept` validates schema, packet, producer identity, evidence, compatibility,
 freshness, and current projection; `consume` occurs compare-before-set inside
 the consumer's existing fenced admission transaction. The consumer's accepted
@@ -527,7 +529,7 @@ that references a missing, mismatched, or non-successor object enters
 Meaningful event types include:
 
 - packet/run published;
-- entry admitted or refused;
+- entry admitted;
 - observation changed quality or value;
 - stage admitted, handed off, excluded, resumed, or terminal;
 - blocking unknown or contradiction disposition changed;
@@ -674,9 +676,11 @@ it does not broadcast to multiple systems.
 #### Mission Run
 
 `compiled_not_ready` and `compiled_ready` are preview results, not durable run
-states. A ready applied request publishes `initializing`, then reaches `active`
-only after current Dagr start recovery succeeds. A not-ready applied request may
-publish `refused` block evidence only when no external effect occurred.
+states. Admission readiness is evaluated before packet/run publication or any
+adapter effect. A not-ready applied request returns the same bounded non-durable
+refusal as compile and creates no run, event, packet file, or cleanup obligation.
+A ready applied request publishes `initializing`, then reaches `active` only
+after current Dagr start recovery succeeds.
 
 | From | Trigger | Guard / Dagr relationship | To | Terminal |
 |---|---|---|---|---:|
@@ -685,6 +689,9 @@ publish `refused` block evidence only when no external effect occurred.
 | `active` | Operator drains admission | Expected generation; does not signal Dagr/Sergeant | `drained` | no |
 | `active` | Drift cannot safely resolve | Affected admission stops; running child is not rewritten | `excluded` | no |
 | `active` | External outcome uncertain | Owning adapter cannot prove accepted/refused/absent | `reconcile_required` | no |
+| `reconcile_required` | Correlation proves no effect | Exact source-specific absence proof; expected generation and prior state match | prior safe nonterminal state | no |
+| `reconcile_required` | Correlation proves accepted effect | Exact authority revision and receipt/fleet binding determine one result | `active` or matching `record_required` | no |
+| `reconcile_required` | Evidence proves unsafe/incompatible result | Exact correlation and current projection identify affected scope | `excluded` | no |
 | `drained` | Operator resumes | Drain continuation and generations match | prior nonterminal state | no |
 | `excluded` | Resurvey permits resume | Required inputs and projection generation match | `active` | no |
 | any nonterminal | Mission acceptance verified | All required Dagr stages have compatible terminal evidence and handoffs | `record_required(completed)` | no |
@@ -697,6 +704,12 @@ publish `refused` block evidence only when no external effect occurred.
 A direct terminal write, terminal resume, or pending-outcome change is invalid.
 Recovery from a publication crash remains `record_required` until the exact
 record digest is proven and the atomic terminal pointer is published.
+Every entry to `reconcile_required` stores its source-specific reason,
+correlation, expected authority revision, prior safe nonterminal state, and
+generation. Reconciliation reads only the owning adapter's authoritative
+evidence and is itself generation-fenced. Missing, stale, wrong-correlation, or
+multiple/conflicting results remain `reconcile_required`; they never choose a
+destination. Recovery does not signal, rewrite, or clean up a Sergeant child.
 
 #### Projection
 
@@ -759,6 +772,7 @@ evidence can pass an unattended admission transaction.
 | Handoff accepted while source drifts | Consumer begins stale work | Compare revisions at admission; exclude on mismatch |
 | Required input arrives during resume | Wrong decision consumed | Compare source revision and continuation generation immediately before effect |
 | Resume request reaches Sergeant but receipt is lost | Duplicate child action | Sergeant correlation owns reconciliation; Platoon does not retry without proof |
+| Reconciliation evidence changes before state commit | Wrong recovery destination | Re-read correlation/authority revision under generation fence; mismatch stays reconcile required |
 | Receiving authority decides while transport receipt is lost | Authorization confused with transport | Record `unknown`; reconcile correlation and authority revision before any retry |
 | Finding created externally before receipt persists | Duplicate route | Reconcile by stable digest/correlation; ambiguity blocks |
 | Child terminal before Mission Record | False mission completion | Enter `record_required`; preserve exact child state separately |
@@ -785,6 +799,7 @@ adapter output only.
 | Compile | Contradiction has no authority route | Invalid declaration |
 | Apply | Declaration digest differs from preview | No run or adapter invocation |
 | Apply | Partial packet publication | No authoritative run; retry is safe |
+| Apply | Readiness is not satisfied | Return bounded non-durable not-ready result; create no packet/run/event files |
 | Run | Transition directly from active to completed | Reject; Mission Record remains required |
 | Run | Resume drained/excluded without its matching guard | No effect; run stays non-active |
 | Run | Resume superseded, completed, or failed-safely run | Terminal refusal without adapter call |
@@ -806,6 +821,7 @@ adapter output only.
 | Handoff | Child or unverified caller attempts to publish an offer | Reject; only applied verified reconciliation is ingress |
 | Handoff | Evidence missing, stale, wrong packet, or wrong stage | Consumer remains blocked |
 | Handoff | Unknown major schema | Incompatible and reassembly required |
+| Handoff | Offer is withdrawn after acceptance | Reject withdrawal; resurvey may exclude and require a new offer |
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
 | Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
@@ -816,6 +832,10 @@ adapter output only.
 | Resume | Stale run generation or projection revision | No effect; explicit stale request |
 | Resume | Required input from wrong authority | No effect; continuation stays open |
 | Resume | Superseded or expired continuation | No effect; terminal refusal |
+| Reconcile | Exact absence proof matches correlation and generation | Return to recorded prior safe nonterminal state |
+| Reconcile | Exact accepted receipt determines one result | Move to active or matching record-required state without duplicate effect |
+| Reconcile | Evidence is missing, stale, wrong-correlation, or ambiguous | Stay reconcile required; no adapter effect |
+| Reconcile | Recovery evidence races a newer generation | Compare fails; newer state remains authoritative |
 | Resurvey | Source unavailable or contradictory | `exclude`, never `continue` |
 | Resurvey | Intent/effect/completion changed | `reassemble` or `supersede`, never projection-only amendment |
 | Resurvey | Compatible revision with failed evidence validation | `exclude`; prior projection remains current |
@@ -839,6 +859,9 @@ adapter output only.
 | External request | Receipt omits authority decision reference | Reject receipt as inconclusive and fail closed |
 | Compatibility | Existing v1alpha1 manifest with old Sergeant files | Existing behavior unchanged; mission features report compatibility mode |
 | Compatibility | Nonterminal pre-mission run is older than immediately prior schema | Original commands remain operable; no forced in-place upgrade |
+| Rollback | Typed run has an active Sergeant child | Rolled-back release still reconciles/drains/resumes that run; child is untouched |
+| Rollback | Typed run is excluded, reconcile-required, or record-required | Rolled-back release retains all guarded operations needed to reach terminal |
+| Rollback | Binary cannot operate an existing typed state version | Rollback is refused before replacement; current compatible binary remains |
 | Privacy | Source contains secret or absolute private path | Output omits it and records bounded rejection |
 | Bounds | More sources/events/findings than limits | Deterministic truncation metadata or fail closed where completeness is required |
 
@@ -918,9 +941,13 @@ place. Operators may finish them or start a new typed mission run.
 #### Rollback
 
 Each phase is feature-gated by document/state version rather than an environment
-toggle hidden from status. Rollback means stop creating the new version while
-retaining read-only inspection of already published packets, projections,
-events, and records. Never rewrite new durable state into an old layout.
+toggle hidden from status. Rollback means stop creating new typed runs while
+retaining both read and guarded mutating operations for every already published
+typed nonterminal run, including reconcile, drain, resume, resurvey, handoff,
+route, and record. The rolled-back release carries compatibility handlers until
+those runs are terminal. A binary lacking handlers for any published typed
+state version is not a valid rollback target and MUST NOT replace the compatible
+binary. Never rewrite new durable state into an old layout.
 
 If Sergeant query integration must roll back, mission status marks the source
 unsupported and uses only previously supported exact local evidence. It does not
@@ -1153,7 +1180,8 @@ those improvements before evidence exists.
 [platoon-architecture]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/docs/architecture.md#L3-L13
 [platoon-dispatch]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/adapter/sergeant.go#L13-L87
 [platoon-limitations]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/README.md#L190-L208
-[platoon-manifest]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/manifest/manifest.go#L33-L53
+[platoon-manifest-schema]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/schema/platoon.schema.json#L17-L25
+[platoon-manifest-validation]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/manifest/manifest.go#L229-L246
 [platoon-start]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/commander/commander.go#L69-L182
 [platoon-state]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/state/types.go#L16-L151
 [platoon-status]: https://github.com/mrtnebrle/platoon/blob/1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4/internal/cli/status.go#L12-L123
@@ -1163,3 +1191,4 @@ those improvements before evidence exists.
 [sergeant-status]: https://github.com/callmeradical/sergeant/blob/efcc96639ab83caf908e651bbedc0790487620a0/bin/sgt-status
 [sergeant-tree]: https://github.com/callmeradical/sergeant/tree/efcc96639ab83caf908e651bbedc0790487620a0
 [sergeant-watch-test]: https://github.com/callmeradical/sergeant/blob/efcc96639ab83caf908e651bbedc0790487620a0/tests/sgt-watch-snapshot-test.sh
+[rfc-8785]: https://www.rfc-editor.org/rfc/rfc8785
