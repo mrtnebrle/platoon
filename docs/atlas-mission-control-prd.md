@@ -1,9 +1,9 @@
 # Atlas-Inspired Mission Control PRD
 
-Status: proposed
-PRD version: 1.0
-Source fixed point: Platoon `1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4`
-Last source survey: 2026-08-07
+- Status: proposed
+- PRD version: 1.0
+- Source fixed point: Platoon `1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4`
+- Last source survey: 2026-08-07
 
 ## Summary
 
@@ -432,6 +432,13 @@ idempotency key, and preparation time. No invocation has occurred while
 `invoking`; only then may the adapter run. A bounded receipt is validated and
 the joint transition atomically stores `committed` or `refused` with its digest
 and operation result.
+
+If generation/authorization revalidation fails while `prepared`, the current
+full fence publishes terminal `canceled_preinvoke` with bounded reason/evidence,
+releases the attempt reservation, and invokes no adapter. This is not an adapter
+refusal and carries no receipt. `retry_prepared` has the same cancellation path.
+The operation-specific reducer then preserves/excludes/replans the run according
+to the failed guard; the canceled attempt itself can no longer run.
 
 A crash in `prepared` may invoke once only after all recorded generations and
 authorization evidence still match. A crash or transport loss in `invoking` is
@@ -1148,15 +1155,17 @@ evidence can pass an unattended admission transaction.
 #### Effect Attempt
 
 An external effect attempt moves from `prepared` to `invoking`, then to
-`committed` or `refused`. Lost/invalid receipt moves `invoking` to
+`committed` or `refused`; failed pre-invocation revalidation moves `prepared` to
+terminal `canceled_preinvoke`. Lost/invalid receipt moves `invoking` to
 `reconcile_required`; exact correlated recovery then reaches `committed`,
 `refused`, or `absent`. Only `prepared` is proven pre-invocation. Terminal
 attempt phases are immutable, and a repeated idempotency key must return the
 same request/receipt digests. For a replay-safe command only,
 `reconcile_required(ordinal=1)` may move to `retry_prepared(ordinal=2)` after the
 declared proof, then `retry_invoking(ordinal=2)`, and finally `committed`,
-`refused`, or terminal `reconcile_required`. The root attempt ID/request digest
-never changes and no ordinal greater than two is valid.
+`refused`, `canceled_preinvoke`, or terminal `reconcile_required`. The root
+attempt ID/request digest never changes and no ordinal greater than two is
+valid.
 
 ### Failure Windows
 
@@ -1165,6 +1174,7 @@ never changes and no ordinal greater than two is valid.
 | Declaration read before packet publication | Source changes during compile | Stable read and digest verification; no run publication |
 | Packet files published before run pointer | Orphan immutable files | Ignore as non-authoritative; bounded cleanup may remove after proof |
 | Effect attempt prepared before invoking | Crash before phase change | Proven no invocation; revalidate generations/authorization before one call |
+| Prepared attempt revalidation fails | Nonterminal attempt can strand run | Publish terminal canceled-preinvoke and release reservation without adapter call |
 | Effect attempt marked invoking before adapter call | Crash before or during call | Outcome uncertain; require correlated absence/receipt evidence before retry |
 | Replay proof published before retry invocation | Crash before ordinal-two call | `retry_prepared` proves no second call; revalidate gate, then invoke ordinal two once |
 | Replay-safe ordinal-two invocation is uncertain | Accidental third call | Remain reconcile required; journal rejects ordinal greater than two/new root attempt |
@@ -1278,6 +1288,8 @@ adapter output only.
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
 | Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
 | Effect attempt | Crash after prepared and before invoking | Revalidate and invoke at most once; stale authorization refuses |
+| Effect attempt | Prepared/retry-prepared generation or authorization becomes stale | Publish canceled-preinvoke, release reservation, and prove zero adapter calls |
+| Effect attempt | Canceled-preinvoke attempt is replayed | Terminal refusal; operation must create no new root attempt for same request |
 | Effect attempt | Crash after invoking and before/after external effect | Reconcile by correlation; never assume absence or retry blindly |
 | Effect attempt | Receipt arrives before committed state publication | Re-query exact receipt and converge one committed/refused result |
 | Effect attempt | Adapter lacks correlation, deduplication, or absence proof | Typed effect is unsupported before invocation |
