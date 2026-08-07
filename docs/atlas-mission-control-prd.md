@@ -498,7 +498,7 @@ effecting operation map is:
 | Sergeant lifecycle request | `request-sergeant-lifecycle` | Verified Sergeant owner/revision and supported action; correlated receipt; Sergeant decides |
 | Mission finding route | `route-finding` | Configured disposition authority/revision; external finding reference/receipt |
 | Handoff offer/withdraw/accept/consume | `publish-handoff` | Current packet/stage/source evidence and local joint transition commit; withdrawal additionally requires current unaccepted offer plus drift/invalidation evidence |
-| Acceptance/integration command | `run-validation` | Pinned repository/worktree/head and command contract; bounded exit/evidence digest |
+| Acceptance/integration command | `run-validation` | Pinned repository/worktree/head plus enforced `no-external-effect/v1` capability profile; bounded exit/evidence digest |
 | Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
 | Receiving-system action | `receiving-system-operation` | Named source, action, owner and revision; revisioned authority decision receipt |
 
@@ -506,14 +506,27 @@ Typed mode also requires `spec.commandPolicies` to cover every repository
 integration and stage acceptance command by deterministic reference
 `repository:<id>:integration:<zero-based-index>` or
 `stage:<id>:acceptance:<zero-based-index>`. Each policy has exactly one mode:
-`replay-safe` or `single-attempt`. There is no default. `replay-safe` asserts the
-command has no external effect and may rerun only after the recorded process
-group is absent and pinned repository/worktree/head identity plus claimed diff
-have been re-observed. `single-attempt` is never retried automatically after
-`invoking`; uncertainty remains `reconcile_required` for explicit recovery or
-safe failure. The canonical command request digest includes executable, args,
-working identity, policy mode, and attempt ID. Legacy reference mode retains
-current command behavior.
+`replay-safe` or `single-attempt`, and names one source-catalog
+`validation-capability` profile. There is no default.
+
+The operator-owned, versioned capability profile binds executable digest and
+allowed argument shape to `no-external-effect/v1`. Its executor disables network,
+passes no credentials or credential helpers, mounts the source/worktree
+read-only, and permits writes only in disposable private temp/cache paths. It
+rejects Git/GitHub mutation, Dagr/Sergeant commands, deployment/production
+tools, identity/credential tools, shells, and every executable/argument shape
+not in the profile. If the host cannot enforce all profile controls, typed
+`run-validation` is unsupported before invocation. An operation with a real
+external effect must use its typed adapter/effect and can never be classified as
+`run-validation`.
+
+`replay-safe` may rerun only after the recorded process group is absent and
+pinned repository/worktree/head identity plus claimed diff have been
+re-observed. `single-attempt` is never retried automatically after `invoking`;
+uncertainty remains `reconcile_required` for explicit recovery or safe failure.
+The canonical command request digest includes executable/digest, args, working
+identity, capability profile/version, policy mode, and attempt ID. Legacy
+reference mode retains current command behavior.
 
 Each stop has stable ID; one typed predicate; scope; blocked transitions/effects;
 and route. A predicate names one source ID, schema field path, operator from
@@ -1060,6 +1073,8 @@ adapter output only.
 | Compile | Allowed invocation tuple has zero or multiple actor-authority matches | Invalid before packet/run publication |
 | Compile | Effect has zero/multiple authoritative sources or route owners | Invalid before packet/run publication |
 | Compile | Typed command lacks policy or uses unknown command reference/mode | Invalid declaration; no default replay safety |
+| Compile | Validation capability is absent, unverified, wrong executable digest, or unsupported on host | Typed validation is not ready; no command invocation |
+| Compile | Validation command/profile permits GitHub/Git/Dagr/Sergeant/deploy/credential mutation | Reject profile/command; cannot classify as run-validation |
 | Compile | Blocking unknown unresolved | Packet preview not ready; apply refuses before effects |
 | Compile | Contradiction has no authority route | Invalid declaration |
 | Apply | Declaration digest differs from preview | No run or adapter invocation |
@@ -1112,6 +1127,8 @@ adapter output only.
 | Command attempt | Replay-safe command loses receipt | Same root attempt may publish ordinal two only after proof and renewed authorization |
 | Command attempt | Replay-safe ordinal two is uncertain or ordinal three is requested | No further invocation; remain reconcile required |
 | Command attempt | Single-attempt command loses receipt | Never retry automatically; remain reconcile required for explicit disposition |
+| Command attempt | Sandbox cannot disable network/credentials or read-only mount fails | Fail before executable starts; no effect attempt invocation |
+| Command attempt | Command tries to write source or access network | Sandbox denies; bounded failure evidence, no external effect |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
 | Continuation | Missing safe state, action, route, or required input | Invalid nonterminal outcome |
@@ -1169,6 +1186,9 @@ adapter output only.
 | Bounds | Whole exact observations exceed aggregate status cap | Return deterministic whole-object page/count/cursor; omitted means unknown |
 | Bounds | Cursor is stale, malformed, or belongs to another run/generation | Reject cursor; do not return a mismatched page |
 | Bounds | Ephemeral observation source changes between status pages | Observation-set digest mismatch returns stale cursor and no mixed page |
+| Bounds | First page fixed sections leave no observation capacity | Return cursor; observation-only continuation returns at least one whole object |
+| Bounds | Equal source/time/digest observations exist | Immutable observation ID orders them uniquely without skip/duplicate |
+| Bounds | Nonterminal cursor page would return zero observations | Reject invalid observation/budget; never emit same/non-advancing cursor |
 
 ### Compatibility, Migration, And Rollback
 
@@ -1296,8 +1316,9 @@ Initial hard bounds, configurable only within published safe ranges:
   operation-specific bound applies.
 
 Status orders observation objects by source label, stable source ID, observation
-time, then digest. It emits only whole schema-validated objects that fit after
-the fixed report sections; it never truncates fields inside an observation. If
+time, digest, then immutable observation ID as the unique final key. It emits
+only whole schema-validated objects that fit after the fixed report sections; it
+never truncates fields inside an observation. If
 the next whole object would exceed 2 MiB, status sets
 `observationsTruncated:true`, reports total/returned counts, and returns a
 versioned opaque cursor. Before paging, status computes an observation-set
@@ -1312,6 +1333,15 @@ subject to the same aggregate cap. A cursor contains no locator or private
 value. Omitted observations remain unknown/not-returned, never absent, and
 interpretations cite observation IDs even when their full object is on a later
 page.
+
+When fixed first-page sections leave insufficient room, status may return zero
+observations and a cursor. Every nonterminal cursor response thereafter uses an
+observation-only envelope containing run/generation, query/set digests, counts,
+and next cursor; it omits already returned fixed sections and reserves 1 MiB
+plus envelope overhead, so at least one valid whole observation must advance the
+cursor. An object that cannot fit despite its 1 MiB input limit is an invalid
+bounded observation, not another zero-progress cursor. End of set returns no
+cursor.
 
 Completeness-sensitive operations, compilation, handoff acceptance, drift
 verdict, resume, and record derivation, fail closed rather than truncate inputs.

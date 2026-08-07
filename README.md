@@ -80,10 +80,10 @@ start, reconcile, drain, resume, and status. It preserves Dagr readiness,
 Sergeant worker lifecycle, Git/td authority, explicit apply, and current adapter
 compatibility.
 It also specifies closed class/output/non-production-effect/stop contracts,
-crash-safe effect attempts, command replay policies, complete authority
-coverage, and a tested compatibility artifact that keeps typed runs operable
-across rollback. This is a design proposal; none of that proposed behavior is
-implemented yet.
+crash-safe effect attempts, sandboxed validation/replay policies, complete
+authority coverage, and a tested compatibility artifact that keeps typed runs
+operable across rollback. This is a design proposal; none of that proposed
+behavior is implemented yet.
 
 Implementation and review pools default to six and two tokens. A repository
 defaults to one writer. Raising `maxWriters` allows same-repository concurrency
