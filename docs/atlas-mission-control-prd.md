@@ -450,14 +450,14 @@ default. Every typed declaration still names its exact allowed subset.
 
 | Class | Required outputs for `completed` | Effect ceiling beyond read/query/orchestration/route | Permitted terminal outcomes |
 |---|---|---|---|
-| `discover` | Sourced answers, remaining unknown/contradiction dispositions, evidence and finding references | none | completed, failed_safely, superseded |
-| `decide` | Attributable decision, deciding authority reference/revision, rationale, downstream effects | none | completed, failed_safely, superseded |
-| `change-substrate` | Product delta plus compatibility, migration, rollback, dependency, and invalidation evidence | write-claimed-source | completed, failed_safely, superseded |
-| `deliver` | Product delta and every declared acceptance result/evidence | write-claimed-source | completed, failed_safely, superseded |
-| `validate` | Independent acceptance evidence and finding/disposition references; no remediation patch | none | completed, failed_safely, superseded |
-| `operate` | Receiving-system operation receipt, resulting state, and audit evidence | receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
-| `recover` | Proven safe state, cause classification, recovery evidence, and next continuation if residual work remains | write-claimed-source, receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
-| `learn` | Sourced world delta, findings, and capability/workflow candidates | none | completed, failed_safely, superseded |
+| `discover` | `sourced-answers`, `unknown-dispositions`, `evidence-references`, `finding-references` | none | completed, failed_safely, superseded |
+| `decide` | `decision`, `authority-decision-evidence`, `decision-rationale`, `downstream-effects` | none | completed, failed_safely, superseded |
+| `change-substrate` | `product-delta`, `compatibility-evidence`, `migration-evidence`, `rollback-evidence`, `dependency-evidence`, `invalidation-evidence` | write-claimed-source | completed, failed_safely, superseded |
+| `deliver` | `product-delta`, `acceptance-evidence` | write-claimed-source | completed, failed_safely, superseded |
+| `validate` | `independent-validation`, `finding-references`; no remediation patch | none | completed, failed_safely, superseded |
+| `operate` | `operation-receipt`, `resulting-state`, `audit-evidence` | receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
+| `recover` | `safe-state`, `cause-classification`, `recovery-evidence`, `recovery-disposition` | write-claimed-source, receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
+| `learn` | `world-delta`, `finding-references`, `capability-candidates`, `workflow-candidates` | none | completed, failed_safely, superseded |
 
 Read/query effects are `read-source` and `query-authority`. Orchestration effects
 available to every class, but only when explicitly allowed, are
@@ -484,7 +484,7 @@ effecting operation map is:
 | Sergeant coordinator request | `sergeant-coordinator-request` | Verified current coordinator owner/revision; correlated accepted/refused/unknown receipt |
 | Sergeant lifecycle request | `request-sergeant-lifecycle` | Verified Sergeant owner/revision and supported action; correlated receipt; Sergeant decides |
 | Mission finding route | `route-finding` | Configured disposition authority/revision; external finding reference/receipt |
-| Handoff offer/accept/consume | `publish-handoff` | Current packet/stage/source evidence; local joint transition commit |
+| Handoff offer/withdraw/accept/consume | `publish-handoff` | Current packet/stage/source evidence and local joint transition commit; withdrawal additionally requires current unaccepted offer plus drift/invalidation evidence |
 | Acceptance/integration command | `run-validation` | Pinned repository/worktree/head and command contract; bounded exit/evidence digest |
 | Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
 | Receiving-system action | `receiving-system-operation` | Named source, action, owner and revision; revisioned authority decision receipt |
@@ -501,14 +501,30 @@ Stops cannot execute code or contain expressions.
 Each authority assumption has stable ID, authority source ID, governed effect
 IDs, claim from `source-is-authoritative`, `actor-may-attempt`, or
 `owner-may-disposition`, revision policy `exact` or `current-at-invocation`,
-optional expected revision required by `exact`, and a route. The source must be
-`verified` at compilation and again at invocation. An assumption documents the
-expected boundary; it never grants authorization or substitutes for the
-receiving authority's receipt.
+optional expected revision required by `exact`, and a route. An
+`actor-may-attempt` claim additionally requires `actorRole` from `operator`,
+`platoon`, `external-scheduler`, or `stage`; `stage` requires one manifest stage
+ID. The invocation entry path supplies the actual role and must match exactly.
+The source must be `verified` at compilation and again at invocation. An
+assumption documents the expected boundary; it never grants authorization or
+substitutes for the receiving authority's receipt.
 
-Every required output has stable ID, producing stage, versioned schema, evidence
-role IDs, and the terminal outcome it gates. Class-required categories must be
-covered exactly once; extra outputs are allowed only with a unique ID/schema.
+Every required output has stable ID, `category`, producing stage, versioned
+schema, evidence role IDs, and the terminal outcome it gates. The closed output
+category registry is the union of the exact IDs in the class table:
+`sourced-answers`, `unknown-dispositions`, `evidence-references`,
+`finding-references`, `decision`, `authority-decision-evidence`,
+`decision-rationale`, `downstream-effects`, `product-delta`,
+`compatibility-evidence`, `migration-evidence`, `rollback-evidence`,
+`dependency-evidence`, `invalidation-evidence`, `acceptance-evidence`,
+`independent-validation`, `operation-receipt`, `resulting-state`,
+`audit-evidence`, `safe-state`, `cause-classification`, `recovery-evidence`,
+`recovery-disposition`, `world-delta`, `capability-candidates`, and
+`workflow-candidates`. `recovery-disposition` must resolve to
+`no-residual-work` or one continuation ID. Each category required by the
+selected class must be covered exactly once. Extra outputs may use only registry
+categories and require unique ID/schema; they do not satisfy another required
+category.
 
 Every unknown SHALL include an ID, exact question, blocking flag, attempted
 source references, and route. Every contradiction SHALL identify two or more
@@ -834,6 +850,9 @@ after current Dagr start recovery succeeds.
 | `reconcile_required` | Correlation proves refused effect | Exact revisioned refusal receipt matches request | prior safe nonterminal state plus refusal event | no |
 | `reconcile_required` | Correlation proves accepted effect | Exact authority revision and receipt/fleet binding determine one operation result | operation-specific success state | no |
 | `reconcile_required` | Evidence proves unsafe/incompatible result | Exact correlation and current projection identify affected scope | `excluded` | no |
+| `drained(prior=reconcile_required)` | Correlation proves no effect/refusal | Same recovery guards; admission hold remains | `drained(prior=<recovered prior state>)` | no |
+| `drained(prior=reconcile_required)` | Correlation proves accepted/unsafe effect | Operation reducer selects one result | `drained(prior=<nonterminal result>)` or matching `record_required` | no |
+| `drained(prior=reconcile_required)` | Recovery remains missing/stale/ambiguous | No valid destination | same drained state/blockers | no |
 | `drained` | Operator resumes | Drain continuation and generations match | prior nonterminal state | no |
 | `excluded` | Resurvey permits resume | Required inputs and projection generation match | `active` | no |
 | `active` or `drained` | Mission acceptance verified | All required Dagr stages have compatible terminal evidence and handoffs | `record_required(completed)` | no |
@@ -847,7 +866,10 @@ after current Dagr start recovery succeeds.
 A direct terminal write, terminal resume, or pending-outcome change is invalid.
 Drain stores the exact pre-drain state and blocker set. Guarded resume restores
 `reconcile_required` and its evidence unchanged when that was the prior state;
-drain never clears a reconciliation obligation.
+drain never clears a reconciliation obligation. Reconcile continues while
+admission is drained by applying recovery to the retained prior state. A
+nonterminal recovery destination stays wrapped by the drain hold; a terminal
+pending outcome leaves drained and enters `record_required`.
 Recovery from a publication crash remains `record_required` until the exact
 record digest is proven and the atomic terminal pointer is published.
 Every entry to `reconcile_required` stores its source-specific reason,
@@ -966,11 +988,13 @@ adapter output only.
 | Compile | Unknown schema version or field | Explicit unsupported/invalid result |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
 | Compile | Class-required output category is missing or duplicated | Invalid; completion rules are not inferred |
+| Compile | Output category is unknown or extra output reuses required category | Invalid declaration |
 | Compile | Effect is unknown, globally forbidden, or outside class ceiling | Invalid declaration |
 | Compile | Stage effect is absent from top-level allowed set | Invalid declaration |
 | Compile | Stop field/operator/type is not in negotiated source schema | Invalid declaration |
 | Compile | Stop source is missing/stale/inconclusive at evaluation | Treat stop as active and block its scope |
 | Compile | Authority assumption source/revision is unverified | Readiness blocked; assumption grants nothing |
+| Compile | `actor-may-attempt` omits role or stage binding | Invalid declaration |
 | Compile | Blocking unknown unresolved | Packet preview not ready; apply refuses before effects |
 | Compile | Contradiction has no authority route | Invalid declaration |
 | Apply | Declaration digest differs from preview | No run or adapter invocation |
@@ -983,6 +1007,9 @@ adapter output only.
 | Run | Safe failure or supersession writes a terminal state before record | Reject; retain matching `record_required` pending outcome |
 | Run | Record pending outcome differs from transition evidence | Reject record and retain nonterminal state |
 | Drain | Reconcile-required run is drained then resumed | Preserve/restore exact blocker, correlation, and prior reconcile state |
+| Drain | Correlation resolves while reconcile-required run is drained | Update retained prior state but keep admission drained |
+| Drain | Drained reconciliation resolves to terminal pending outcome | Enter matching record-required state; never reopen admission |
+| Drain | Drained reconciliation evidence stays ambiguous | Preserve drained wrapper, reconcile blocker, and child ownership |
 | Drain | Drain repeats on an already drained run | Idempotent success with unchanged generation semantics |
 | Drain | Stale generation or terminal run is drained | Reject without state or child effect |
 | Query | Project or td scope unresolved/wrong namespace | Explicit unresolved; never idle |
@@ -1005,6 +1032,7 @@ adapter output only.
 | Handoff | Evidence missing, stale, wrong packet, or wrong stage | Consumer remains blocked |
 | Handoff | Unknown major schema | Incompatible and reassembly required |
 | Handoff | Offer is withdrawn after acceptance | Reject withdrawal; resurvey may exclude and require a new offer |
+| Handoff | Withdrawal lacks current drift/invalidation evidence | Authorization gate refuses before transition commit |
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
 | Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
 | Effect attempt | Crash after prepared and before invoking | Revalidate and invoke at most once; stale authorization refuses |
@@ -1174,9 +1202,11 @@ continuation ID, truncation flags, adapter durations, and bounded error codes.
 
 Metrics SHALL count states and durations without project names, task IDs, paths,
 source bodies, or user identities. Logs use opaque run/event IDs and error codes.
-No raw child stdout/stderr, prompt, transcript, response body, environment,
-credential, private path, hostname, or source document is persisted in
-trajectory or returned by status.
+No raw child stdout/stderr, prompt, transcript, raw or unvalidated adapter
+response body, environment, credential, private path, hostname, or source
+document is persisted in trajectory or returned by status. Status may return
+the exact fields of a schema-validated, bounded typed observation; that object is
+the explicit observation contract, not a raw transport body.
 
 Initial hard bounds, configurable only within published safe ranges:
 
