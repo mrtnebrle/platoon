@@ -286,8 +286,8 @@ point, not Atlas proposals.
 3. A run persists manifest and intent digests, Dagr identity, stage state,
    reservations, merge queues, and bounded blockers ([state model][platoon-state]).
 4. Dagr owns readiness while Sergeant owns child worktree and lifecycle state;
-   Platoon stores references and verified summaries ([architecture ownership]
-   [platoon-architecture]).
+   Platoon stores references and verified summaries
+   ([architecture ownership][platoon-architecture]).
 5. The Sergeant adapter dispatches one project/task/repository/stage and verifies
    a bounded receipt ([dispatch adapter][platoon-dispatch]).
 6. Fleet observation uses documented durable files, recognizes distinct
@@ -369,6 +369,32 @@ the new adapter reports `unsupported`. Existing dispatch and current durable
 file adapters continue unchanged. Platoon MUST NOT emulate #207 by traversing td
 or coordinator state.
 
+#### Effect Authorization Gate
+
+One gate applies to every external adapter `Request`, whether invoked manually,
+by applied reconciliation, or from an unattended scheduler. Under the held run
+generation fence and immediately before adapter invocation, Mission Control
+must prove all of the following from the current packet/projection and exact
+source evidence:
+
+1. The requested effect is explicitly allowed and not prohibited.
+2. No applicable stop, unresolved blocking unknown, contradiction, exclusion,
+   or drift verdict prevents the effect.
+3. The operation belongs to the current stage contract or unconsumed
+   continuation and its expected packet, projection, and run generations match.
+4. The receiving authority source and revision match the request, and current
+   authority evidence permits this caller to attempt the operation.
+5. Correlation and idempotency identities are new or reconcile to the exact same
+   request.
+6. An unattended request additionally carries current `qualified` evidence.
+
+Failure returns a bounded refusal before adapter invocation and appends no
+effect event. Passing this gate does not grant authorization: the receiving
+system independently accepts or refuses, and Platoon recognizes acceptance only
+from its revisioned authority decision receipt. If authority changes after the
+gate but before receipt, the revision mismatch is `unknown` and enters
+operation-specific reconciliation rather than accepted state.
+
 #### Mission Declaration
 
 The declaration is strict YAML with unknown fields rejected. Its identity is
@@ -436,10 +462,15 @@ Each projection entry contains:
 - integrity digest for Platoon-owned snapshots only;
 - previous projection revision and event ID.
 
-The projection MUST reference Sergeant, Git, td, and receiving-system evidence;
-it MUST NOT copy raw fleet files, work-item bodies, source trees, transcripts, or
-credentials into Platoon state. A verified bounded summary may be stored only
-when its schema and source reference are retained.
+The projection MUST reference every authority required by packet source roles,
+stages, effects, handoffs, required outputs, or continuations. Sergeant, Git,
+td, and receiving-system references are therefore conditional on packet scope,
+not ceremonial universal fields. A required authority that is missing,
+unsupported, or inconclusive blocks the operation it governs; an irrelevant
+authority is omitted rather than invented. The projection MUST NOT copy raw
+fleet files, work-item bodies, source trees, transcripts, or credentials into
+Platoon state. A verified bounded summary may be stored only when its schema and
+source reference are retained.
 
 #### Handoff Contracts
 
@@ -688,9 +719,10 @@ after current Dagr start recovery succeeds.
 | `initializing` | Dagr outcome uncertain | Current Dagr recovery evidence incomplete | `reconcile_required` | no |
 | `active` | Operator drains admission | Expected generation; does not signal Dagr/Sergeant | `drained` | no |
 | `active` | Drift cannot safely resolve | Affected admission stops; running child is not rewritten | `excluded` | no |
-| `active` | External outcome uncertain | Owning adapter cannot prove accepted/refused/absent | `reconcile_required` | no |
+| any nonterminal allowed to request an external effect | External outcome uncertain | Owning adapter cannot prove accepted/refused/absent | `reconcile_required` with operation and prior state | no |
 | `reconcile_required` | Correlation proves no effect | Exact source-specific absence proof; expected generation and prior state match | prior safe nonterminal state | no |
-| `reconcile_required` | Correlation proves accepted effect | Exact authority revision and receipt/fleet binding determine one result | `active` or matching `record_required` | no |
+| `reconcile_required` | Correlation proves refused effect | Exact revisioned refusal receipt matches request | prior safe nonterminal state plus refusal event | no |
+| `reconcile_required` | Correlation proves accepted effect | Exact authority revision and receipt/fleet binding determine one operation result | operation-specific success state | no |
 | `reconcile_required` | Evidence proves unsafe/incompatible result | Exact correlation and current projection identify affected scope | `excluded` | no |
 | `drained` | Operator resumes | Drain continuation and generations match | prior nonterminal state | no |
 | `excluded` | Resurvey permits resume | Required inputs and projection generation match | `active` | no |
@@ -710,6 +742,17 @@ generation. Reconciliation reads only the owning adapter's authoritative
 evidence and is itself generation-fenced. Missing, stale, wrong-correlation, or
 multiple/conflicting results remain `reconcile_required`; they never choose a
 destination. Recovery does not signal, rewrite, or clean up a Sergeant child.
+
+The accepted destination is prior-state and operation specific. `route` and
+`handoff` append their verified external reference and return to the recorded
+prior state. Dagr start moves initializing to active. `resume` moves to the
+continuation's already validated target. Sergeant dispatch/coordinator actions
+apply the same reducer as synchronous success and may return to the prior state,
+active work, exclusion, or the matching `record_required` outcome only when
+exact worker/authority evidence requires it. Local-only `record` publication
+never enters external-request reconciliation. An accepted receipt that cannot
+select exactly one destination allowed by the original operation remains
+`reconcile_required`.
 
 #### Projection
 
@@ -817,6 +860,8 @@ adapter output only.
 | Projection | Crash before pointer update | Ignore orphan revision |
 | Projection | Revalidation changes purpose, authority, effect, or completion | Reject amendment and require successor packet |
 | Projection | Run state names mismatched event/projection commit | Reconcile required; prior verified generation remains displayable |
+| Projection | Mission uses only a proper subset of source kinds | Compile exactly the packet-required authorities; invent no empty references |
+| Projection | Packet-required authority is absent or inconclusive | Block its governed operation; do not substitute an irrelevant source |
 | Handoff | Producer and consumer are same forbidden ownership | Validation fails |
 | Handoff | Child or unverified caller attempts to publish an offer | Reject; only applied verified reconciliation is ingress |
 | Handoff | Evidence missing, stale, wrong packet, or wrong stage | Consumer remains blocked |
@@ -833,7 +878,10 @@ adapter output only.
 | Resume | Required input from wrong authority | No effect; continuation stays open |
 | Resume | Superseded or expired continuation | No effect; terminal refusal |
 | Reconcile | Exact absence proof matches correlation and generation | Return to recorded prior safe nonterminal state |
-| Reconcile | Exact accepted receipt determines one result | Move to active or matching record-required state without duplicate effect |
+| Reconcile | Exact refusal matches request and authority revision | Return to recorded prior state with refusal event and no retry |
+| Reconcile | Exact accepted receipt determines one result | Apply original operation reducer once; destination must be allowed from recorded prior state |
+| Reconcile | Lost route/handoff receipt began in drained, excluded, or record-required | Recovery preserves that prior state after appending exact reference |
+| Reconcile | Lost resume/Sergeant receipt proves accepted | Move only to continuation/worker-evidence destination defined by original request |
 | Reconcile | Evidence is missing, stale, wrong-correlation, or ambiguous | Stay reconcile required; no adapter effect |
 | Reconcile | Recovery evidence races a newer generation | Compare fails; newer state remains authoritative |
 | Resurvey | Source unavailable or contradictory | `exclude`, never `continue` |
@@ -854,6 +902,11 @@ adapter output only.
 | Unattended | Drift races scheduler invocation | Fenced compare expires qualification; no effect |
 | Unattended | Expired/denied qualification ID is replayed | No effect; a new evaluation ID is required |
 | Scheduler | Replayed or premature hint | Compare fails; no effect |
+| External request | Effect is absent from allowed list or appears in prohibited list | Pre-request gate refuses without adapter invocation |
+| External request | Applicable stop, block, contradiction, exclusion, or drift is active | Pre-request gate refuses without adapter invocation |
+| External request | Continuation, packet, projection, or run generation is stale | Fenced compare refuses without adapter invocation |
+| External request | Receiving authority/revision is missing or stale | Pre-request gate refuses without adapter invocation |
+| External request | Authorization changes after pre-request gate | Receipt revision mismatch is unknown and enters reconciliation |
 | External request | Receiving authority refuses | Record exact refusal; no retry or accepted interpretation |
 | External request | Receipt is lost or authorization revision mismatches | Record unknown and reconcile by correlation; no blind retry |
 | External request | Receipt omits authority decision reference | Reject receipt as inconclusive and fail closed |
@@ -862,6 +915,8 @@ adapter output only.
 | Rollback | Typed run has an active Sergeant child | Rolled-back release still reconciles/drains/resumes that run; child is untouched |
 | Rollback | Typed run is excluded, reconcile-required, or record-required | Rolled-back release retains all guarded operations needed to reach terminal |
 | Rollback | Binary cannot operate an existing typed state version | Rollback is refused before replacement; current compatible binary remains |
+| Rollback | Pinned compatibility artifact is absent or fails a state fixture | New typed state publication remains disabled; no run files are created |
+| Rollback | Compatibility artifact attempts to create its disabled state version | Explicit refusal before publication; existing typed runs remain operable |
 | Privacy | Source contains secret or absolute private path | Output omits it and records bounded rejection |
 | Bounds | More sources/events/findings than limits | Deterministic truncation metadata or fail closed where completeness is required |
 
@@ -939,6 +994,17 @@ under their original state schema and command behavior; they are not upgraded in
 place. Operators may finish them or start a new typed mission run.
 
 #### Rollback
+
+Delivery is compatibility-first. Before any release enables creation of a new
+typed state version, it SHALL build and identify a rollback artifact that has
+creation of that version disabled but retains every reader and guarded operation
+for `initializing`, `active`, `drained`, `excluded`, `reconcile_required`, and
+`record_required`, including runs with active Sergeant children. Release
+metadata pins the rollback artifact version and SHA-256. CI exercises that
+artifact against synthetic durable fixtures for every state and operation. If
+the artifact is unavailable or any fixture fails, typed state publication stays
+disabled: explicit typed applied start refuses without creating files, while
+legacy manifests preserve existing behavior.
 
 Each phase is feature-gated by document/state version rather than an environment
 toggle hidden from status. Rollback means stop creating new typed runs while
@@ -1052,7 +1118,8 @@ refuse entry.
 
 Snapshot typed declaration and packet during applied start. Bind packet digest
 to a new run-state version. Demonstrates crash-safe publication and legacy-run
-read-only compatibility.
+operational compatibility. Publish and validate the creation-disabled rollback
+artifact before enabling the first typed state write.
 
 #### Phase 2: Deep Read-Only Status
 
