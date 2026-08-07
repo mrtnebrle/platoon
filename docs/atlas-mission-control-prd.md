@@ -430,9 +430,10 @@ idempotency key before retry. Exact accepted/refused/absence evidence converges
 the attempt; missing, stale, multiple, or conflicting evidence remains
 `reconcile_required`. An adapter operation that cannot provide stable
 correlation, durable deduplication or bounded absence proof is unsupported for a
-typed external effect. Command operations additionally require declared
-idempotence and pinned pre/post repository evidence before any absence-proven
-retry. Attempt records contain no credentials, environment, or raw output.
+typed external effect. A `replay-safe` command policy supplies its local
+process/repository proof before rerun; a `single-attempt` command never takes a
+retry transition. Attempt records contain no credentials, environment, or raw
+output.
 
 #### Mission Declaration
 
@@ -472,7 +473,10 @@ globally forbidden and cannot appear in `allowed`.
 
 `effects.allowed` and `effects.prohibited` are unique effect-ID sets and must be
 disjoint. `effects.stages` maps every manifest stage ID to a subset of top-level
-allowed effects; an undeclared stage/effect pair is denied. The exhaustive
+allowed effects; an undeclared stage/effect pair is denied. `effects.callers`
+maps each allowed effect to a nonempty set from `operator`, `platoon`,
+`external-scheduler`, and `stage`; stage callers are further restricted by
+`effects.stages`. An undeclared caller/effect pair is denied. The exhaustive
 effecting operation map is:
 
 | Adapter operation | Required effect | Authority evidence and accepted receipt |
@@ -488,6 +492,19 @@ effecting operation map is:
 | Acceptance/integration command | `run-validation` | Pinned repository/worktree/head and command contract; bounded exit/evidence digest |
 | Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
 | Receiving-system action | `receiving-system-operation` | Named source, action, owner and revision; revisioned authority decision receipt |
+
+Typed mode also requires `spec.commandPolicies` to cover every repository
+integration and stage acceptance command by deterministic reference
+`repository:<id>:integration:<zero-based-index>` or
+`stage:<id>:acceptance:<zero-based-index>`. Each policy has exactly one mode:
+`replay-safe` or `single-attempt`. There is no default. `replay-safe` asserts the
+command has no external effect and may rerun only after the recorded process
+group is absent and pinned repository/worktree/head identity plus claimed diff
+have been re-observed. `single-attempt` is never retried automatically after
+`invoking`; uncertainty remains `reconcile_required` for explicit recovery or
+safe failure. The canonical command request digest includes executable, args,
+working identity, policy mode, and attempt ID. Legacy reference mode retains
+current command behavior.
 
 Each stop has stable ID; one typed predicate; scope; blocked transitions/effects;
 and route. A predicate names one source ID, schema field path, operator from
@@ -508,6 +525,16 @@ ID. The invocation entry path supplies the actual role and must match exactly.
 The source must be `verified` at compilation and again at invocation. An
 assumption documents the expected boundary; it never grants authorization or
 substitutes for the receiving authority's receipt.
+
+Compilation forms every allowed invocation tuple `(mission-or-stage, effect,
+callerRole)` from `effects.allowed`, `effects.stages`, and `effects.callers`.
+Each tuple MUST match exactly one `actor-may-attempt` assumption; zero or
+overlapping matches are invalid before packet/run publication. Every effecting
+operation must also resolve exactly one `source-is-authoritative` assumption for
+its receiving adapter, and each disposition route exactly one
+`owner-may-disposition` assumption. Extra assumptions that match no tuple are
+invalid. Invocation repeats the exact tuple/source/revision match under the run
+fence.
 
 Every required output has stable ID, `category`, producing stage, versioned
 schema, evidence role IDs, and the terminal outcome it gates. The closed output
@@ -598,10 +625,9 @@ consumer, output schema, required evidence, compatibility and freshness rules,
 and explicit missing/incompatible behavior. The initial behaviors are
 `block-consumer` for missing evidence and `reassemble` for incompatibility.
 Contracts are authored in the typed declaration's `spec.handoffs` collection;
-producer and consumer must name existing manifest stage IDs, and the output
-producer and consumer must be distinct stages. Same-repository handoffs are
-valid; a stage handing to itself is not. The output locator must be a source role
-declared in the packet rather than a child path.
+producer and consumer must name existing, distinct manifest stage IDs.
+Same-repository handoffs are valid; a stage handing to itself is not. The output
+locator must be a source role declared in the packet rather than a child path.
 
 The initial ingress requires no child write to Platoon state. During an applied
 reconciliation, Platoon observes a producer's verified merge-ready evidence,
@@ -622,6 +648,14 @@ the consumer's existing fenced admission transaction. The consumer's accepted
 offer revision is persisted before dispatch. Platoon validates shape and
 binding but does not certify payload domain truth. Producer and consumer remain
 separately owned; the contract belongs to the packet.
+
+Authorized pre-acceptance withdrawal generation-fences an immutable
+`withdrawn` state for that offer revision and publishes a trajectory event with
+the drift/invalidation evidence. A withdrawn revision can never be accepted,
+consumed, or restored. Fresh verified producer evidence may create the next
+monotonic offer revision for the same contract; it references the withdrawn
+revision and receives a new evidence-derived idempotency key. Re-offer never
+edits or reuses the withdrawn object.
 
 Contract revisions follow semantic compatibility rules. A compatible minor
 revision may receive `revalidate_projection`; a changed required field,
@@ -903,8 +937,11 @@ observation, projection, event, or transition commit is not authoritative.
 #### Handoff
 
 Handoff moves from `declared` through `awaiting_producer`, `offered`,
-`validating`, `accepted`, and `consumed`. An offer may be withdrawn before
-acceptance; validation may instead produce `incompatible` or `stale`.
+`validating`, `accepted`, and `consumed`. Before acceptance, `offered` may move
+to immutable `withdrawn`; validation may instead produce `incompatible` or
+`stale`. A withdrawn offer has no outgoing transition. Fresh evidence creates a
+new monotonic offer revision from the contract's `awaiting_producer` lifecycle,
+referencing but not changing the withdrawn revision.
 
 Accepted handoffs are immutable references. Correction or new evidence creates
 a new offer revision. A consumed handoff cannot be withdrawn retroactively.
@@ -995,6 +1032,9 @@ adapter output only.
 | Compile | Stop source is missing/stale/inconclusive at evaluation | Treat stop as active and block its scope |
 | Compile | Authority assumption source/revision is unverified | Readiness blocked; assumption grants nothing |
 | Compile | `actor-may-attempt` omits role or stage binding | Invalid declaration |
+| Compile | Allowed invocation tuple has zero or multiple actor-authority matches | Invalid before packet/run publication |
+| Compile | Effect has zero/multiple authoritative sources or route owners | Invalid before packet/run publication |
+| Compile | Typed command lacks policy or uses unknown command reference/mode | Invalid declaration; no default replay safety |
 | Compile | Blocking unknown unresolved | Packet preview not ready; apply refuses before effects |
 | Compile | Contradiction has no authority route | Invalid declaration |
 | Apply | Declaration digest differs from preview | No run or adapter invocation |
@@ -1033,6 +1073,8 @@ adapter output only.
 | Handoff | Unknown major schema | Incompatible and reassembly required |
 | Handoff | Offer is withdrawn after acceptance | Reject withdrawal; resurvey may exclude and require a new offer |
 | Handoff | Withdrawal lacks current drift/invalidation evidence | Authorization gate refuses before transition commit |
+| Handoff | Authorized offered revision is withdrawn | Publish immutable withdrawn state/event; acceptance is thereafter impossible |
+| Handoff | Fresh evidence follows withdrawal | Publish next offer revision with new key and predecessor reference |
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
 | Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
 | Effect attempt | Crash after prepared and before invoking | Revalidate and invoke at most once; stale authorization refuses |
@@ -1040,6 +1082,8 @@ adapter output only.
 | Effect attempt | Receipt arrives before committed state publication | Re-query exact receipt and converge one committed/refused result |
 | Effect attempt | Adapter lacks correlation, deduplication, or absence proof | Typed effect is unsupported before invocation |
 | Effect attempt | Reused idempotency key carries different request digest | Fail closed in reconcile required |
+| Command attempt | Replay-safe command loses receipt | Retry only after process absence and pinned repository/diff re-observation |
+| Command attempt | Single-attempt command loses receipt | Never retry automatically; remain reconcile required for explicit disposition |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
 | Continuation | Missing safe state, action, route, or required input | Invalid nonterminal outcome |
