@@ -510,15 +510,26 @@ integration and stage acceptance command by deterministic reference
 `validation-capability` profile. There is no default.
 
 The operator-owned, versioned capability profile binds executable digest and
-allowed argument shape to `no-external-effect/v1`. Its executor disables network,
-passes no credentials or credential helpers, mounts the source/worktree
-read-only, and permits writes only in disposable private temp/cache paths. It
-rejects Git/GitHub mutation, Dagr/Sergeant commands, deployment/production
-tools, identity/credential tools, shells, and every executable/argument shape
-not in the profile. If the host cannot enforce all profile controls, typed
-`run-validation` is unsupported before invocation. An operation with a real
-external effect must use its typed adapter/effect and can never be classified as
-`run-validation`.
+allowed argument shape to `no-external-effect/v1`. Its measured platform adapter
+creates a deny-by-default OS sandbox: no network namespace/routes; no host IPC
+or Unix sockets; no inherited descriptors except bounded stdin/stdout/stderr
+pipes; no host process visibility, signaling, tracing, or shared memory; and no
+devices except explicitly read-only harmless primitives required by the runtime.
+The filesystem exposes only allowlisted executable/runtime libraries and the
+pinned source/worktree read-only, plus disposable private temp/cache mounts. It
+does not expose home/config directories, SSH/Git credentials, keychains,
+credential-agent sockets, service-account metadata, or ambient secrets. The
+environment is a fixed non-secret allowlist.
+
+The adapter enforces syscall/process-group limits for descendants and rejects
+Git/GitHub mutation, Dagr/Sergeant commands, deployment/production tools,
+identity/credential tools, shells, and every executable/argument shape not in
+the profile. Each supported platform publishes a self-test/profile digest that
+proves denial of ambient file reads, host signals/tracing, IPC/socket access,
+devices, credential services, and network. If any control/self-test is
+unavailable, typed `run-validation` is unsupported before invocation. An
+operation with a real external effect must use its typed adapter/effect and can
+never be classified as `run-validation`.
 
 `replay-safe` may rerun only after the recorded process group is absent and
 pinned repository/worktree/head identity plus claimed diff have been
@@ -740,11 +751,24 @@ pointer. The pointer carries current transition digest/generation and the exact
 previous transition digest/generation; the commit supplies observation set,
 event head, projection revision, and resulting state. There is no independently
 writable observation, event-head, or projection pointer. Recovery ignores
-unreferenced objects/commits and orphan forks. If current transition validation
-fails, recovery may use only the pointer's named previous commit after verifying
-its full chain/state digest, reports `reconcile_required`, and publishes a new
-successor before any effect. It never chooses among orphan descendants or skips
-an intermediate generation.
+unreferenced objects/commits and orphan forks.
+
+The authoritative mutation fence is the tuple `(repairEpoch, currentGeneration,
+currentTransitionDigest)`, not generation alone. Every applied operation and
+effect attempt carries and compares the full tuple; references to an expected
+generation elsewhere in this PRD include this fence. If current transition
+validation fails, recovery CASes the exact raw pointer tuple and publishes a
+no-effect quarantine transition at generation N+1 and repair epoch E+1. The
+quarantine names the invalid digest/generation, the pointer-named previous valid
+digest/generation, and bounded reason; it accounts for the invalid generation
+without adopting its state. The pointer then names quarantine as current and the
+verified recovery base as previous.
+
+A repair successor at N+2 must name quarantine as predecessor and derives
+`reconcile_required` from the verified recovery base. No external effect is
+allowed until that successor and required reconciliation publish. An operation
+holding the old epoch/generation/digest cannot pass the fence. Recovery never
+reuses N, chooses among orphan descendants, or skips the quarantine generation.
 
 Meaningful event types include:
 
@@ -1033,7 +1057,7 @@ never changes and no ordinal greater than two is valid.
 | Observation/event/projection objects synced before transition commit | Orphan objects | Ignore as unreferenced; prior run state remains authoritative |
 | Transition commit synced before run-state replacement | Orphan commit | Ignore as unreferenced; retry may reuse only exact digests |
 | Run state names observation/event/projection not jointly bound by commit | Split-brain pointers | Invalid generation enters reconcile required; never expose any as current |
-| Current pointer commit is invalid after replacement | Lost authoritative predecessor | Verify only pointer-named previous commit/chain, expose reconcile required, publish successor before effects |
+| Current pointer commit is invalid after replacement | Repair skips/collides with invalid generation | CAS full fence; publish no-effect quarantine N+1/E+1, then reconcile successor N+2 before effects |
 | Multiple orphan commits share one predecessor | Ambiguous recovery fork | Ignore all unreferenced forks; pointer alone selects current/previous authority |
 | Handoff offer published before evidence | Consumer sees incomplete output | Offer is non-acceptable until all references validate |
 | Handoff accepted while source drifts | Consumer begins stale work | Compare revisions at admission; exclude on mismatch |
@@ -1105,7 +1129,8 @@ adapter output only.
 | Projection | Crash before pointer update | Ignore orphan revision |
 | Projection | Revalidation changes purpose, authority, effect, or completion | Reject amendment and require successor packet |
 | Projection | Run state names mismatched event/projection commit | Reconcile required; prior verified generation remains displayable |
-| Projection | Current commit is invalid but pointer-named predecessor verifies | Use only predecessor in reconcile-required mode; no effect until successor publishes |
+| Projection | Current commit is invalid but pointer-named predecessor verifies | Quarantine invalid digest at new epoch/generation, then publish reconcile successor before effects |
+| Projection | Stale operation presents old epoch with same/reused generation | Full epoch/generation/digest fence rejects it without mutation |
 | Projection | Two orphan successor commits share a predecessor | Ignore both unless authoritative pointer names one; never choose by timestamp |
 | Projection | Mission uses only a proper subset of source kinds | Compile exactly the packet-required authorities; invent no empty references |
 | Projection | Packet-required authority is absent or inconclusive | Block its governed operation; do not substitute an irrelevant source |
@@ -1129,6 +1154,9 @@ adapter output only.
 | Command attempt | Single-attempt command loses receipt | Never retry automatically; remain reconcile required for explicit disposition |
 | Command attempt | Sandbox cannot disable network/credentials or read-only mount fails | Fail before executable starts; no effect attempt invocation |
 | Command attempt | Command tries to write source or access network | Sandbox denies; bounded failure evidence, no external effect |
+| Command attempt | Command reads ambient home/private config or credential service | Sandbox denies absent mount/socket; no private data returned |
+| Command attempt | Command signals/traces host process or opens host IPC/device | Namespace/syscall/device policy denies; bounded failure evidence |
+| Command attempt | Platform sandbox self-test/profile digest is missing or changed | Typed run-validation unsupported before attempt publication |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
 | Continuation | Missing safe state, action, route, or required input | Invalid nonterminal outcome |
