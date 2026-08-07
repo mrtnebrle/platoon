@@ -73,11 +73,12 @@ pre-existing fleet to a stage.
 
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 proposes activating the currently inert mission reference as a versioned,
-immutable declaration. It defines sourced cross-repository interpretation,
-handoffs, drift verdicts, trajectory, Mission Records, and a bounded Sergeant
-status-query seam while preserving Dagr readiness, Sergeant worker lifecycle,
-Git/td authority, explicit apply, and current adapter compatibility. This is a
-design proposal; none of that proposed behavior is implemented yet.
+explicitly opted-in immutable declaration. It defines sourced cross-repository
+interpretation, handoffs, drift verdicts, trajectory, Mission Records, and a
+bounded Sergeant status-query seam. It preserves Dagr readiness, Sergeant
+worker lifecycle, Git/td authority, explicit apply, and current adapter
+compatibility. This is a design proposal; none of that proposed behavior is
+implemented yet.
 
 Implementation and review pools default to six and two tokens. A repository
 defaults to one writer. Raising `maxWriters` allows same-repository concurrency

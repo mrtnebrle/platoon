@@ -5,7 +5,7 @@ PRD version: 1.0
 Source fixed point: Platoon `1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4`  
 Last source survey: 2026-08-07
 
-## 1. Summary
+## Summary
 
 Platoon should evolve from a stage dispatcher with a required but inert mission
 reference into a mission compiler and interpreter. A versioned mission
@@ -67,8 +67,10 @@ bounded query at the owning layer.
 
 ## Solution
 
-An operator supplies the existing `platoon.dev/v1alpha1` manifest whose
-`spec.mission` points to a `platoon.dev/mission/v1alpha1` declaration.
+An operator supplies the existing `platoon.dev/v1alpha1` manifest, explicitly
+sets `spec.missionFormat: declaration-v1alpha1`, and points `spec.mission` to a
+`platoon.dev/mission/v1alpha1` declaration. Omitting the new format preserves
+current reference-only behavior.
 
 1. `validate` checks both documents, references, authority assumptions, source
    labels, handoff compatibility, and lifecycle completeness without side
@@ -236,7 +238,7 @@ evidence for current behavior and authority.
 | Projection | Reconstructable, revisioned mapping from packet roles to source references and verified summaries. It references evidence rather than copying it. |
 | Observation | Exact bounded data returned by an owning source adapter, retained without semantic rewriting. |
 | Interpretation | Platoon's labeled mission-level conclusion derived from observations and declaration rules. |
-| Source label | Enum describing provenance: `declaration`, `platoon`, `dagr`, `sergeant`, `git`, `td`, or `receiving_system`. |
+| Source label | Enum describing provenance: `declaration`, `intent`, `platoon`, `dagr`, `sergeant`, `git`, `td`, or `receiving_system`. |
 | Unknown | Precisely named missing fact with source attempts, blocking flag, owner route, and disposition state. |
 | Contradiction | Two or more sourced claims that cannot all govern the same decision. |
 | Stop | Testable condition that prevents a named effect or stage transition. |
@@ -322,9 +324,10 @@ illustrative, not a required Go identifier.
 | `Apply` | yes | compiled digests, expected source revisions | immutable packet/run publication and existing admission result |
 | `Status` | no | run ID, optional refresh policy | exact observations plus interpretation and continuation |
 | `Resurvey` | append-only | run ID, expected generation and projection revision | drift evidence and one verdict |
+| `Handoff` | append-only | contract ID, action, expected run/projection generation | verified offer, withdrawal, acceptance, or consumption result |
 | `Route` | append-only/external request | finding draft, owning route, expected generation | external finding reference or explicit refusal |
 | `Resume` | yes | continuation ID, required input references, expected generations | accepted transition or fail-closed reason |
-| `Record` | append-only | terminal run ID, expected event head | validated derived Mission Record |
+| `Record` | append-only | `record_required` run ID, pending outcome, expected event head | validated Mission Record and terminal transition |
 
 Existing `validate`, `plan`, `start`, `reconcile`, `status`, `drain`, and `resume`
 commands SHALL become compatibility entry points over this boundary. The PRD
@@ -348,7 +351,13 @@ totals, activity evidence quality, coordinator ownership evidence, optional
 correlated response, source version, observation time, and truncation metadata.
 
 `Request` is limited to operations Sergeant explicitly supports, such as a
-correlated coordinator request or finding handoff. It does not expose arbitrary
+correlated coordinator request or finding handoff. Every request names the
+receiving authority source, requested effect, expected external revision,
+correlation, and idempotency key. Its receipt is exactly `accepted`, `refused`,
+or `unknown` and carries the authority decision reference/revision and observed
+external revision when available. Refusal is not a transport failure; timeout,
+lost receipt, stale authority, or revision mismatch is `unknown` and blocks
+retry until correlated reconciliation. The adapter does not expose arbitrary
 commands, session IDs, prompt text, or child-state writes. Wake, resume, drain,
 recovery, reviews, and cleanup remain Sergeant-owned even if a future adapter
 supports requesting them.
@@ -385,11 +394,27 @@ unknowns only when the author supplied the exact question and route.
 **Atlas design inspiration:** immutable WorkPacket and revisioned projection.
 Platoon uses these concepts without materializing a Garrison filesystem.
 
-Packet identity is the SHA-256 of canonical declaration, canonical intent,
-manifest snapshot, selected handoff contracts, source descriptors, and schema
-versions. Packet bytes are written before authoritative run publication with the
-same restrictive, atomic durability rules as current run files. A packet never
-changes after publication.
+Packet identity uses a versioned byte contract. Stable-read source bytes produce
+`manifestSourceDigest`, `declarationSourceDigest`, and `intentRevision` over the
+exact bytes. Strictly decoded manifest and declaration values are defaulted and
+normalized by their schema versions, schema-declared sets sort by normalized
+stable ID, and ordered arrays retain declaration order. The resulting envelope
+is encoded with RFC 8785 JSON Canonicalization Scheme; values outside its JSON
+domain, nulls where the schema has no null, and unknown fields are rejected. The
+intent body is not normalized; only its exact-byte digest and media type enter
+the envelope.
+
+The canonical `platoon.packet/v1alpha1` envelope contains its schema, normalized
+manifest and declaration values, all three exact source digests, intent media
+type, selected handoff contracts sorted by ID, source descriptors sorted by ID
+including source-native revisions, and every nested schema version. Packet ID is
+lowercase SHA-256 over the ASCII domain separator
+`platoon.packet/v1alpha1` followed by one NUL byte and the canonical envelope
+bytes. Golden fixtures SHALL prove that map-key input order and schema-set
+order do not change identity, while any semantic value, exact intent byte,
+source revision, handoff, or schema change does. Packet bytes are written before
+authoritative run publication with the same restrictive, atomic durability
+rules as current run files. A packet never changes after publication.
 
 A run ID binds exactly one packet digest. Reassembly creates a new packet and a
 new run linked by `supersedes`; it never swaps a packet under an existing run.
@@ -423,12 +448,29 @@ The `platoon.dev/handoff/v1alpha1` contract requires a stable ID, producer,
 consumer, output schema, required evidence, compatibility and freshness rules,
 and explicit missing/incompatible behavior. The initial behaviors are
 `block-consumer` for missing evidence and `reassemble` for incompatibility.
+Contracts are authored in the typed declaration's `spec.handoffs` collection;
+producer and consumer must name existing manifest stage IDs, and the output
+locator must be a source role declared in the packet rather than a child path.
 
-The producer publishes a reference, schema version, source revision, evidence
-references, and digest. Platoon validates shape and binding but does not certify
-the domain truth of the payload. The consumer records the accepted handoff
-revision before admission. Producer and consumer remain separately owned; the
-contract belongs to the mission packet.
+The initial ingress requires no child write to Platoon state. During an applied
+reconciliation, Platoon observes a producer's verified merge-ready evidence,
+resolves the contract's output role through Git or another owning source
+adapter, and creates an immutable offer containing reference, schema version,
+source revision, evidence references, and digest. The operator-authorized
+reconciliation is the publication actor; Sergeant remains owner of child output
+and lifecycle. The idempotency key is the digest of packet ID, contract ID,
+producer stage/fleet binding, producer head, output digest, and evidence digests.
+Repeated observation returns the same offer.
+
+`Handoff` exposes the lifecycle inside the single Mission Control interface.
+`offer` is accepted only from the verified reconciliation path; `withdraw`
+requires drift or invalidation evidence and is forbidden after consumption;
+`accept` validates schema, packet, producer identity, evidence, compatibility,
+freshness, and current projection; `consume` occurs compare-before-set inside
+the consumer's existing fenced admission transaction. The consumer's accepted
+offer revision is persisted before dispatch. Platoon validates shape and
+binding but does not certify payload domain truth. Producer and consumer remain
+separately owned; the contract belongs to the packet.
 
 Contract revisions follow semantic compatibility rules. A compatible minor
 revision may receive `revalidate_projection`; a changed required field,
@@ -465,10 +507,22 @@ MUST NOT be labeled as coordinator contact.
 
 #### Meaningful Events And Trajectory
 
-The trajectory is append-only JSON Lines or an equivalent framed format with a
-versioned event envelope, monotonic sequence, previous-event digest, run
-generation, projection revision, timestamp, event type, sanitized subject, and
-evidence references. Atomic publication ensures a torn final event is rejected.
+The trajectory uses immutable, individually framed event objects with a
+versioned envelope, monotonic sequence, previous-event digest, run generation,
+projection revision, timestamp, event type, sanitized subject, and evidence
+references. This is the append-only equivalent of JSON Lines while permitting a
+crash-consistent pointer transaction.
+
+One publication protocol jointly advances trajectory and projection. The writer
+first creates and syncs any immutable projection object and event object in the
+run directory, then creates and syncs an immutable transition commit naming
+their digests, previous event head, previous projection revision, and resulting
+state. It finally atomically replaces and directory-syncs the authoritative run
+state, whose single generation names transition commit, event head, and
+projection revision together. There is no independently writable event-head or
+projection pointer. Recovery ignores unreferenced objects/commits. A run state
+that references a missing, mismatched, or non-successor object enters
+`reconcile_required` and never skips to a later object.
 
 Meaningful event types include:
 
@@ -514,6 +568,13 @@ never writes a Sergeant worker status. If worker action is needed, Platoon
 requests it through Sergeant and records the receipt; Sergeant decides whether
 the action is accepted.
 
+The nonterminal mission-status outcomes are `waiting`, `needs_input`,
+`approval_required`, `blocked`, `paused`, and `escalated`. They are current
+interpretations recorded in trajectory events, not terminal Mission Records.
+Each requires a continuation and maps to `active`, `drained`, `excluded`, or
+`reconcile_required` according to its guard. A later meaningful event may change
+the nonterminal outcome without rewriting history.
+
 #### Mission Record
 
 The Mission Record is derived from the immutable packet, validated trajectory,
@@ -523,13 +584,13 @@ log. Required fields are:
 - schema, record ID, run ID, packet digest, projection revision, event head;
 - declaration and intent revisions;
 - actors and source-owned stage/fleet references;
-- one outcome: `completed`, `waiting`, `needs_input`, `approval_required`,
-  `blocked`, `paused`, `escalated`, `failed_safely`, or `superseded`;
+- one terminal outcome: `completed`, `failed_safely`, or `superseded`;
 - acceptance results with evidence references;
 - product delta, present even when empty;
 - world delta, present even when empty;
 - cause classification when harmful or safely failed;
-- continuation for every nonterminal or safe-failure outcome;
+- continuation for `failed_safely` and successor/cancellation authority
+  reference when superseded;
 - finding references and their externally owned disposition state;
 - start, last meaningful event, and record publication times.
 
@@ -539,9 +600,11 @@ topology, authority, procedure, capability, policy, or substrate that should
 affect future mission compilation. Neither field may contain an unsupported
 claim.
 
-A terminal run is not `completed` until its Mission Record validates and is
-published. Record publication failure leaves `record_required`, a nonterminal
-Platoon interpretation; it does not change the exact child or Dagr state.
+No typed mission is terminal until its Mission Record validates and is
+published. Completion evidence, safe failure, or an authorized supersession
+first enters `record_required` with one pending terminal outcome. Record
+publication failure leaves that nonterminal state unchanged; it does not change
+exact child, Sergeant, or Dagr state.
 
 #### Drift And Resurvey Verdicts
 
@@ -578,6 +641,11 @@ Unresolved, stale, unsupported, or conflicting evidence defaults to `exclude`.
 
 Qualification records the rule version and evidence references. It expires when
 a relevant declaration, workflow, source contract, authority, or effect changes.
+Immediately before an unattended applied operation, Mission Control compares the
+qualification ID, rule version, evidence revisions, packet, projection, run
+generation, and scheduler hint in the same fenced transaction that admits the
+effect. Concurrent drift expires qualification and excludes the operation; it
+never races through on previously qualified evidence.
 
 The external scheduler seam consists of read-only status plus idempotent,
 bounded applied commands. Status may expose `schedulerHint` with operation,
@@ -605,16 +673,30 @@ it does not broadcast to multiple systems.
 
 #### Mission Run
 
-The main path is `compiled_not_ready` to `compiled_ready` to `initializing` to
-`active`. Compilation or initialization may instead become `refused`. Active
-runs may move to `drained`, `excluded`, `record_required`, `superseded`,
-`failed`, or `reconcile_required`; drained and excluded runs may return to active
-only through their guarded resume contracts. `record_required` derives exactly
-one of `completed`, `failed_safely`, or `superseded`.
+`compiled_not_ready` and `compiled_ready` are preview results, not durable run
+states. A ready applied request publishes `initializing`, then reaches `active`
+only after current Dagr start recovery succeeds. A not-ready applied request may
+publish `refused` block evidence only when no external effect occurred.
 
-`compiled_*` are preview results and not durable run states. `refused` is a valid
-applied result only if packet/block evidence was durably published and no effect
-occurred. Existing run states map as described in migration.
+| From | Trigger | Guard / Dagr relationship | To | Terminal |
+|---|---|---|---|---:|
+| `initializing` | Verified Dagr run start | Exact workflow/run/stage identities | `active` | no |
+| `initializing` | Dagr outcome uncertain | Current Dagr recovery evidence incomplete | `reconcile_required` | no |
+| `active` | Operator drains admission | Expected generation; does not signal Dagr/Sergeant | `drained` | no |
+| `active` | Drift cannot safely resolve | Affected admission stops; running child is not rewritten | `excluded` | no |
+| `active` | External outcome uncertain | Owning adapter cannot prove accepted/refused/absent | `reconcile_required` | no |
+| `drained` | Operator resumes | Drain continuation and generations match | prior nonterminal state | no |
+| `excluded` | Resurvey permits resume | Required inputs and projection generation match | `active` | no |
+| any nonterminal | Mission acceptance verified | All required Dagr stages have compatible terminal evidence and handoffs | `record_required(completed)` | no |
+| any nonterminal | Mission cannot safely complete | Required Dagr/Sergeant failure evidence and cause are verified | `record_required(failed_safely)` | no |
+| any nonterminal | Owning authority replaces/cancels intent | Superseding authority evidence is verified; children are not rewritten | `record_required(superseded)` | no |
+| `record_required` | Record validates and publishes | Pending outcome, event head, acceptance/cause/continuation evidence match | matching terminal state | yes |
+
+`record_required` is the only route to `completed`, `failed_safely`, or
+`superseded`. Dagr stage terminality is source evidence, not mission terminality.
+A direct terminal write, terminal resume, or pending-outcome change is invalid.
+Recovery from a publication crash remains `record_required` until the exact
+record digest is proven and the atomic terminal pointer is published.
 
 #### Projection
 
@@ -622,8 +704,9 @@ Projection starts at `revision_0`. A current revision may enter `revalidating`
 and publish the next current revision, become `excluded`, or require a successor
 packet.
 
-Only a validated event advances the authoritative revision pointer. An
-unreferenced projection file is not authoritative.
+Only the joint transition commit and atomic run-state generation advance event
+head and projection revision. An unreferenced projection, event, or transition
+commit is not authoritative.
 
 #### Handoff
 
@@ -648,6 +731,16 @@ Finding reference moves from `draft` through `routing` and `routed` to
 
 External authority owns all transitions after `routed`; Platoon observes them.
 
+#### Unattended Qualification
+
+Qualification starts as `not_requested` or `requested`. Requested evidence moves
+to `evaluating`, then exactly one of `qualified` or `denied`. A qualified record
+becomes `expired` when its time bound or any relevant evidence revision changes,
+and `revoked` when an owning authority withdraws permission or the qualification
+policy is superseded. Denied, expired, and revoked records are immutable history;
+a later attempt creates a new qualification ID. Only current `qualified`
+evidence can pass an unattended admission transaction.
+
 ### Failure Windows
 
 | Window | Risk | Required behavior |
@@ -659,15 +752,20 @@ External authority owns all transitions after `routed`; Platoon observes them.
 | Observation stored before interpretation event | Status halves disagree | Observation remains valid; interpretation reports pending and retries derivation |
 | Projection file written before revision pointer | Partial amendment | Ignore unreferenced file; retain prior revision |
 | Event body written without complete framing | Torn trajectory | Reject final event and retain last verified head; never skip sequence |
+| Event/projection objects synced before transition commit | Orphan objects | Ignore as unreferenced; prior run state remains authoritative |
+| Transition commit synced before run-state replacement | Orphan commit | Ignore as unreferenced; retry may reuse only exact digests |
+| Run state names event but not matching projection | Split-brain pointers | Invalid generation enters reconcile required; never expose either as current |
 | Handoff offer published before evidence | Consumer sees incomplete output | Offer is non-acceptable until all references validate |
 | Handoff accepted while source drifts | Consumer begins stale work | Compare revisions at admission; exclude on mismatch |
 | Required input arrives during resume | Wrong decision consumed | Compare source revision and continuation generation immediately before effect |
 | Resume request reaches Sergeant but receipt is lost | Duplicate child action | Sergeant correlation owns reconciliation; Platoon does not retry without proof |
+| Receiving authority decides while transport receipt is lost | Authorization confused with transport | Record `unknown`; reconcile correlation and authority revision before any retry |
 | Finding created externally before receipt persists | Duplicate route | Reconcile by stable digest/correlation; ambiguity blocks |
 | Child terminal before Mission Record | False mission completion | Enter `record_required`; preserve exact child state separately |
 | Mission Record written before terminal pointer | Orphan record | Validate digest and publish pointer atomically; orphan is non-authoritative |
 | Drift found while child runs | Unsafe automatic stop or continuation | Exclude new admission; do not kill or rewrite child; request Sergeant action only if policy authorizes it |
 | Scheduler invokes stale hint | Old continuation resumed | Generation and projection compare fails without effect |
+| Qualification expires or is revoked during scheduler admission | Stale unattended permission used | Same fenced compare excludes operation before effect |
 | Process crashes after external effect | Unattributed outcome | Reconcile through owning source evidence; unresolved state fails closed |
 
 ### Negative Test Matrix
@@ -677,7 +775,9 @@ adapter output only.
 
 | Lifecycle | Negative case | Expected public result |
 |---|---|---|
-| Compile | Missing mission file | Validation fails; no state created |
+| Compile | Missing mission file in explicit declaration mode | Validation fails; no state created |
+| Compile | Missing mission file in default reference mode | Preserve current path-only validation; no file read |
+| Compile | Typed-looking content without explicit `missionFormat` | Remain reference mode; content sniffing is forbidden |
 | Compile | Symlink, oversized, changed-during-read declaration | Fail closed with bounded diagnostic |
 | Compile | Unknown schema version or field | Explicit unsupported/invalid result |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
@@ -687,8 +787,10 @@ adapter output only.
 | Apply | Partial packet publication | No authoritative run; retry is safe |
 | Run | Transition directly from active to completed | Reject; Mission Record remains required |
 | Run | Resume drained/excluded without its matching guard | No effect; run stays non-active |
-| Run | Resume superseded, completed, or failed run | Terminal refusal without adapter call |
+| Run | Resume superseded, completed, or failed-safely run | Terminal refusal without adapter call |
 | Run | Refusal occurs after an external effect | Reconcile required, never reported as refused |
+| Run | Safe failure or supersession writes a terminal state before record | Reject; retain matching `record_required` pending outcome |
+| Run | Record pending outcome differs from transition evidence | Reject record and retain nonterminal state |
 | Query | Project or td scope unresolved/wrong namespace | Explicit unresolved; never idle |
 | Query | Sergeant `busy:null` | Platoon interpretation is indeterminate |
 | Query | Git metadata but no coordinator | `queried:false`; never coordinator response |
@@ -699,10 +801,13 @@ adapter output only.
 | Projection | Revision skips predecessor | Keep prior authoritative revision |
 | Projection | Crash before pointer update | Ignore orphan revision |
 | Projection | Revalidation changes purpose, authority, effect, or completion | Reject amendment and require successor packet |
+| Projection | Run state names mismatched event/projection commit | Reconcile required; prior verified generation remains displayable |
 | Handoff | Producer and consumer are same forbidden ownership | Validation fails |
+| Handoff | Child or unverified caller attempts to publish an offer | Reject; only applied verified reconciliation is ingress |
 | Handoff | Evidence missing, stale, wrong packet, or wrong stage | Consumer remains blocked |
 | Handoff | Unknown major schema | Incompatible and reassembly required |
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
+| Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
 | Continuation | Missing safe state, action, route, or required input | Invalid nonterminal outcome |
@@ -724,8 +829,16 @@ adapter output only.
 | Record | Event head changes during derivation | Retry from new head; do not publish stale record |
 | Unattended | Requested without prior evidence | Qualification refused |
 | Unattended | Blocking unknown, mutable authority, or unbounded input | Qualification refused |
+| Unattended | Qualified evidence revision changes | Qualification expires before invocation |
+| Unattended | Owning authority revokes permission | Qualification is revoked and cannot be reused |
+| Unattended | Drift races scheduler invocation | Fenced compare expires qualification; no effect |
+| Unattended | Expired/denied qualification ID is replayed | No effect; a new evaluation ID is required |
 | Scheduler | Replayed or premature hint | Compare fails; no effect |
+| External request | Receiving authority refuses | Record exact refusal; no retry or accepted interpretation |
+| External request | Receipt is lost or authorization revision mismatches | Record unknown and reconcile by correlation; no blind retry |
+| External request | Receipt omits authority decision reference | Reject receipt as inconclusive and fail closed |
 | Compatibility | Existing v1alpha1 manifest with old Sergeant files | Existing behavior unchanged; mission features report compatibility mode |
+| Compatibility | Nonterminal pre-mission run is older than immediately prior schema | Original commands remain operable; no forced in-place upgrade |
 | Privacy | Source contains secret or absolute private path | Output omits it and records bounded rejection |
 | Bounds | More sources/events/findings than limits | Deterministic truncation metadata or fail closed where completeness is required |
 
@@ -734,22 +847,55 @@ adapter output only.
 #### Version Negotiation
 
 - Existing manifests remain `platoon.dev/v1alpha1`.
-- The currently required `spec.mission` path gains semantics through a separate
-  `platoon.dev/mission/v1alpha1` document; no manifest field is repurposed.
-- Existing manifests whose mission file is unstructured Markdown enter
-  `legacy-reference` mode during the first migration slice. Validation and
-  current execution remain available, while new compilation/status features
-  report `missionDeclaration: unsupported`.
+- An optional `spec.missionFormat` field is added to that manifest version with
+  values `reference` and `declaration-v1alpha1`; omission defaults to
+  `reference`, preserving every existing manifest. Content or filename sniffing
+  is forbidden. The currently required `spec.mission` path is not repurposed.
+- `reference` is legacy mode: Platoon validates the path syntax exactly as it
+  does now and does not require, read, or snapshot the referenced file.
+  `declaration-v1alpha1` is explicit opt-in: the referenced file must exist and
+  strictly decode as `platoon.dev/mission/v1alpha1`, or validation fails.
 - A later manifest API version may require the typed declaration. That change is
   outside the first implementation and requires explicit migration tooling.
-- Durable state adds a new major/minor version. Readers support the current
-  version and the immediately prior version read-only; writers never downgrade.
+- Durable state adds a new major/minor version. Every released pre-mission state
+  schema remains readable and operable by its original command behavior while
+  it is nonterminal; terminal legacy state remains read-only inspectable.
+  Writers never upgrade or downgrade a run in place. Retirement requires an
+  explicit major release, backup/export path, inventory proving no nonterminal
+  run uses the version, and an operator-visible migration notice.
 - Sergeant negotiation starts with a capability/version query. Unsupported
   generic status leaves existing dispatch/file adapters operational and marks
   only the new observation unavailable.
 - Existing callback origin and fleet file contracts remain supported until a
   separately announced adapter removal. The new query does not silently replace
   dispatch correlation recovery.
+
+Command compatibility is explicit:
+
+| Command | `reference` (default/legacy) | `declaration-v1alpha1` |
+|---|---|---|
+| `validate` | Current manifest/path checks; missing mission file remains permitted | Stable-read and strictly validate declaration; missing/invalid file fails |
+| `plan` | Current deterministic admission plan | Compile packet/readiness preview without mutation |
+| non-applied `start` | Current preview | Same typed compile preview |
+| applied `start` | Current intent snapshot, Dagr, and Sergeant behavior | Publish packet/run, then enter existing fenced path |
+| `reconcile`, `drain`, `resume` | Current run semantics only | Mission guards wrap existing semantics without child writes |
+| `status` | Current status plus `missionMode: reference` | Deep observed/interpreted mission status |
+| `resurvey`, `route`, `record`, unattended scheduling | Explicit `unsupported_for_reference`; no effect | Available only at the phase/version that implements the contract |
+
+Current state mappings are likewise explicit and do not convert a legacy run:
+
+| `platoon.state/v1alpha1` run | Compatibility interpretation | Allowed handling |
+|---|---|---|
+| `initialized` | `legacy.initialized` | Existing start/recovery behavior |
+| `active` | `legacy.active` | Existing reconcile/drain behavior |
+| `drained` | `legacy.drained` | Existing reconcile/resume behavior |
+| `reconcile_required` | `legacy.reconcile_required` | Existing recovery behavior |
+| `completed` | `legacy.completed` | Terminal read-only inspection |
+| `failed` | `legacy.failed` | Terminal read-only inspection |
+
+Legacy terminal runs are not backfilled with Mission Records and are never
+reported as satisfying typed-record guarantees. Typed run states use only the
+transition table in this PRD.
 
 #### Migration
 
@@ -817,7 +963,9 @@ a time.
 1. CLI tests prove `validate`, `plan`, non-applied `start`, and `status` create no
    state or adapter effects.
 2. Schema/runtime shared fixtures prove strict declaration, packet, handoff,
-   event, continuation, and record validation.
+   event, continuation, and record validation. Golden packet fixtures prove the
+   canonical byte/digest contract across equivalent ordering and meaningful
+   source changes.
 3. A synthetic fake Dagr/Sergeant lifecycle extends the existing end-to-end
    prior art: compile, apply, dispatch, observed waiting/needs-input, handoff,
    drift, resume, terminal evidence, record.
@@ -825,7 +973,8 @@ a time.
    `busy:null`, stale coordinator, no correlated response, incompatible version,
    and cross-harness isolation without importing Sergeant source.
 5. Crash tests inject failure at every publication pointer and external request
-   window in Section 12.
+   window in [Failure Windows](#failure-windows), including each object/commit/
+   state-pointer boundary in the joint projection/trajectory protocol.
 6. Golden JSON tests verify exact observation versus interpretation labels,
    stable ordering, bounds, and privacy rejection.
 7. Property tests verify append-only event chains, generation fencing,
@@ -922,8 +1071,9 @@ The first implementation is successful when:
 - all inconclusive Sergeant evidence remains inconclusive;
 - every accepted handoff cites producer revision and evidence;
 - every drift event receives exactly one conservative verdict;
-- every nonterminal/safe-failure record has a valid continuation;
-- every terminal mission has a validated Mission Record;
+- every nonterminal interpretation and failed-safely record has a valid
+  continuation;
+- every typed terminal mission has a validated Mission Record;
 - no new path traverses td/fleet/coordinator state outside the Sergeant adapter;
 - privacy and bound tests show no raw child output or private source content;
 - existing manifests and adapters retain their documented compatibility path.
@@ -973,7 +1123,7 @@ those improvements before evidence exists.
 
 #### Atlas Design Inspiration, Not Implemented Evidence
 
-- Chapter 0 and the [Field Reference WorkPacket][atlas-workpacket]: immutable
+- [Chapter 0][atlas-0] and the [Field Reference WorkPacket][atlas-workpacket]: immutable
   declaration, sourced context tiers, explicit effects/stops, projection, and
   Mission Record.
 - [Chapter 1][atlas-1]: blocking versus non-blocking unknowns,
@@ -990,6 +1140,7 @@ those improvements before evidence exists.
 - [Field Reference][atlas-reference]: implementation-neutral contracts for
   packet, projection, workflow, finding, and Mission Record.
 
+[atlas-0]: https://garrison-field-atlas.netlify.app/
 [atlas-1]: https://garrison-field-atlas.netlify.app/1/
 [atlas-2]: https://garrison-field-atlas.netlify.app/2/
 [atlas-3]: https://garrison-field-atlas.netlify.app/3/
