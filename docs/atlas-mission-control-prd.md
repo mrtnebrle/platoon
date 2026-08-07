@@ -17,9 +17,10 @@ observations without rewriting them, record an append-only sanitized
 trajectory, and derive a terminal Mission Record.
 
 The public product boundary is one deep Platoon mission interface with compile,
-apply, status, resurvey, route, resume, and record operations. Existing commands
-remain compatibility entry points into that interface. Runtime facts enter
-through one version-negotiated Sergeant status-query adapter. That adapter
+apply, reconcile, status, drain, resurvey, handoff, route, resume, and record
+operations. Existing commands remain compatibility entry points into that
+interface. Runtime facts enter through one version-negotiated Sergeant
+status-query adapter. That adapter
 depends on the generic project/td/fleet/coordinator resolution proposed by
 [Sergeant issue #207][sergeant-207]; Platoon will not traverse td, infer worker
 liveness, discover coordinators, manage callback queues, or route harness
@@ -323,8 +324,10 @@ illustrative, not a required Go identifier.
 | Operation | Mutates | Input | Result |
 |---|---:|---|---|
 | `Compile` | no | manifest bytes, declaration bytes, intent bytes, source descriptors | deterministic packet preview, readiness, diagnostics |
-| `Apply` | yes | compiled digests, expected source revisions | immutable packet/run publication and existing admission result |
+| `Apply` | yes | compiled digests, expected source revisions | immutable initial packet/run publication and start admission result |
+| `Reconcile` | yes | run ID, expected generation, bounded refresh policy | one existing bounded reconciliation cycle plus mission transitions/handoff offers |
 | `Status` | no | run ID, optional refresh policy | exact observations plus interpretation and continuation |
+| `Drain` | yes | run ID, expected generation | Platoon-local admission drain without signaling Dagr or Sergeant |
 | `Resurvey` | append-only | run ID, expected generation and projection revision | drift evidence and one verdict |
 | `Handoff` | append-only | contract ID, action, expected run/projection generation | verified offer, withdrawal, acceptance, or consumption result |
 | `Route` | append-only/external request | finding draft, owning route, expected generation | external finding reference or explicit refusal |
@@ -371,10 +374,17 @@ or coordinator state.
 
 #### Effect Authorization Gate
 
-One gate applies to every external adapter `Request`, whether invoked manually,
-by applied reconciliation, or from an unattended scheduler. Under the held run
-generation fence and immediately before adapter invocation, Mission Control
-must prove all of the following from the current packet/projection and exact
+One gate applies to every typed-run effecting adapter invocation, whether
+invoked manually, by initial apply, by reconciliation, or from an unattended
+scheduler. This includes Dagr workflow load/start and terminal acknowledgment,
+Sergeant dispatch and `Request`, validation/integration command execution, and
+any receiving-system operation. Read-only Dagr/Sergeant/Git queries do not
+require effect authorization but remain bounded and source-labeled. Legacy
+reference-mode runs preserve their current adapter behavior.
+
+Under the held run generation fence and immediately before each effecting
+adapter invocation, Mission Control maps the operation to its declared effect
+and must prove all of the following from the current packet/projection and exact
 source evidence:
 
 1. The requested effect is explicitly allowed and not prohibited.
@@ -388,12 +398,14 @@ source evidence:
    request.
 6. An unattended request additionally carries current `qualified` evidence.
 
-Failure returns a bounded refusal before adapter invocation and appends no
-effect event. Passing this gate does not grant authorization: the receiving
-system independently accepts or refuses, and Platoon recognizes acceptance only
-from its revisioned authority decision receipt. If authority changes after the
-gate but before receipt, the revision mismatch is `unknown` and enters
-operation-specific reconciliation rather than accepted state.
+Failure returns a bounded refusal before that adapter invocation and appends no
+effect event. A typed run whose required Dagr or Sergeant orchestration effect
+is absent from the allowed list is not ready to start. Passing this gate does
+not grant authorization: the receiving system independently accepts or refuses,
+and Platoon recognizes acceptance only from its revisioned authority decision
+receipt. If authority changes after the gate but before receipt, the revision
+mismatch is `unknown` and enters operation-specific reconciliation rather than
+accepted state.
 
 #### Mission Declaration
 
@@ -546,15 +558,22 @@ projection revision, timestamp, event type, sanitized subject, and evidence
 references. This is the append-only equivalent of JSON Lines while permitting a
 crash-consistent pointer transaction.
 
-One publication protocol jointly advances trajectory and projection. The writer
-first creates and syncs any immutable projection object and event object in the
-run directory, then creates and syncs an immutable transition commit naming
-their digests, previous event head, previous projection revision, and resulting
-state. It finally atomically replaces and directory-syncs the authoritative run
-state, whose single generation names transition commit, event head, and
-projection revision together. There is no independently writable event-head or
-projection pointer. Recovery ignores unreferenced objects/commits. A run state
-that references a missing, mismatched, or non-successor object enters
+One publication protocol jointly advances observations, trajectory, and
+projection. A source query intended only for a read-only status response is
+ephemeral and is not durable authority. Applied reconciliation that persists an
+observation first creates and syncs an immutable bounded observation object with
+its source schema, revision/time, quality, and digest. The writer then creates
+and syncs any immutable projection object and event object; the event references
+observation IDs rather than embedding their bodies.
+
+The writer next creates and syncs an immutable transition commit naming every
+observation digest, projection digest, event digest, previous event head,
+previous projection revision, and resulting state. It finally atomically
+replaces and directory-syncs the authoritative run state, whose single
+generation names transition commit, observation set, event head, and projection
+revision together. There is no independently writable observation, event-head,
+or projection pointer. Recovery ignores unreferenced objects/commits. A run
+state that references a missing, mismatched, or non-successor object enters
 `reconcile_required` and never skips to a later object.
 
 Meaningful event types include:
@@ -760,9 +779,9 @@ Projection starts at `revision_0`. A current revision may enter `revalidating`
 and publish the next current revision, become `excluded`, or require a successor
 packet.
 
-Only the joint transition commit and atomic run-state generation advance event
-head and projection revision. An unreferenced projection, event, or transition
-commit is not authoritative.
+Only the joint transition commit and atomic run-state generation publish an
+observation set or advance event head and projection revision. An unreferenced
+observation, projection, event, or transition commit is not authoritative.
 
 #### Handoff
 
@@ -805,12 +824,12 @@ evidence can pass an unattended admission transaction.
 | Packet files published before run pointer | Orphan immutable files | Ignore as non-authoritative; bounded cleanup may remove after proof |
 | Run pointer published before Dagr start receipt | Existing uncertain start | Preserve current Dagr recovery and `reconcile_required` behavior |
 | Sergeant query returns while source changes | Mixed observation | Adapter provides one versioned bounded observation or marks inconclusive |
-| Observation stored before interpretation event | Status halves disagree | Observation remains valid; interpretation reports pending and retries derivation |
+| Observation object synced before event/transition | Uninterpreted evidence appears authoritative | Ignore as unreferenced; prior published observation set remains current |
 | Projection file written before revision pointer | Partial amendment | Ignore unreferenced file; retain prior revision |
 | Event body written without complete framing | Torn trajectory | Reject final event and retain last verified head; never skip sequence |
-| Event/projection objects synced before transition commit | Orphan objects | Ignore as unreferenced; prior run state remains authoritative |
+| Observation/event/projection objects synced before transition commit | Orphan objects | Ignore as unreferenced; prior run state remains authoritative |
 | Transition commit synced before run-state replacement | Orphan commit | Ignore as unreferenced; retry may reuse only exact digests |
-| Run state names event but not matching projection | Split-brain pointers | Invalid generation enters reconcile required; never expose either as current |
+| Run state names observation/event/projection not jointly bound by commit | Split-brain pointers | Invalid generation enters reconcile required; never expose any as current |
 | Handoff offer published before evidence | Consumer sees incomplete output | Offer is non-acceptable until all references validate |
 | Handoff accepted while source drifts | Consumer begins stale work | Compare revisions at admission; exclude on mismatch |
 | Required input arrives during resume | Wrong decision consumed | Compare source revision and continuation generation immediately before effect |
@@ -855,6 +874,8 @@ adapter output only.
 | Query | Transcript/session exists but owner stale | No live coordinator conclusion |
 | Query | Unsupported Sergeant query version | Existing adapters continue; mission observation unsupported |
 | Query | Oversized or unknown-field response | Reject observation; bounded error |
+| Observation | Object is unreferenced by authoritative transition commit | Ignore it; prior observation set remains current |
+| Observation | Event/commit names missing or wrong-digest observation | Reconcile required; do not expose partial interpretation |
 | Projection | Source locator is private path or secret-like | Reject before durable write |
 | Projection | Revision skips predecessor | Keep prior authoritative revision |
 | Projection | Crash before pointer update | Ignore orphan revision |
@@ -910,6 +931,9 @@ adapter output only.
 | External request | Receiving authority refuses | Record exact refusal; no retry or accepted interpretation |
 | External request | Receipt is lost or authorization revision mismatches | Record unknown and reconcile by correlation; no blind retry |
 | External request | Receipt omits authority decision reference | Reject receipt as inconclusive and fail closed |
+| Dagr effect | Typed packet omits or prohibits workflow start/terminal acknowledgment effect | Authorization gate refuses before Dagr invocation |
+| Sergeant dispatch | Typed packet omits/prohibits dispatch or has an active stop | Authorization gate refuses before dispatch invocation |
+| Effecting command | Validation/integration effect or authority revision is not current | Authorization gate refuses before command invocation |
 | Compatibility | Existing v1alpha1 manifest with old Sergeant files | Existing behavior unchanged; mission features report compatibility mode |
 | Compatibility | Nonterminal pre-mission run is older than immediately prior schema | Original commands remain operable; no forced in-place upgrade |
 | Rollback | Typed run has an active Sergeant child | Rolled-back release still reconciles/drains/resumes that run; child is untouched |
@@ -1066,8 +1090,8 @@ a time.
    `busy:null`, stale coordinator, no correlated response, incompatible version,
    and cross-harness isolation without importing Sergeant source.
 5. Crash tests inject failure at every publication pointer and external request
-   window in [Failure Windows](#failure-windows), including each object/commit/
-   state-pointer boundary in the joint projection/trajectory protocol.
+   window in [Failure Windows](#failure-windows), including each observation,
+   projection, event, commit, and state-pointer boundary in the joint protocol.
 6. Golden JSON tests verify exact observation versus interpretation labels,
    stable ordering, bounds, and privacy rejection.
 7. Property tests verify append-only event chains, generation fencing,
