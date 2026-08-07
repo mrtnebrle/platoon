@@ -16,9 +16,9 @@ revisioned projection of sourced references, interpret exact Sergeant
 observations without rewriting them, record an append-only sanitized
 trajectory, and derive a terminal Mission Record.
 
-The public product boundary is one deep Platoon mission interface with compile,
-apply, reconcile, status, drain, resurvey, handoff, route, resume, and record
-operations. Existing commands remain compatibility entry points into that
+The public product boundary is one deep Platoon mission interface with survey,
+compile, apply, reconcile, status, drain, resurvey, handoff, route, resume, and
+record operations. Existing commands remain compatibility entry points into that
 interface. Runtime facts enter through one version-negotiated Sergeant
 status-query adapter. That adapter
 depends on the generic project/td/fleet/coordinator resolution proposed by
@@ -76,25 +76,28 @@ current reference-only behavior.
 1. `validate` checks both documents, references, authority assumptions, source
    labels, handoff compatibility, and lifecycle completeness without side
    effects.
-2. `plan` compiles a deterministic preview containing readiness, blocking
-   unknowns, contradictions, admission decisions, and the source revisions it
-   would bind.
-3. Applied `start` snapshots the declaration and existing intent, publishes an
+2. `survey` optionally queries declared sources read-only and returns an
+   immutable observation bundle without creating Platoon state.
+3. `plan` consumes that bundle without mutable queries and compiles a
+   deterministic preview containing readiness, blocking unknowns,
+   contradictions, admission decisions, and source revisions.
+4. Applied `start` revalidates bundled sources, snapshots declaration/intent,
+   and publishes an
    immutable packet and run identity, then uses the existing fenced admission
    path.
-4. `status` returns one bounded document containing exact observed state from
+5. `status` returns one bounded document containing exact observed state from
    Dagr, Sergeant, Git, and td references alongside explicitly labeled Platoon
    interpretation, projection revision, continuation, and recent meaningful
    events.
-5. `resurvey` compares source revisions and emits a conservative drift verdict.
+6. `resurvey` compares source revisions and emits a conservative drift verdict.
    It never mutates the packet or child state.
-6. `route` publishes a mission-level finding reference through the authority
+7. `route` publishes a mission-level finding reference through the authority
    that owns disposition. It does not create or close repository review
    findings itself.
-7. Applied `resume` requires the expected run generation, projection revision,
+8. Applied `resume` requires the expected run generation, projection revision,
    satisfied required inputs, and authoritative evidence for the selected
    continuation.
-8. A terminal run derives and validates one Mission Record before the run is
+9. A terminal run derives and validates one Mission Record before the run is
    considered complete.
 
 Every mutating operation remains explicit with `--apply`. No internal daemon is
@@ -323,8 +326,9 @@ illustrative, not a required Go identifier.
 
 | Operation | Mutates | Input | Result |
 |---|---:|---|---|
-| `Compile` | no | manifest bytes, declaration bytes, intent bytes, source descriptors | deterministic packet preview, readiness, diagnostics |
-| `Apply` | yes | compiled digests, expected source revisions | immutable initial packet/run publication and start admission result |
+| `Survey` | no | validated manifest/declaration digest, declared sources, caller role | immutable bounded source-observation bundle; no Platoon state |
+| `Compile` | no | manifest, declaration, intent, optional source-bundle bytes | deterministic packet preview, readiness, diagnostics |
+| `Apply` | yes | compiled digests, expected source-bundle/revisions | revalidated immutable packet/run publication and start admission result |
 | `Reconcile` | yes | run ID, expected generation, bounded refresh policy | one existing bounded reconciliation cycle plus mission transitions/handoff offers |
 | `Status` | no | run ID, optional refresh policy | exact observations plus interpretation and continuation |
 | `Drain` | yes | run ID, expected generation | Platoon-local admission drain without signaling Dagr or Sergeant |
@@ -372,31 +376,37 @@ the new adapter reports `unsupported`. Existing dispatch and current durable
 file adapters continue unchanged. Platoon MUST NOT emulate #207 by traversing td
 or coordinator state.
 
-#### Effect Authorization Gate
+#### Mission And Effect Authorization Gates
 
-One gate applies to every typed-run effecting adapter invocation, whether
+The common mission gate applies to every typed operation, including
+`read-source` and `query-authority`. It checks declared effect, prohibited set,
+caller/stage scope, applicable stops/unknowns/contradictions, and the current
+input fence. Run-bound operations use the full run fence; pre-run `Survey` uses
+the validated manifest/declaration digest and exact caller role. A failed common
+gate returns a bounded refusal before any query or effect. Read-only queries then
+skip receiving-system authorization, receipt, and effect-attempt journaling, but
+they do not skip mission policy.
+
+The external-effect gate applies after the common gate to every typed-run
+effecting adapter invocation, whether
 invoked manually, by initial apply, by reconciliation, or from an unattended
 scheduler. This includes Dagr workflow load/start and terminal acknowledgment,
 Sergeant dispatch and `Request`, validation/integration command execution, and
-any receiving-system operation. Read-only Dagr/Sergeant/Git queries do not
-require effect authorization but remain bounded and source-labeled. Legacy
-reference-mode runs preserve their current adapter behavior.
+any receiving-system operation. Legacy reference-mode runs preserve their
+current adapter behavior.
 
 Under the held run generation fence and immediately before each effecting
 adapter invocation, Mission Control maps the operation to its declared effect
 and must prove all of the following from the current packet/projection and exact
 source evidence:
 
-1. The requested effect is explicitly allowed and not prohibited.
-2. No applicable stop, unresolved blocking unknown, contradiction, exclusion,
-   or drift verdict prevents the effect.
-3. The operation belongs to the current stage contract or unconsumed
+1. The operation belongs to the current stage contract or unconsumed
    continuation and its expected packet, projection, and run generations match.
-4. The receiving authority source and revision match the request, and current
+2. The receiving authority source and revision match the request, and current
    authority evidence permits this caller to attempt the operation.
-5. Correlation and idempotency identities are new or reconcile to the exact same
+3. Correlation and idempotency identities are new or reconcile to the exact same
    request.
-6. An unattended request additionally carries current `qualified` evidence.
+4. An unattended request additionally carries current `qualified` evidence.
 
 Failure returns a bounded refusal before that adapter invocation and appends no
 effect event. A typed run whose required Dagr or Sergeant orchestration effect
@@ -462,7 +472,7 @@ Source kinds are closed and provenance labels are derived, never authored:
 | `td` | `td` | `SergeantMissionSource` td scope from #207 | Source revision when supplied, observation time, and evidence digest |
 | `dagr` | `dagr` | Configured Dagr adapter/snapshot schema | Workflow/run/stage identities, adapter version, observation time/digest |
 | `sergeant` | `sergeant` | Version-negotiated Sergeant query/file schema | Schema version, scope/correlation, observation time/digest |
-| `receiving-system` | `receiving_system` | Registered typed authority adapter | Authority/action revision, observation time, decision digest |
+| `receiving-system` | `receiving_system` | Registered typed authority adapter plus `platoon.receiving-capability/v1alpha1` | Capability/authority/action revision, environment class, observation time, decision digest |
 | `validation-capability` | `platoon` | Operator-owned `platoon.validation-capability/v1alpha1` profile | Profile, executable, sandbox self-test, and policy digests |
 | `platoon-policy` | `platoon` | Snapshotted Platoon policy schema | Exact policy version and content digest |
 
@@ -472,6 +482,32 @@ versions, locator/kind mismatches, or missing required revision evidence fail
 closed. A `td` source is always resolved through the Sergeant adapter; it never
 authorizes direct td traversal in Platoon. Negotiated source schemas define the
 only field paths a stop may inspect.
+
+##### Source Survey Bundle
+
+`Survey` strictly validates manifest/declaration structure, then applies the
+common mission gate for each declared `read-source`/`query-authority` operation.
+It queries only declared sources through owning adapters and returns, without
+creating Platoon state, one `platoon.source-bundle/v1alpha1` object. The bundle
+contains declaration/source-catalog digests, caller role, canonical query scope,
+ordered bounded typed observations, adapter/schema versions, source revisions,
+qualities, observation times, and per-source freshness policy. Its bundle ID is
+the domain-separated RFC 8785 SHA-256 of that envelope. Raw source/transport
+bodies are excluded.
+
+`Compile`/`plan` never query mutable systems. They consume an optional bundle and
+produce deterministic readiness from its exact bytes. A required mutable source
+without a valid bundle, with expired freshness, or with inconclusive quality is
+an explicit not-ready unknown, not an inferred value. This does not prevent
+offline preview of declaration shape and static admission decisions.
+
+Applied typed `start` re-queries every source required for entry/authority after
+the common read/query gate and before packet/run file publication. Each current
+schema, revision, quality, and observation digest must match the compiled bundle
+and source freshness policy. Any change returns `replan_required` without packet
+files, Dagr/Sergeant call, or other effect. A match allows final packet
+publication with the revalidated observation/bundle digest. Survey and apply
+both resolve td only through `SergeantMissionSource`.
 
 Required mission classes and completion rules are closed in v1alpha1. Effect
 ceilings list what a class may explicitly request; they grant nothing by
@@ -507,6 +543,17 @@ maps each allowed effect to a nonempty set from `operator`, `platoon`,
 `effects.stages`. An undeclared caller/effect pair is denied. The exhaustive
 effecting operation map is:
 
+`effects.receivingActions` is required for each allowed
+`receiving-system-operation` and binds stage/mission scope, receiving source ID,
+closed adapter action ID, caller roles, and expected capability revision. The
+source's signed/digested capability manifest binds adapter type/version and an
+action registry. Each action declares environment class from `development`,
+`test`, or `staging`, `production:false`, `destructive:false`, mutability, and
+authority/receipt schema. Production, unknown/unclassified environment,
+destructive action, missing capability, or declaration/capability mismatch is
+invalid. Apply revalidates the same capability revision immediately before the
+effect; the receipt must echo action/environment and authority revision.
+
 | Adapter operation | Required effect | Authority evidence and accepted receipt |
 |---|---|---|
 | Dagr workflow load | `dagr-load-workflow` | Configured Dagr source/version; exact workflow receipt and post-query |
@@ -519,7 +566,7 @@ effecting operation map is:
 | Handoff offer/withdraw/accept/consume | `publish-handoff` | Current packet/stage/source evidence and local joint transition commit; withdrawal additionally requires current unaccepted offer plus drift/invalidation evidence |
 | Acceptance/integration command | `run-validation` | Pinned repository/worktree/head plus enforced `no-external-effect/v1` capability profile; bounded exit/evidence digest |
 | Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
-| Receiving-system action | `receiving-system-operation` | Named source, action, owner and revision; revisioned authority decision receipt |
+| Receiving-system action | `receiving-system-operation` | Named capability action with non-production/non-destructive environment proof, owner/revision, and matching authority decision receipt |
 
 Typed mode also requires `spec.commandPolicies` to cover every repository
 integration and stage acceptance command by deterministic reference
@@ -630,7 +677,8 @@ media type enter the envelope.
 The canonical `platoon.packet/v1alpha1` envelope contains its schema, normalized
 manifest and declaration values, all three exact source digests, intent media
 type, selected handoff contracts sorted by ID, source descriptors sorted by ID
-including source-native revisions, and every nested schema version. Packet ID is
+including source-native revisions and revalidated bundle digest, and every
+nested schema version. Packet ID is
 lowercase SHA-256 over the ASCII domain separator
 `platoon.packet/v1alpha1` followed by one NUL byte and the canonical envelope
 bytes. Golden fixtures SHALL prove that map-key input order and schema-set
@@ -949,6 +997,7 @@ after current Dagr start recovery succeeds.
 |---|---|---|---|---:|
 | `initializing` | Verified Dagr run start | Exact workflow/run/stage identities | `active` | no |
 | `initializing` | Dagr outcome uncertain | Current Dagr recovery evidence incomplete | `reconcile_required` | no |
+| `initializing` | Dagr load/start definitively refuses or fails non-retryably | Exact authoritative refusal/failure and no live run | `record_required(failed_safely)` | no |
 | `active` or `reconcile_required` | Operator drains admission | Expected generation; retain exact prior state/blockers; do not signal Dagr/Sergeant | `drained` | no |
 | `drained` | Operator repeats drain | Same run; no state change | `drained` | no |
 | `active` | Drift cannot safely resolve | Affected admission stops; running child is not rewritten | `excluded` | no |
@@ -1069,6 +1118,7 @@ never changes and no ordinal greater than two is valid.
 | Adapter effect succeeds before receipt is durable | Duplicate effect after restart | Keep reconcile required; query idempotency/correlation, never blind retry |
 | Receipt validated before committed transition | Lost local result | Re-query exact receipt and request digest; publish one operation result |
 | Run pointer published before Dagr start receipt | Existing uncertain start | Preserve current Dagr recovery and `reconcile_required` behavior |
+| Dagr load/start returns authoritative final refusal | Initializing run cannot progress | Enter record-required failed-safely with cause/continuation; no retry/live run |
 | Sergeant query returns while source changes | Mixed observation | Adapter provides one versioned bounded observation or marks inconclusive |
 | Observation object synced before event/transition | Uninterpreted evidence appears authoritative | Ignore as unreferenced; prior published observation set remains current |
 | Projection file written before revision pointer | Partial amendment | Ignore unreferenced file; retain prior revision |
@@ -1106,6 +1156,9 @@ adapter output only.
 | Compile | Unknown schema version or field | Explicit unsupported/invalid result |
 | Compile | Source kind/label/schema/revision contract is unknown or mismatched | Invalid declaration; no adapter fallback or invented label |
 | Compile | td source cannot resolve through Sergeant adapter | Required source unavailable/inconclusive; never traverse td locally |
+| Survey | Read/query effect, caller, source, or stop is not allowed | Refuse before source adapter query; no bundle/state |
+| Compile | Required mutable source bundle is absent, stale, mismatched, or inconclusive | Deterministic not-ready result with explicit unknown |
+| Apply | Revalidated source/capability differs from compiled bundle | Return replan-required before packet/effect; create no run files |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
 | Compile | Class-required output category is missing or duplicated | Invalid; completion rules are not inferred |
 | Compile | Output category is unknown or extra output reuses required category | Invalid declaration |
@@ -1131,6 +1184,7 @@ adapter output only.
 | Run | Refusal occurs after an external effect | Reconcile required, never reported as refused |
 | Run | Safe failure or supersession writes a terminal state before record | Reject; retain matching `record_required` pending outcome |
 | Run | Record pending outcome differs from transition evidence | Reject record and retain nonterminal state |
+| Run | Initializing Dagr operation returns exact non-retryable final refusal | Enter record-required failed-safely with Dagr cause evidence |
 | Drain | Reconcile-required run is drained then resumed | Preserve/restore exact blocker, correlation, and prior reconcile state |
 | Drain | Correlation resolves while reconcile-required run is drained | Update retained prior state but keep admission drained |
 | Drain | Drained reconciliation resolves to terminal pending outcome | Enter matching record-required state; never reopen admission |
@@ -1212,7 +1266,10 @@ adapter output only.
 | Unattended | Expired/denied qualification ID is replayed | No effect; a new evaluation ID is required |
 | Scheduler | Replayed or premature hint | Compare fails; no effect |
 | External request | Effect is absent from allowed list or appears in prohibited list | Pre-request gate refuses without adapter invocation |
+| Read/query | Effect/caller/stage is undeclared, prohibited, stopped, or stale | Common mission gate refuses before query adapter invocation |
 | External request | Receiving operation requests production activation | Invalid/global prohibition; never invoke adapter |
+| External request | Receiving action capability is absent, unknown, destructive, production, or changed | Compile/apply gate refuses before adapter invocation |
+| External request | Receipt action/environment/capability revision mismatches request | Record unknown; reconcile, never accept |
 | External request | Applicable stop, block, contradiction, exclusion, or drift is active | Pre-request gate refuses without adapter invocation |
 | External request | Continuation, packet, projection, or run generation is stale | Fenced compare refuses without adapter invocation |
 | External request | Receiving authority/revision is missing or stale | Pre-request gate refuses without adapter invocation |
@@ -1272,9 +1329,10 @@ Command compatibility is explicit:
 | Command | `reference` (default/legacy) | `declaration-v1alpha1` |
 |---|---|---|
 | `validate` | Current manifest/path checks; missing mission file remains permitted | Stable-read and strictly validate declaration; missing/invalid file fails |
-| `plan` | Current deterministic admission plan | Compile packet/readiness preview without mutation |
+| `survey` | Explicit `unsupported_for_reference`; no effect | Read-only declared-source bundle without Platoon state |
+| `plan` | Current deterministic admission plan | Offline packet/readiness preview from optional immutable bundle |
 | non-applied `start` | Current preview | Same typed compile preview |
-| applied `start` | Current intent snapshot, Dagr, and Sergeant behavior | Publish packet/run, then enter existing fenced path |
+| applied `start` | Current intent snapshot, Dagr, and Sergeant behavior | Revalidate bundle, publish packet/run, then enter existing fenced path |
 | `reconcile`, `drain`, `resume` | Current run semantics only | Mission guards wrap existing semantics without child writes |
 | `status` | Current status plus `missionMode: reference` | Deep observed/interpreted mission status |
 | `resurvey`, `route`, `record`, unattended scheduling | Explicit `unsupported_for_reference`; no effect | Available only at the phase/version that implements the contract |

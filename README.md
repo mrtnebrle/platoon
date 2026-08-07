@@ -76,9 +76,9 @@ proposes activating the currently inert mission reference as a versioned,
 explicitly opted-in immutable declaration. It defines sourced cross-repository
 interpretation, handoffs, drift verdicts, trajectory, Mission Records, and a
 bounded whole-observation Sergeant status-query seam behind one interface for
-start, reconcile, drain, resume, and status. It preserves Dagr readiness,
-Sergeant worker lifecycle, Git/td authority, explicit apply, and current adapter
-compatibility.
+survey, start, reconcile, drain, resume, and status. It preserves Dagr
+readiness, Sergeant worker lifecycle, Git/td authority, explicit apply, and
+current adapter compatibility.
 It also specifies closed source/class/output/non-production-effect/stop
 contracts, crash-safe effect attempts, deny-by-default sandboxed
 validation/replay policies, complete authority coverage, and a tested
