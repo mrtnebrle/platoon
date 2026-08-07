@@ -407,6 +407,33 @@ receipt. If authority changes after the gate but before receipt, the revision
 mismatch is `unknown` and enters operation-specific reconciliation rather than
 accepted state.
 
+#### Effect Attempt Journal
+
+Every typed external effecting invocation uses one generalized durable attempt
+contract after authorization and before the adapter call. Existing Sergeant
+dispatch reservations and Dagr transition journals may implement this contract;
+Mission Control must not create a second competing journal.
+
+The held generation first publishes and syncs `prepared` with attempt ID,
+effect/adapter operation, canonical request digest, prior run/stage state,
+packet/projection/run generations, authority source/revision, correlation,
+idempotency key, and preparation time. No invocation has occurred while
+`prepared`. Immediately before the call, the same fence publishes and syncs
+`invoking`; only then may the adapter run. A bounded receipt is validated and
+the joint transition atomically stores `committed` or `refused` with its digest
+and operation result.
+
+A crash in `prepared` may invoke once only after all recorded generations and
+authorization evidence still match. A crash or transport loss in `invoking` is
+always uncertain: recovery queries the owning adapter by correlation and
+idempotency key before retry. Exact accepted/refused/absence evidence converges
+the attempt; missing, stale, multiple, or conflicting evidence remains
+`reconcile_required`. An adapter operation that cannot provide stable
+correlation, durable deduplication or bounded absence proof is unsupported for a
+typed external effect. Command operations additionally require declared
+idempotence and pinned pre/post repository evidence before any absence-proven
+retry. Attempt records contain no credentials, environment, or raw output.
+
 #### Mission Declaration
 
 The declaration is strict YAML with unknown fields rejected. Its identity is
@@ -417,10 +444,71 @@ unattended request, and a source catalog. Source entries require stable ID,
 closed source kind, opaque public-safe locator, revision or observation policy,
 mission role, and reason.
 
-Required mission classes are `discover`, `decide`, `change-substrate`,
-`deliver`, `validate`, `operate`, `recover`, and `learn`. Each class SHALL define
-required output and permitted terminal-outcome rules. A declaration cannot use
-an unknown mission class or omit an explicit effect boundary.
+Required mission classes and completion rules are closed in v1alpha1. Effect
+ceilings list what a class may explicitly request; they grant nothing by
+default. Every typed declaration still names its exact allowed subset.
+
+| Class | Required outputs for `completed` | Effect ceiling beyond read/query/orchestration/route | Permitted terminal outcomes |
+|---|---|---|---|
+| `discover` | Sourced answers, remaining unknown/contradiction dispositions, evidence and finding references | none | completed, failed_safely, superseded |
+| `decide` | Attributable decision, deciding authority reference/revision, rationale, downstream effects | none | completed, failed_safely, superseded |
+| `change-substrate` | Product delta plus compatibility, migration, rollback, dependency, and invalidation evidence | write-claimed-source | completed, failed_safely, superseded |
+| `deliver` | Product delta and every declared acceptance result/evidence | write-claimed-source | completed, failed_safely, superseded |
+| `validate` | Independent acceptance evidence and finding/disposition references; no remediation patch | none | completed, failed_safely, superseded |
+| `operate` | Receiving-system operation receipt, resulting state, and audit evidence | receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
+| `recover` | Proven safe state, cause classification, recovery evidence, and next continuation if residual work remains | write-claimed-source, receiving-system-operation, request-sergeant-lifecycle | completed, failed_safely, superseded |
+| `learn` | Sourced world delta, findings, and capability/workflow candidates | none | completed, failed_safely, superseded |
+
+Read/query effects are `read-source` and `query-authority`. Orchestration effects
+available to every class, but only when explicitly allowed, are
+`dagr-load-workflow`, `dagr-start-run`, `dagr-ack-stage`,
+`sergeant-dispatch`, `sergeant-coordinator-request`, `publish-handoff`,
+`route-finding`, and `run-validation`. The complete additional v1alpha1 effect
+registry is `write-claimed-source`, `receiving-system-operation`, and
+`request-sergeant-lifecycle`. Unknown effects fail validation. Merge, push,
+identity switch, credential creation, production activation outside a named
+receiving-system operation, child-state write, and direct session injection are
+globally forbidden and cannot appear in `allowed`.
+
+`effects.allowed` and `effects.prohibited` are unique effect-ID sets and must be
+disjoint. `effects.stages` maps every manifest stage ID to a subset of top-level
+allowed effects; an undeclared stage/effect pair is denied. The exhaustive
+effecting operation map is:
+
+| Adapter operation | Required effect | Authority evidence and accepted receipt |
+|---|---|---|
+| Dagr workflow load | `dagr-load-workflow` | Configured Dagr source/version; exact workflow receipt and post-query |
+| Dagr run start | `dagr-start-run` | Configured Dagr source/version; one full run identity and post-query |
+| Dagr step done/fail | `dagr-ack-stage` | Bound Dagr run/stage and expected state; post-query confirms transition |
+| Sergeant dispatch | `sergeant-dispatch` plus stage work effects | Registered project/adapter version and stage/task binding; correlated fleet receipt/evidence |
+| Sergeant coordinator request | `sergeant-coordinator-request` | Verified current coordinator owner/revision; correlated accepted/refused/unknown receipt |
+| Sergeant lifecycle request | `request-sergeant-lifecycle` | Verified Sergeant owner/revision and supported action; correlated receipt; Sergeant decides |
+| Mission finding route | `route-finding` | Configured disposition authority/revision; external finding reference/receipt |
+| Handoff offer/accept/consume | `publish-handoff` | Current packet/stage/source evidence; local joint transition commit |
+| Acceptance/integration command | `run-validation` | Pinned repository/worktree/head and command contract; bounded exit/evidence digest |
+| Worker source change | `write-claimed-source` on its stage | Sergeant dispatch binding plus Platoon path/semantic claims; Platoon never performs the write |
+| Receiving-system action | `receiving-system-operation` | Named source, action, owner and revision; revisioned authority decision receipt |
+
+Each stop has stable ID; one typed predicate; scope; blocked transitions/effects;
+and route. A predicate names one source ID, schema field path, operator from
+`equals`, `not_equals`, `in`, `exists`, or `quality_is`, and a bounded typed
+scalar/list value when required. Scope contains `entry: true` and/or explicit
+stage/effect ID sets. Fields and value types must exist in the source adapter's
+negotiated schema. Missing source, unknown field, type mismatch, stale value,
+or inconclusive/unavailable quality evaluates conservatively as stop active.
+Stops cannot execute code or contain expressions.
+
+Each authority assumption has stable ID, authority source ID, governed effect
+IDs, claim from `source-is-authoritative`, `actor-may-attempt`, or
+`owner-may-disposition`, revision policy `exact` or `current-at-invocation`,
+optional expected revision required by `exact`, and a route. The source must be
+`verified` at compilation and again at invocation. An assumption documents the
+expected boundary; it never grants authorization or substitutes for the
+receiving authority's receipt.
+
+Every required output has stable ID, producing stage, versioned schema, evidence
+role IDs, and the terminal outcome it gates. Class-required categories must be
+covered exactly once; extra outputs are allowed only with a unique ID/schema.
 
 Every unknown SHALL include an ID, exact question, blocking flag, attempted
 source references, and route. Every contradiction SHALL identify two or more
@@ -495,7 +583,9 @@ and explicit missing/incompatible behavior. The initial behaviors are
 `block-consumer` for missing evidence and `reassemble` for incompatibility.
 Contracts are authored in the typed declaration's `spec.handoffs` collection;
 producer and consumer must name existing manifest stage IDs, and the output
-locator must be a source role declared in the packet rather than a child path.
+producer and consumer must be distinct stages. Same-repository handoffs are
+valid; a stage handing to itself is not. The output locator must be a source role
+declared in the packet rather than a child path.
 
 The initial ingress requires no child write to Platoon state. During an applied
 reconciliation, Platoon observes a producer's verified merge-ready evidence,
@@ -736,7 +826,8 @@ after current Dagr start recovery succeeds.
 |---|---|---|---|---:|
 | `initializing` | Verified Dagr run start | Exact workflow/run/stage identities | `active` | no |
 | `initializing` | Dagr outcome uncertain | Current Dagr recovery evidence incomplete | `reconcile_required` | no |
-| `active` | Operator drains admission | Expected generation; does not signal Dagr/Sergeant | `drained` | no |
+| `active` or `reconcile_required` | Operator drains admission | Expected generation; retain exact prior state/blockers; do not signal Dagr/Sergeant | `drained` | no |
+| `drained` | Operator repeats drain | Same run; no state change | `drained` | no |
 | `active` | Drift cannot safely resolve | Affected admission stops; running child is not rewritten | `excluded` | no |
 | any nonterminal allowed to request an external effect | External outcome uncertain | Owning adapter cannot prove accepted/refused/absent | `reconcile_required` with operation and prior state | no |
 | `reconcile_required` | Correlation proves no effect | Exact source-specific absence proof; expected generation and prior state match | prior safe nonterminal state | no |
@@ -745,14 +836,18 @@ after current Dagr start recovery succeeds.
 | `reconcile_required` | Evidence proves unsafe/incompatible result | Exact correlation and current projection identify affected scope | `excluded` | no |
 | `drained` | Operator resumes | Drain continuation and generations match | prior nonterminal state | no |
 | `excluded` | Resurvey permits resume | Required inputs and projection generation match | `active` | no |
-| any nonterminal | Mission acceptance verified | All required Dagr stages have compatible terminal evidence and handoffs | `record_required(completed)` | no |
-| any nonterminal | Mission cannot safely complete | Required Dagr/Sergeant failure evidence and cause are verified | `record_required(failed_safely)` | no |
-| any nonterminal | Owning authority replaces/cancels intent | Superseding authority evidence is verified; children are not rewritten | `record_required(superseded)` | no |
+| `active` or `drained` | Mission acceptance verified | All required Dagr stages have compatible terminal evidence and handoffs | `record_required(completed)` | no |
+| `active`, `drained`, or `excluded` | Mission cannot safely complete | Required Dagr/Sergeant failure evidence and cause are verified | `record_required(failed_safely)` | no |
+| `initializing`, `active`, `drained`, `excluded`, or `reconcile_required` | Owning authority replaces/cancels intent | Superseding authority evidence is verified; children are not rewritten | `record_required(superseded)` | no |
+| `record_required(outcome)` | Same terminal evidence repeats | Outcome and evidence digest exactly match | same `record_required(outcome)` | no |
 | `record_required` | Record validates and publishes | Pending outcome, event head, acceptance/cause/continuation evidence match | matching terminal state | yes |
 
 `record_required` is the only route to `completed`, `failed_safely`, or
 `superseded`. Dagr stage terminality is source evidence, not mission terminality.
 A direct terminal write, terminal resume, or pending-outcome change is invalid.
+Drain stores the exact pre-drain state and blocker set. Guarded resume restores
+`reconcile_required` and its evidence unchanged when that was the prior state;
+drain never clears a reconciliation obligation.
 Recovery from a publication crash remains `record_required` until the exact
 record digest is proven and the atomic terminal pointer is published.
 Every entry to `reconcile_required` stores its source-specific reason,
@@ -816,12 +911,25 @@ policy is superseded. Denied, expired, and revoked records are immutable history
 a later attempt creates a new qualification ID. Only current `qualified`
 evidence can pass an unattended admission transaction.
 
+#### Effect Attempt
+
+An external effect attempt moves from `prepared` to `invoking`, then to
+`committed` or `refused`. Lost/invalid receipt moves `invoking` to
+`reconcile_required`; exact correlated recovery then reaches `committed`,
+`refused`, or `absent`. Only `prepared` is proven pre-invocation. Terminal
+attempt phases are immutable, and a repeated idempotency key must return the
+same request/receipt digests.
+
 ### Failure Windows
 
 | Window | Risk | Required behavior |
 |---|---|---|
 | Declaration read before packet publication | Source changes during compile | Stable read and digest verification; no run publication |
 | Packet files published before run pointer | Orphan immutable files | Ignore as non-authoritative; bounded cleanup may remove after proof |
+| Effect attempt prepared before invoking | Crash before phase change | Proven no invocation; revalidate generations/authorization before one call |
+| Effect attempt marked invoking before adapter call | Crash before or during call | Outcome uncertain; require correlated absence/receipt evidence before retry |
+| Adapter effect succeeds before receipt is durable | Duplicate effect after restart | Keep reconcile required; query idempotency/correlation, never blind retry |
+| Receipt validated before committed transition | Lost local result | Re-query exact receipt and request digest; publish one operation result |
 | Run pointer published before Dagr start receipt | Existing uncertain start | Preserve current Dagr recovery and `reconcile_required` behavior |
 | Sergeant query returns while source changes | Mixed observation | Adapter provides one versioned bounded observation or marks inconclusive |
 | Observation object synced before event/transition | Uninterpreted evidence appears authoritative | Ignore as unreferenced; prior published observation set remains current |
@@ -857,6 +965,12 @@ adapter output only.
 | Compile | Symlink, oversized, changed-during-read declaration | Fail closed with bounded diagnostic |
 | Compile | Unknown schema version or field | Explicit unsupported/invalid result |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
+| Compile | Class-required output category is missing or duplicated | Invalid; completion rules are not inferred |
+| Compile | Effect is unknown, globally forbidden, or outside class ceiling | Invalid declaration |
+| Compile | Stage effect is absent from top-level allowed set | Invalid declaration |
+| Compile | Stop field/operator/type is not in negotiated source schema | Invalid declaration |
+| Compile | Stop source is missing/stale/inconclusive at evaluation | Treat stop as active and block its scope |
+| Compile | Authority assumption source/revision is unverified | Readiness blocked; assumption grants nothing |
 | Compile | Blocking unknown unresolved | Packet preview not ready; apply refuses before effects |
 | Compile | Contradiction has no authority route | Invalid declaration |
 | Apply | Declaration digest differs from preview | No run or adapter invocation |
@@ -868,6 +982,9 @@ adapter output only.
 | Run | Refusal occurs after an external effect | Reconcile required, never reported as refused |
 | Run | Safe failure or supersession writes a terminal state before record | Reject; retain matching `record_required` pending outcome |
 | Run | Record pending outcome differs from transition evidence | Reject record and retain nonterminal state |
+| Drain | Reconcile-required run is drained then resumed | Preserve/restore exact blocker, correlation, and prior reconcile state |
+| Drain | Drain repeats on an already drained run | Idempotent success with unchanged generation semantics |
+| Drain | Stale generation or terminal run is drained | Reject without state or child effect |
 | Query | Project or td scope unresolved/wrong namespace | Explicit unresolved; never idle |
 | Query | Sergeant `busy:null` | Platoon interpretation is indeterminate |
 | Query | Git metadata but no coordinator | `queried:false`; never coordinator response |
@@ -883,13 +1000,18 @@ adapter output only.
 | Projection | Run state names mismatched event/projection commit | Reconcile required; prior verified generation remains displayable |
 | Projection | Mission uses only a proper subset of source kinds | Compile exactly the packet-required authorities; invent no empty references |
 | Projection | Packet-required authority is absent or inconclusive | Block its governed operation; do not substitute an irrelevant source |
-| Handoff | Producer and consumer are same forbidden ownership | Validation fails |
+| Handoff | Producer and consumer name the same stage | Reject self-handoff; same-repository distinct stages remain valid |
 | Handoff | Child or unverified caller attempts to publish an offer | Reject; only applied verified reconciliation is ingress |
 | Handoff | Evidence missing, stale, wrong packet, or wrong stage | Consumer remains blocked |
 | Handoff | Unknown major schema | Incompatible and reassembly required |
 | Handoff | Offer is withdrawn after acceptance | Reject withdrawal; resurvey may exclude and require a new offer |
 | Handoff | Offer withdrawn after consumption | Existing consumption preserved; correction is new offer |
 | Handoff | Same idempotency key has different evidence | Reconcile required; neither offer is accepted |
+| Effect attempt | Crash after prepared and before invoking | Revalidate and invoke at most once; stale authorization refuses |
+| Effect attempt | Crash after invoking and before/after external effect | Reconcile by correlation; never assume absence or retry blindly |
+| Effect attempt | Receipt arrives before committed state publication | Re-query exact receipt and converge one committed/refused result |
+| Effect attempt | Adapter lacks correlation, deduplication, or absence proof | Typed effect is unsupported before invocation |
+| Effect attempt | Reused idempotency key carries different request digest | Fail closed in reconcile required |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
 | Continuation | Missing safe state, action, route, or required input | Invalid nonterminal outcome |
@@ -1080,26 +1202,31 @@ a time.
 1. CLI tests prove `validate`, `plan`, non-applied `start`, and `status` create no
    state or adapter effects.
 2. Schema/runtime shared fixtures prove strict declaration, packet, handoff,
-   event, continuation, and record validation. Golden packet fixtures prove the
-   canonical byte/digest contract across equivalent ordering and meaningful
-   source changes.
+   effect-attempt, event, continuation, and record validation. Golden packet
+   fixtures prove the canonical byte/digest contract across equivalent ordering
+   and meaningful source changes.
 3. A synthetic fake Dagr/Sergeant lifecycle extends the existing end-to-end
    prior art: compile, apply, dispatch, observed waiting/needs-input, handoff,
-   drift, resume, terminal evidence, record.
+   drift, reconcile-required drain/resume, terminal evidence, record.
 4. Fake Sergeant #207 responses cover td epic resolution, wrong namespace,
    `busy:null`, stale coordinator, no correlated response, incompatible version,
    and cross-harness isolation without importing Sergeant source.
 5. Crash tests inject failure at every publication pointer and external request
    window in [Failure Windows](#failure-windows), including each observation,
-   projection, event, commit, and state-pointer boundary in the joint protocol.
-6. Golden JSON tests verify exact observation versus interpretation labels,
+   projection, event, effect-attempt phase, receipt, commit, and state-pointer
+   boundary in the joint protocol.
+6. A table-driven authorization test crosses every operation/effect mapping with
+   absent permission, prohibition, active/unknown stop, stale generation,
+   invalid stage scope, stale authority, and receipt revision mismatch; no
+   failing case may reach its adapter.
+7. Golden JSON tests verify exact observation versus interpretation labels,
    stable ordering, bounds, and privacy rejection.
-7. Property tests verify append-only event chains, generation fencing,
+8. Property tests verify append-only event chains, generation fencing,
    idempotent replay, and no unsafe drift downgrade.
-8. Compatibility tests load current `platoon.state/v1alpha1`, existing
+9. Compatibility tests load current `platoon.state/v1alpha1`, existing
    `platoon.dev/v1alpha1` manifests, callback origin v1, and fleet files.
-9. Race tests cover concurrent status/resurvey/resume and cross-root claims.
-10. The repository's full `make test`, `make race`, `make vet`, and `make demo`
+10. Race tests cover concurrent status/resurvey/resume and cross-root claims.
+11. The repository's full `make test`, `make race`, `make vet`, and `make demo`
     remain release gates for every vertical slice.
 
 Mocks stop at public adapters. Tests do not duplicate internal algorithms or
@@ -1143,7 +1270,9 @@ refuse entry.
 Snapshot typed declaration and packet during applied start. Bind packet digest
 to a new run-state version. Demonstrates crash-safe publication and legacy-run
 operational compatibility. Publish and validate the creation-disabled rollback
-artifact before enabling the first typed state write.
+artifact before enabling the first typed state write. The first typed external
+effect also includes the closed authorization mapping and generalized attempt
+journal; until both are green, typed behavior remains preview-only.
 
 #### Phase 2: Deep Read-Only Status
 
