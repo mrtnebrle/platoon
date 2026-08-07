@@ -75,9 +75,10 @@ The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 proposes activating the currently inert mission reference as a versioned,
 explicitly opted-in immutable declaration. It defines sourced cross-repository
 interpretation, handoffs, drift verdicts, trajectory, Mission Records, and a
-bounded Sergeant status-query seam behind one interface for start, reconcile,
-drain, resume, and status. It preserves Dagr readiness, Sergeant worker
-lifecycle, Git/td authority, explicit apply, and current adapter compatibility.
+bounded whole-observation Sergeant status-query seam behind one interface for
+start, reconcile, drain, resume, and status. It preserves Dagr readiness,
+Sergeant worker lifecycle, Git/td authority, explicit apply, and current adapter
+compatibility.
 It also specifies closed class/output/effect/stop contracts, crash-safe effect
 attempts, command replay policies, complete authority coverage, and a tested
 compatibility artifact that keeps typed runs operable across rollback. This is

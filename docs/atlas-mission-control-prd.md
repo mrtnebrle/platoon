@@ -432,8 +432,17 @@ the attempt; missing, stale, multiple, or conflicting evidence remains
 correlation, durable deduplication or bounded absence proof is unsupported for a
 typed external effect. A `replay-safe` command policy supplies its local
 process/repository proof before rerun; a `single-attempt` command never takes a
-retry transition. Attempt records contain no credentials, environment, or raw
-output.
+retry transition.
+
+V1alpha1 permits exactly two invocation ordinals for a `replay-safe` command and
+one for `single-attempt`. After ordinal one is uncertain and the replay proof
+passes, the same root attempt ID, idempotency key, canonical request digest, and
+authority binding append `retry_prepared(ordinal=2)`, re-run the authorization
+gate, then sync `retry_invoking(ordinal=2)` immediately before the call. The
+ordinal is journal metadata and is excluded from the canonical request digest;
+creating a new root attempt is forbidden. A second uncertain result has no retry
+transition and remains `reconcile_required`. Attempt records contain no
+credentials, environment, or raw output.
 
 #### Mission Declaration
 
@@ -708,13 +717,21 @@ observation IDs rather than embedding their bodies.
 
 The writer next creates and syncs an immutable transition commit naming every
 observation digest, projection digest, event digest, previous event head,
-previous projection revision, and resulting state. It finally atomically
-replaces and directory-syncs the authoritative run state, whose single
-generation names transition commit, observation set, event head, and projection
-revision together. There is no independently writable observation, event-head,
-or projection pointer. Recovery ignores unreferenced objects/commits. A run
-state that references a missing, mismatched, or non-successor object enters
-`reconcile_required` and never skips to a later object.
+previous projection revision, resulting state, previous authoritative transition
+digest, previous run generation, and previous resulting-state digest. Genesis
+uses explicit null predecessor fields. Each commit therefore forms one immutable
+generation chain.
+
+It finally atomically replaces and directory-syncs the authoritative run-state
+pointer. The pointer carries current transition digest/generation and the exact
+previous transition digest/generation; the commit supplies observation set,
+event head, projection revision, and resulting state. There is no independently
+writable observation, event-head, or projection pointer. Recovery ignores
+unreferenced objects/commits and orphan forks. If current transition validation
+fails, recovery may use only the pointer's named previous commit after verifying
+its full chain/state digest, reports `reconcile_required`, and publishes a new
+successor before any effect. It never chooses among orphan descendants or skips
+an intermediate generation.
 
 Meaningful event types include:
 
@@ -977,7 +994,11 @@ An external effect attempt moves from `prepared` to `invoking`, then to
 `reconcile_required`; exact correlated recovery then reaches `committed`,
 `refused`, or `absent`. Only `prepared` is proven pre-invocation. Terminal
 attempt phases are immutable, and a repeated idempotency key must return the
-same request/receipt digests.
+same request/receipt digests. For a replay-safe command only,
+`reconcile_required(ordinal=1)` may move to `retry_prepared(ordinal=2)` after the
+declared proof, then `retry_invoking(ordinal=2)`, and finally `committed`,
+`refused`, or terminal `reconcile_required`. The root attempt ID/request digest
+never changes and no ordinal greater than two is valid.
 
 ### Failure Windows
 
@@ -987,6 +1008,8 @@ same request/receipt digests.
 | Packet files published before run pointer | Orphan immutable files | Ignore as non-authoritative; bounded cleanup may remove after proof |
 | Effect attempt prepared before invoking | Crash before phase change | Proven no invocation; revalidate generations/authorization before one call |
 | Effect attempt marked invoking before adapter call | Crash before or during call | Outcome uncertain; require correlated absence/receipt evidence before retry |
+| Replay proof published before retry invocation | Crash before ordinal-two call | `retry_prepared` proves no second call; revalidate gate, then invoke ordinal two once |
+| Replay-safe ordinal-two invocation is uncertain | Accidental third call | Remain reconcile required; journal rejects ordinal greater than two/new root attempt |
 | Adapter effect succeeds before receipt is durable | Duplicate effect after restart | Keep reconcile required; query idempotency/correlation, never blind retry |
 | Receipt validated before committed transition | Lost local result | Re-query exact receipt and request digest; publish one operation result |
 | Run pointer published before Dagr start receipt | Existing uncertain start | Preserve current Dagr recovery and `reconcile_required` behavior |
@@ -997,6 +1020,8 @@ same request/receipt digests.
 | Observation/event/projection objects synced before transition commit | Orphan objects | Ignore as unreferenced; prior run state remains authoritative |
 | Transition commit synced before run-state replacement | Orphan commit | Ignore as unreferenced; retry may reuse only exact digests |
 | Run state names observation/event/projection not jointly bound by commit | Split-brain pointers | Invalid generation enters reconcile required; never expose any as current |
+| Current pointer commit is invalid after replacement | Lost authoritative predecessor | Verify only pointer-named previous commit/chain, expose reconcile required, publish successor before effects |
+| Multiple orphan commits share one predecessor | Ambiguous recovery fork | Ignore all unreferenced forks; pointer alone selects current/previous authority |
 | Handoff offer published before evidence | Consumer sees incomplete output | Offer is non-acceptable until all references validate |
 | Handoff accepted while source drifts | Consumer begins stale work | Compare revisions at admission; exclude on mismatch |
 | Required input arrives during resume | Wrong decision consumed | Compare source revision and continuation generation immediately before effect |
@@ -1065,6 +1090,8 @@ adapter output only.
 | Projection | Crash before pointer update | Ignore orphan revision |
 | Projection | Revalidation changes purpose, authority, effect, or completion | Reject amendment and require successor packet |
 | Projection | Run state names mismatched event/projection commit | Reconcile required; prior verified generation remains displayable |
+| Projection | Current commit is invalid but pointer-named predecessor verifies | Use only predecessor in reconcile-required mode; no effect until successor publishes |
+| Projection | Two orphan successor commits share a predecessor | Ignore both unless authoritative pointer names one; never choose by timestamp |
 | Projection | Mission uses only a proper subset of source kinds | Compile exactly the packet-required authorities; invent no empty references |
 | Projection | Packet-required authority is absent or inconclusive | Block its governed operation; do not substitute an irrelevant source |
 | Handoff | Producer and consumer name the same stage | Reject self-handoff; same-repository distinct stages remain valid |
@@ -1082,7 +1109,8 @@ adapter output only.
 | Effect attempt | Receipt arrives before committed state publication | Re-query exact receipt and converge one committed/refused result |
 | Effect attempt | Adapter lacks correlation, deduplication, or absence proof | Typed effect is unsupported before invocation |
 | Effect attempt | Reused idempotency key carries different request digest | Fail closed in reconcile required |
-| Command attempt | Replay-safe command loses receipt | Retry only after process absence and pinned repository/diff re-observation |
+| Command attempt | Replay-safe command loses receipt | Same root attempt may publish ordinal two only after proof and renewed authorization |
+| Command attempt | Replay-safe ordinal two is uncertain or ordinal three is requested | No further invocation; remain reconcile required |
 | Command attempt | Single-attempt command loses receipt | Never retry automatically; remain reconcile required for explicit disposition |
 | Trajectory | Duplicate sequence or broken previous digest | Reject tail and report reconcile required |
 | Trajectory | Raw child output, prompt, token, or private path | Redaction is not enough; event rejected |
@@ -1137,6 +1165,8 @@ adapter output only.
 | Rollback | Compatibility artifact attempts to create its disabled state version | Explicit refusal before publication; existing typed runs remain operable |
 | Privacy | Source contains secret or absolute private path | Output omits it and records bounded rejection |
 | Bounds | More sources/events/findings than limits | Deterministic truncation metadata or fail closed where completeness is required |
+| Bounds | Whole exact observations exceed aggregate status cap | Return deterministic whole-object page/count/cursor; omitted means unknown |
+| Bounds | Cursor is stale, malformed, or belongs to another run/generation | Reject cursor; do not return a mismatched page |
 
 ### Compatibility, Migration, And Rollback
 
@@ -1263,6 +1293,17 @@ Initial hard bounds, configurable only within published safe ranges:
 - adapter calls: current command timeout and output limits unless a lower
   operation-specific bound applies.
 
+Status orders observation objects by source label, stable source ID, observation
+time, then digest. It emits only whole schema-validated objects that fit after
+the fixed report sections; it never truncates fields inside an observation. If
+the next whole object would exceed 2 MiB, status sets
+`observationsTruncated:true`, reports total/returned counts, and returns a
+versioned opaque cursor for the next ordering key. Callers may page or select
+source IDs, subject to the same aggregate cap. A cursor contains no locator or
+private value. Omitted observations remain unknown/not-returned, never absent,
+and interpretations cite observation IDs even when their full object is on a
+later page.
+
 Completeness-sensitive operations, compilation, handoff acceptance, drift
 verdict, resume, and record derivation, fail closed rather than truncate inputs.
 Read-only status may truncate display lists only when totals, ordering, cursor,
@@ -1342,11 +1383,14 @@ refuse entry.
 #### Phase 1: Immutable Packet
 
 Snapshot typed declaration and packet during applied start. Bind packet digest
-to a new run-state version. Demonstrates crash-safe publication and legacy-run
-operational compatibility. Publish and validate the creation-disabled rollback
-artifact before enabling the first typed state write. The first typed external
-effect also includes the closed authorization mapping and generalized attempt
-journal; until both are green, typed behavior remains preview-only.
+to a new run-state version and publish projection revision zero, genesis event,
+immutable observations required by start/effect receipts, immutable transition
+chain/two-generation pointer, and generalized attempt journal. Demonstrates
+crash-safe publication and legacy-run operational compatibility. Publish and
+validate the creation-disabled rollback artifact before enabling the first typed
+state write. The first typed external effect also includes the closed
+authorization mapping. Until all of these minimum contracts are green, typed
+behavior remains preview-only.
 
 #### Phase 2: Deep Read-Only Status
 
@@ -1358,10 +1402,12 @@ interpretation. Demonstrates bounded privacy-safe projection without #207.
 Add the one versioned adapter after #207 ships. Demonstrates project/td scope,
 inconclusive activity, and coordinator-aware evidence without local traversal.
 
-#### Phase 4: Projection And Trajectory
+#### Phase 4: Projection Expansion And Trajectory Enrichment
 
-Publish revisioned source references and append-only meaningful events.
-Demonstrates context expansion and crash recovery without packet mutation.
+Add post-start source expansion, additional observation adapters, and the full
+meaningful-event vocabulary on the Phase 1 projection/event substrate.
+Demonstrates context expansion and richer resurvey evidence without packet
+mutation.
 
 #### Phase 5: Handoffs And Drift
 
