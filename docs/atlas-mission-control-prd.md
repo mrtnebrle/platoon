@@ -476,9 +476,9 @@ available to every class, but only when explicitly allowed, are
 `route-finding`, and `run-validation`. The complete additional v1alpha1 effect
 registry is `write-claimed-source`, `receiving-system-operation`, and
 `request-sergeant-lifecycle`. Unknown effects fail validation. Merge, push,
-identity switch, credential creation, production activation outside a named
-receiving-system operation, child-state write, and direct session injection are
-globally forbidden and cannot appear in `allowed`.
+identity switch, credential creation, production activation, child-state write,
+and direct session injection are globally forbidden and cannot appear in
+`allowed`. A `receiving-system-operation` is therefore non-production only.
 
 `effects.allowed` and `effects.prohibited` are unique effect-ID sets and must be
 disjoint. `effects.stages` maps every manifest stage ID to a subset of top-level
@@ -826,7 +826,7 @@ queries. It emits exactly one verdict per affected scope:
 | `revalidate_projection` | Referenced evidence changed without changing purpose, authority, effects, or completion | Publish projection revision after validation |
 | `reassemble` | Context, handoff semantics, authority, effects, or completion materially changed | Exclude affected work and compile a successor packet/run |
 | `exclude` | Safe decision cannot yet be made or required replacement evidence is unavailable | Hold affected admission; preserve children and unrelated work |
-| `supersede` | Intent or mission is replaced, canceled, or no longer authoritative | Terminally supersede run; never resume it |
+| `supersede` | Intent or mission is replaced, canceled, or no longer authoritative | Enter `record_required(superseded)`; terminalize only after Mission Record publication |
 
 "Amend projection" is the application of `revalidate_projection`; packet bytes
 remain unchanged. A run needing reassembly does not mutate into the successor.
@@ -1128,7 +1128,7 @@ adapter output only.
 | Reconcile | Evidence is missing, stale, wrong-correlation, or ambiguous | Stay reconcile required; no adapter effect |
 | Reconcile | Recovery evidence races a newer generation | Compare fails; newer state remains authoritative |
 | Resurvey | Source unavailable or contradictory | `exclude`, never `continue` |
-| Resurvey | Intent/effect/completion changed | `reassemble` or `supersede`, never projection-only amendment |
+| Resurvey | Intent/effect/completion changed | `reassemble` or enter `record_required(superseded)`, never projection-only amendment |
 | Resurvey | Compatible revision with failed evidence validation | `exclude`; prior projection remains current |
 | Finding | No unambiguous owning route | No broadcast; continuation records authority gap |
 | Finding | Lost receipt after external creation | Correlation reconciliation; no blind duplicate |
@@ -1146,6 +1146,7 @@ adapter output only.
 | Unattended | Expired/denied qualification ID is replayed | No effect; a new evaluation ID is required |
 | Scheduler | Replayed or premature hint | Compare fails; no effect |
 | External request | Effect is absent from allowed list or appears in prohibited list | Pre-request gate refuses without adapter invocation |
+| External request | Receiving operation requests production activation | Invalid/global prohibition; never invoke adapter |
 | External request | Applicable stop, block, contradiction, exclusion, or drift is active | Pre-request gate refuses without adapter invocation |
 | External request | Continuation, packet, projection, or run generation is stale | Fenced compare refuses without adapter invocation |
 | External request | Receiving authority/revision is missing or stale | Pre-request gate refuses without adapter invocation |
@@ -1167,6 +1168,7 @@ adapter output only.
 | Bounds | More sources/events/findings than limits | Deterministic truncation metadata or fail closed where completeness is required |
 | Bounds | Whole exact observations exceed aggregate status cap | Return deterministic whole-object page/count/cursor; omitted means unknown |
 | Bounds | Cursor is stale, malformed, or belongs to another run/generation | Reject cursor; do not return a mismatched page |
+| Bounds | Ephemeral observation source changes between status pages | Observation-set digest mismatch returns stale cursor and no mixed page |
 
 ### Compatibility, Migration, And Rollback
 
@@ -1298,11 +1300,18 @@ time, then digest. It emits only whole schema-validated objects that fit after
 the fixed report sections; it never truncates fields inside an observation. If
 the next whole object would exceed 2 MiB, status sets
 `observationsTruncated:true`, reports total/returned counts, and returns a
-versioned opaque cursor for the next ordering key. Callers may page or select
-source IDs, subject to the same aggregate cap. A cursor contains no locator or
-private value. Omitted observations remain unknown/not-returned, never absent,
-and interpretations cite observation IDs even when their full object is on a
-later page.
+versioned opaque cursor. Before paging, status computes an observation-set
+digest over canonical query scope (run, source selectors, refresh policy), total
+count, and the complete ordered sequence of observation IDs/digests. Durable
+sets use their transition-commit digest; ephemeral refreshes use this aggregate
+digest. The cursor binds run/generation, query-scope digest,
+observation-set/transition digest, and next ordering key. A later page rechecks
+the complete set digest; source drift returns `stale_cursor` with no observation
+objects, requiring restart from page one. Callers may page or select source IDs,
+subject to the same aggregate cap. A cursor contains no locator or private
+value. Omitted observations remain unknown/not-returned, never absent, and
+interpretations cite observation IDs even when their full object is on a later
+page.
 
 Completeness-sensitive operations, compilation, handoff acceptance, drift
 verdict, resume, and record derivation, fail closed rather than truncate inputs.
