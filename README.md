@@ -71,6 +71,14 @@ review mode, an agent harness, model/risk classes, dependencies, path claims,
 semantic claims, and acceptance commands. `adoptFleet` explicitly binds a
 pre-existing fleet to a stage.
 
+The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
+proposes activating the currently inert mission reference as a versioned,
+immutable declaration. It defines sourced cross-repository interpretation,
+handoffs, drift verdicts, trajectory, Mission Records, and a bounded Sergeant
+status-query seam while preserving Dagr readiness, Sergeant worker lifecycle,
+Git/td authority, explicit apply, and current adapter compatibility. This is a
+design proposal; none of that proposed behavior is implemented yet.
+
 Implementation and review pools default to six and two tokens. A repository
 defaults to one writer. Raising `maxWriters` allows same-repository concurrency
 only when every active path and semantic write claim is disjoint. Repository
