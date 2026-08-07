@@ -470,7 +470,7 @@ Source kinds are closed and provenance labels are derived, never authored:
 |---|---|---|---|
 | `git` | `git` | Bounded Git adapter / pinned object contract | Full object ID and repository identity |
 | `td` | `td` | `SergeantMissionSource` td scope from #207 | Source revision when supplied, observation time, and evidence digest |
-| `dagr` | `dagr` | Configured Dagr adapter/snapshot schema | Workflow/run/stage identities, adapter version, observation time/digest |
+| `dagr` | `dagr` | Pre-start `dagr.capability/v1` and post-effect `dagr.run-observation/v1` | Before effects: adapter/database/schema/operation capability; after effects: workflow/run/stage identities and observation digest |
 | `sergeant` | `sergeant` | Version-negotiated Sergeant query/file schema | Schema version, scope/correlation, observation time/digest |
 | `receiving-system` | `receiving_system` | Registered typed authority adapter plus `platoon.receiving-capability/v1alpha1` | Capability/authority/action revision, environment class, observation time, decision digest |
 | `environment-classifier` | `receiving_system` | Independently configured target-classification trust root / `platoon.target-proof/v1alpha1` | Issuer/trust-root revision, signature, target/endpoint/environment proof digest and expiry |
@@ -483,6 +483,16 @@ versions, locator/kind mismatches, or missing required revision evidence fail
 closed. A `td` source is always resolved through the Sergeant adapter; it never
 authorizes direct td traversal in Platoon. Negotiated source schemas define the
 only field paths a stop may inspect.
+
+Dagr evidence is phase-specific. Survey/compile/apply entry can require only the
+pre-start capability: configured executable/adapter version, database physical
+identity and schema version, supported load/list/start/watch/ack operations, and
+bounded query policy. Future workflow, run, and stage IDs are invalid in a
+pre-start source observation. Apply revalidates capability/database identity,
+then the authorized load/list/start effect receipts and post-queries publish the
+generated workflow digest/identity, full run ID, and full stage IDs into the
+projection/trajectory. Those post-effect identities do not alter the immutable
+packet.
 
 ##### Source Survey Bundle
 
@@ -585,8 +595,8 @@ transport changed after invocation.
 
 | Adapter operation | Required effect | Authority evidence and accepted receipt |
 |---|---|---|
-| Dagr workflow load | `dagr-load-workflow` | Configured Dagr source/version; exact workflow receipt and post-query |
-| Dagr run start | `dagr-start-run` | Configured Dagr source/version; one full run identity and post-query |
+| Dagr workflow load/list | `dagr-load-workflow` | Revalidated pre-start capability/database plus generated workflow digest; exact workflow/stage receipt and post-query |
+| Dagr run start | `dagr-start-run` | Revalidated capability and bound post-load workflow/stages; one full run identity and post-query |
 | Dagr step done/fail | `dagr-ack-stage` | Bound Dagr run/stage and expected state; post-query confirms transition |
 | Sergeant dispatch | `sergeant-dispatch` plus stage work effects | Registered project/adapter version and stage/task binding; correlated fleet receipt/evidence |
 | Sergeant coordinator request | `sergeant-coordinator-request` | Verified current coordinator owner/revision; correlated accepted/refused/unknown receipt |
@@ -933,6 +943,9 @@ log. Required fields are:
 - cause classification when harmful or safely failed;
 - continuation for `failed_safely` and successor/cancellation authority
   reference when superseded;
+- one disposition per known Sergeant child: exact terminal status/evidence,
+  result digest or failure cause, reservation/claim release, and retained
+  candidate/product reference when applicable;
 - finding references and their externally owned disposition state;
 - start, last meaningful event, and record publication times.
 
@@ -947,6 +960,16 @@ published. Completion evidence, safe failure, or an authorized supersession
 first enters `record_required` with one pending terminal outcome. Record
 publication failure leaves that nonterminal state unchanged; it does not change
 exact child, Sergeant, or Dagr state.
+
+Record publication additionally requires every known Sergeant child to have
+verified terminal evidence, every Platoon reservation/token/global claim to be
+released, no candidate to be `integrating`, and no effect attempt to be
+nonterminal. Sergeant cleanup is not required and remains Sergeant-owned. A
+`record_required` run with an active/waiting/blocked/orphaned child remains
+nonterminal: new admission is disabled, but guarded `Reconcile`, read-only
+status, and an explicitly authorized Sergeant lifecycle request remain
+available. Its continuation names the outstanding children and route. This
+applies to superseded runs even though Platoon never rewrites or kills a child.
 
 #### Drift And Resurvey Verdicts
 
@@ -1044,7 +1067,8 @@ after current Dagr start recovery succeeds.
 | `active`, `drained`, or `excluded` | Mission cannot safely complete | Required Dagr/Sergeant failure evidence and cause are verified | `record_required(failed_safely)` | no |
 | `initializing`, `active`, `drained`, `excluded`, or `reconcile_required` | Owning authority replaces/cancels intent | Superseding authority evidence is verified; children are not rewritten | `record_required(superseded)` | no |
 | `record_required(outcome)` | Same terminal evidence repeats | Outcome and evidence digest exactly match | same `record_required(outcome)` | no |
-| `record_required` | Record validates and publishes | Pending outcome, event head, acceptance/cause/continuation evidence match | matching terminal state | yes |
+| `record_required` | Reconcile known child/effect | Exact source evidence; no new admission | same state until all dispositions terminal/released | no |
+| `record_required` | Record validates and publishes | Pending outcome/event head match; all children terminal, attempts/candidates settled, reservations/claims released | matching terminal state | yes |
 
 `record_required` is the only route to `completed`, `failed_safely`, or
 `superseded`. Dagr stage terminality is source evidence, not mission terminality.
@@ -1148,6 +1172,7 @@ never changes and no ordinal greater than two is valid.
 | Receipt validated before committed transition | Lost local result | Re-query exact receipt and request digest; publish one operation result |
 | Run pointer published before Dagr start receipt | Existing uncertain start | Preserve current Dagr recovery and `reconcile_required` behavior |
 | Dagr load/start returns authoritative final refusal | Initializing run cannot progress | Enter record-required failed-safely with cause/continuation; no retry/live run |
+| Pre-start Dagr source expects future run/stage identity | Circular readiness | Reject source observation; require capability/database evidence only |
 | Sergeant query returns while source changes | Mixed observation | Adapter provides one versioned bounded observation or marks inconclusive |
 | Observation object synced before event/transition | Uninterpreted evidence appears authoritative | Ignore as unreferenced; prior published observation set remains current |
 | Projection file written before revision pointer | Partial amendment | Ignore unreferenced file; retain prior revision |
@@ -1186,6 +1211,7 @@ adapter output only.
 | Compile | Source kind/label/schema/revision contract is unknown or mismatched | Invalid declaration; no adapter fallback or invented label |
 | Compile | td source cannot resolve through Sergeant adapter | Required source unavailable/inconclusive; never traverse td locally |
 | Survey | Read/query effect, caller, source, or stop is not allowed | Refuse before source adapter query; no bundle/state |
+| Survey | Pre-start Dagr evidence requires/claims future run or stage IDs | Reject schema; use capability/database identity only |
 | Compile | Required mutable source bundle is absent, stale, mismatched, or inconclusive | Deterministic not-ready result with explicit unknown |
 | Apply | Revalidated source/capability differs from compiled bundle | Return replan-required before packet/effect; create no run files |
 | Apply | Requery is later but schema/revision/quality/content digest match | Freshness passes and apply may publish; observedAt difference is provenance only |
@@ -1216,6 +1242,7 @@ adapter output only.
 | Run | Safe failure or supersession writes a terminal state before record | Reject; retain matching `record_required` pending outcome |
 | Run | Record pending outcome differs from transition evidence | Reject record and retain nonterminal state |
 | Run | Initializing Dagr operation returns exact non-retryable final refusal | Enter record-required failed-safely with Dagr cause evidence |
+| Run | Dagr load/list/start receipt or post-query identities disagree | Reconcile required; never bind ambiguous workflow/run/stages |
 | Drain | Reconcile-required run is drained then resumed | Preserve/restore exact blocker, correlation, and prior reconcile state |
 | Drain | Correlation resolves while reconcile-required run is drained | Update retained prior state but keep admission drained |
 | Drain | Drained reconciliation resolves to terminal pending outcome | Enter matching record-required state; never reopen admission |
@@ -1289,6 +1316,9 @@ adapter output only.
 | Record | Product or world delta omitted | Invalid record even if empty would be valid |
 | Record | Safe failure lacks cause/continuation | Invalid record |
 | Record | Event head changes during derivation | Retry from new head; do not publish stale record |
+| Record | Any known child/attempt/integration/claim remains nonterminal | Keep record-required and reconcile; do not publish terminal record |
+| Record | Superseded run has active/waiting/blocked/orphaned child | Disable admission, preserve child, publish continuation, keep reconciling |
+| Record | Last child terminates and all reservations/claims release | Derive child dispositions; record may terminalize without Sergeant cleanup |
 | Unattended | Requested without prior evidence | Qualification refused |
 | Unattended | Blocking unknown, mutable authority, or unbounded input | Qualification refused |
 | Unattended | Qualified evidence revision changes | Qualification expires before invocation |

@@ -82,9 +82,9 @@ current adapter compatibility.
 It also specifies closed source/class/output/non-production-effect/stop
 contracts, content-stable source surveys, target-bound environment proofs,
 crash-safe effect attempts, deny-by-default sandboxed validation/replay policies,
-complete authority coverage, and a tested compatibility artifact that keeps
-typed runs operable across rollback. This is a design proposal; none of that
-proposed behavior is implemented yet.
+complete authority coverage, terminal child convergence, and a tested
+compatibility artifact that keeps typed runs operable across rollback. This is a
+design proposal; none of that proposed behavior is implemented yet.
 
 Implementation and review pools default to six and two tokens. A repository
 defaults to one writer. Raising `maxWriters` allows same-repository concurrency
