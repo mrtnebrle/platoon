@@ -454,6 +454,25 @@ unattended request, and a source catalog. Source entries require stable ID,
 closed source kind, opaque public-safe locator, revision or observation policy,
 mission role, and reason.
 
+Source kinds are closed and provenance labels are derived, never authored:
+
+| Source kind | Source label | Owning adapter/schema | Required revision evidence |
+|---|---|---|---|
+| `git` | `git` | Bounded Git adapter / pinned object contract | Full object ID and repository identity |
+| `td` | `td` | `SergeantMissionSource` td scope from #207 | Source revision when supplied, observation time, and evidence digest |
+| `dagr` | `dagr` | Configured Dagr adapter/snapshot schema | Workflow/run/stage identities, adapter version, observation time/digest |
+| `sergeant` | `sergeant` | Version-negotiated Sergeant query/file schema | Schema version, scope/correlation, observation time/digest |
+| `receiving-system` | `receiving_system` | Registered typed authority adapter | Authority/action revision, observation time, decision digest |
+| `validation-capability` | `platoon` | Operator-owned `platoon.validation-capability/v1alpha1` profile | Profile, executable, sandbox self-test, and policy digests |
+| `platoon-policy` | `platoon` | Snapshotted Platoon policy schema | Exact policy version and content digest |
+
+`declaration` and `intent` provenance labels come from the mandatory run-owned
+snapshots and are not source-catalog kinds. Unknown kinds, unsupported schema
+versions, locator/kind mismatches, or missing required revision evidence fail
+closed. A `td` source is always resolved through the Sergeant adapter; it never
+authorizes direct td traversal in Platoon. Negotiated source schemas define the
+only field paths a stop may inspect.
+
 Required mission classes and completion rules are closed in v1alpha1. Effect
 ceilings list what a class may explicitly request; they grant nothing by
 default. Every typed declaration still names its exact allowed subset.
@@ -1085,6 +1104,8 @@ adapter output only.
 | Compile | Typed-looking content without explicit `missionFormat` | Remain reference mode; content sniffing is forbidden |
 | Compile | Symlink, oversized, changed-during-read declaration | Fail closed with bounded diagnostic |
 | Compile | Unknown schema version or field | Explicit unsupported/invalid result |
+| Compile | Source kind/label/schema/revision contract is unknown or mismatched | Invalid declaration; no adapter fallback or invented label |
+| Compile | td source cannot resolve through Sergeant adapter | Required source unavailable/inconclusive; never traverse td locally |
 | Compile | Missing objective/effect boundary/output | Invalid, never inferred |
 | Compile | Class-required output category is missing or duplicated | Invalid; completion rules are not inferred |
 | Compile | Output category is unknown or extra output reuses required category | Invalid declaration |
