@@ -1,8 +1,8 @@
 # Atlas-Inspired Mission Control PRD
 
-Status: proposed  
-PRD version: 1.0  
-Source fixed point: Platoon `1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4`  
+Status: proposed
+PRD version: 1.0
+Source fixed point: Platoon `1b39c499ef25eaa2e3d256f2d4abae9d65cf40b4`
 Last source survey: 2026-08-07
 
 ## Summary
