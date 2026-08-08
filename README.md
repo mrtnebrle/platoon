@@ -85,6 +85,13 @@ diagnostics contain only bounded mode/schema/reason identifiers, never mission
 bodies or resolved private paths. Typed applied start is intentionally disabled
 until immutable packet state is implemented in a later phase.
 
+Ready declarations explicitly allow the required Dagr, Sergeant, and validation
+effects within their class ceiling and provide exact actor/source authority
+coverage. Entry stops, mutable sources without an observation bundle, missing
+orchestration effects, and unattended requests are not ready. Source kinds bind
+to closed source schemas; stop fields and disposition owners must resolve
+without ambiguity.
+
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 defines the later sourced cross-repository
 interpretation, handoffs, drift verdicts, trajectory, Mission Records, and a

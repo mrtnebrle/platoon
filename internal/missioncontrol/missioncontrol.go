@@ -148,6 +148,7 @@ type unattended struct {
 type source struct {
 	ID                string `yaml:"id"`
 	Kind              string `yaml:"kind"`
+	Schema            string `yaml:"schema"`
 	Locator           string `yaml:"locator"`
 	Revision          string `yaml:"revision,omitempty"`
 	ObservationPolicy string `yaml:"observationPolicy,omitempty"`
@@ -168,14 +169,14 @@ func Compile(m *manifest.Manifest, manifestFile string) (Preview, error) {
 	declarationPath := filepath.Join(filepath.Dir(manifestFile), filepath.FromSlash(m.Spec.Mission))
 	raw, err := readStable(declarationPath)
 	if err != nil {
-		return Preview{}, err
+		return Preview{}, compileFailure(classifyReadError(err))
 	}
 	d, err := decode(raw)
 	if err != nil {
-		return Preview{}, err
+		return Preview{}, compileFailure(classifyDecodeError(err))
 	}
 	if err := validate(d, m); err != nil {
-		return Preview{}, err
+		return Preview{}, compileFailure(classifyValidationError(err))
 	}
 
 	preview.Schema = d.APIVersion
@@ -192,6 +193,22 @@ func Compile(m *manifest.Manifest, manifestFile string) (Preview, error) {
 	}
 	for _, contradiction := range d.Spec.Contradictions {
 		blocking = append(blocking, "unresolved contradiction "+contradiction.ID)
+	}
+	for _, stop := range d.Spec.Stops {
+		if stop.Scope.Entry {
+			blocking = append(blocking, "entry stop "+stop.ID+" cannot be disproved without source evidence")
+		}
+	}
+	for _, source := range d.Spec.Sources {
+		if source.ObservationPolicy != "" {
+			blocking = append(blocking, "source "+source.ID+" requires an observation bundle")
+		}
+	}
+	allowedEffects := stringSet(d.Spec.Effects.Allowed)
+	for _, effect := range requiredEntryEffects {
+		if !allowedEffects[effect] {
+			blocking = append(blocking, "required effect "+effect+" is not allowed")
+		}
 	}
 	if d.Spec.Unattended.Requested {
 		blocking = append(blocking, "unattended qualification is unavailable in declaration preview mode")
@@ -213,6 +230,21 @@ func readStable(file string) ([]byte, error) {
 }
 
 func readStableWithHook(file string, afterRead func()) ([]byte, error) {
+	first, err := readBounded(file)
+	if err != nil {
+		return nil, err
+	}
+	if afterRead != nil {
+		afterRead()
+	}
+	second, err := readBounded(file)
+	if err != nil || !bytes.Equal(first, second) {
+		return nil, errors.New("mission declaration changed while reading")
+	}
+	return first, nil
+}
+
+func readBounded(file string) ([]byte, error) {
 	before, err := os.Lstat(file)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -239,14 +271,67 @@ func readStableWithHook(file string, afterRead func()) ([]byte, error) {
 	if err != nil || len(raw) > maxDeclarationSize {
 		return nil, errors.New("mission declaration could not be read within its size limit")
 	}
-	if afterRead != nil {
-		afterRead()
-	}
 	after, err := os.Lstat(file)
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		return nil, errors.New("mission declaration changed while reading")
 	}
 	return bytes.Clone(raw), nil
+}
+
+func compileFailure(reason string) error {
+	return fmt.Errorf("mission compile: mode=%s schema=%s reason=%s", manifest.MissionDeclarationV1Alpha1, declarationAPIVersion, reason)
+}
+
+func classifyReadError(err error) string {
+	switch {
+	case strings.Contains(err.Error(), "missing"):
+		return "missing"
+	case strings.Contains(err.Error(), "regular file"):
+		return "not-regular"
+	case strings.Contains(err.Error(), "exceeds") || strings.Contains(err.Error(), "size limit"):
+		return "oversized"
+	case strings.Contains(err.Error(), "changed"):
+		return "changed"
+	default:
+		return "read-failed"
+	}
+}
+
+func classifyDecodeError(err error) string {
+	if strings.Contains(err.Error(), "field ") && strings.Contains(err.Error(), "not found") {
+		return "unknown-field"
+	}
+	return "invalid-schema"
+}
+
+func classifyValidationError(err error) string {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "mission apiVersion") || strings.Contains(message, "mission kind must"):
+		return "unknown-schema"
+	case strings.Contains(message, "unknown effect"):
+		return "unknown-effect"
+	case strings.Contains(message, "unknown category"):
+		return "unknown-output"
+	case strings.Contains(message, "class ceiling"):
+		return "effect-class-ceiling"
+	case strings.Contains(message, "stop stage"):
+		return "unknown-stop-stage"
+	case strings.Contains(message, "stop"):
+		return "malformed-stop"
+	case strings.Contains(message, "authority"):
+		return "malformed-authority"
+	case strings.Contains(message, "contradiction"):
+		return "unrouted-contradiction"
+	case strings.Contains(message, "source"):
+		return "invalid-source"
+	case strings.Contains(message, "output"):
+		return "invalid-output"
+	case strings.Contains(message, "handoff"):
+		return "invalid-handoff"
+	default:
+		return "invalid-declaration"
+	}
 }
 
 func decode(raw []byte) (*declaration, error) {
@@ -340,10 +425,10 @@ func validate(d *declaration, m *manifest.Manifest) error {
 	if err != nil {
 		return err
 	}
-	if err := validateEffects(d.Spec.Effects, m); err != nil {
+	if err := validateEffects(d.Spec.Effects, d.Spec.Class, m); err != nil {
 		return err
 	}
-	if err := validateStops(d.Spec.Stops, sourceIDs, d.Spec.Effects); err != nil {
+	if err := validateStops(d.Spec.Stops, sourceIDs, sourceKindByID(d.Spec.Sources), d.Spec.Effects, m); err != nil {
 		return err
 	}
 	if err := validateAuthority(d.Spec.AuthorityAssumptions, sourceIDs, d.Spec.Effects, m); err != nil {
@@ -353,6 +438,9 @@ func validate(d *declaration, m *manifest.Manifest) error {
 		return err
 	}
 	if err := validateContradictions(d.Spec.Contradictions, sourceIDs); err != nil {
+		return err
+	}
+	if err := validateDispositionOwners(d.Spec.Stops, d.Spec.Unknowns, d.Spec.Contradictions, d.Spec.AuthorityAssumptions); err != nil {
 		return err
 	}
 	seenIDs := map[string]bool{}
@@ -401,6 +489,9 @@ func validateSources(sources []source) (map[string]bool, map[string]bool, error)
 		if _, ok := sourceKinds[source.Kind]; !ok {
 			return nil, nil, fmt.Errorf("mission source %q has unknown kind", source.ID)
 		}
+		if source.Schema != sourceSchemas[source.Kind] {
+			return nil, nil, errors.New("mission source schema does not match its kind")
+		}
 		if !safeOpaque(source.Locator) || !validSlug(source.Role) || roles[source.Role] || strings.TrimSpace(source.Reason) == "" || len(source.Reason) > 512 || hasControl(source.Reason) {
 			return nil, nil, fmt.Errorf("mission source %q has an invalid locator, role, or reason", source.ID)
 		}
@@ -414,7 +505,7 @@ func validateSources(sources []source) (map[string]bool, map[string]bool, error)
 	return ids, roles, nil
 }
 
-func validateEffects(value *effects, m *manifest.Manifest) error {
+func validateEffects(value *effects, class string, m *manifest.Manifest) error {
 	allowed, err := closedSet("allowed", value.Allowed, effectRegistry)
 	if err != nil {
 		return err
@@ -429,6 +520,9 @@ func validateEffects(value *effects, m *manifest.Manifest) error {
 		}
 		if globallyForbiddenEffects[effect] {
 			return fmt.Errorf("mission effect %q is globally forbidden", effect)
+		}
+		if !commonEffects[effect] && !classEffectCeilings[class][effect] {
+			return errors.New("mission effect exceeds class ceiling")
 		}
 	}
 	for _, stage := range m.Spec.Stages {
@@ -468,7 +562,7 @@ func validateEffects(value *effects, m *manifest.Manifest) error {
 	return nil
 }
 
-func validateStops(stops []stop, sources map[string]bool, effects *effects) error {
+func validateStops(stops []stop, sources map[string]bool, sourceKindsByID map[string]string, effects *effects, m *manifest.Manifest) error {
 	seen := map[string]bool{}
 	allowed := stringSet(effects.Allowed)
 	for _, stop := range stops {
@@ -478,11 +572,26 @@ func validateStops(stops []stop, sources map[string]bool, effects *effects) erro
 			return errors.New("mission stop is malformed")
 		}
 		seen[stop.ID] = true
+		if !stopFields[sourceKindsByID[stop.Predicate.Source]][stop.Predicate.Field] {
+			return errors.New("mission stop field is not in the source schema")
+		}
 		if stop.Predicate.Operator == "exists" && stop.Predicate.Value != nil {
 			return fmt.Errorf("mission stop %q exists predicate must omit value", stop.ID)
 		}
 		if stop.Predicate.Operator != "exists" && stop.Predicate.Value == nil {
 			return fmt.Errorf("mission stop %q predicate requires value", stop.ID)
+		}
+		if stop.Predicate.Operator == "quality_is" {
+			value, ok := stop.Predicate.Value.(string)
+			if !ok || (value != "verified" && value != "inconclusive" && value != "unavailable") {
+				return errors.New("mission stop quality predicate has an invalid value")
+			}
+		}
+		if stop.Predicate.Operator == "in" {
+			values, ok := stop.Predicate.Value.([]any)
+			if !ok || len(values) == 0 {
+				return errors.New("mission stop in predicate requires a nonempty list")
+			}
 		}
 		for _, effect := range stop.Scope.Effects {
 			if !allowed[effect] {
@@ -491,6 +600,11 @@ func validateStops(stops []stop, sources map[string]bool, effects *effects) erro
 		}
 		if hasDuplicates(stop.Scope.Stages) || hasDuplicates(stop.Scope.Effects) {
 			return fmt.Errorf("mission stop %q repeats scope values", stop.ID)
+		}
+		for _, stage := range stop.Scope.Stages {
+			if _, ok := m.Stage(stage); !ok {
+				return errors.New("mission stop stage is unknown")
+			}
 		}
 	}
 	return nil
@@ -508,7 +622,7 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 			(assumption.ExpectedRevision != "" && !safeOpaque(assumption.ExpectedRevision)) {
 			return fmt.Errorf("mission authority assumption %q has malformed revision policy", assumption.ID)
 		}
-		if len(assumption.Effects) == 0 || hasDuplicates(assumption.Effects) || !allKnown(assumption.Effects, stringSet(effects.Allowed)) {
+		if (len(assumption.Effects) == 0 && assumption.Claim != "owner-may-disposition") || hasDuplicates(assumption.Effects) || !allKnown(assumption.Effects, stringSet(effects.Allowed)) {
 			return fmt.Errorf("mission authority assumption %q has effects outside allowed", assumption.ID)
 		}
 		if assumption.Claim == "actor-may-attempt" {
@@ -567,6 +681,36 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 		}
 		if matches != 1 {
 			return fmt.Errorf("mission authority effect %q must match exactly one source-is-authoritative assumption", effect)
+		}
+	}
+	return nil
+}
+
+func validateDispositionOwners(stops []stop, unknowns []unknown, contradictions []contradiction, assumptions []authorityAssumption) error {
+	routes := map[string]bool{}
+	for _, stop := range stops {
+		routes[stop.Route] = true
+	}
+	for _, unknown := range unknowns {
+		routes[unknown.Route] = true
+	}
+	for _, contradiction := range contradictions {
+		routes[contradiction.DispositionAuthority] = true
+	}
+	for route := range routes {
+		matches := 0
+		for _, assumption := range assumptions {
+			if assumption.Claim == "owner-may-disposition" && assumption.Source == route {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return errors.New("mission authority disposition route must match exactly one owner assumption")
+		}
+	}
+	for _, assumption := range assumptions {
+		if assumption.Claim == "owner-may-disposition" && !routes[assumption.Source] {
+			return errors.New("mission authority owner assumption matches no disposition route")
 		}
 	}
 	return nil
@@ -632,6 +776,14 @@ func stringSet(values []string) map[string]bool {
 	result := make(map[string]bool, len(values))
 	for _, value := range values {
 		result[value] = true
+	}
+	return result
+}
+
+func sourceKindByID(sources []source) map[string]string {
+	result := make(map[string]string, len(sources))
+	for _, source := range sources {
+		result[source.ID] = source.Kind
 	}
 	return result
 }
@@ -729,6 +881,24 @@ var sourceKinds = map[string]bool{
 	"environment-classifier": true, "validation-capability": true, "platoon-policy": true,
 }
 
+var sourceSchemas = map[string]string{
+	"git": "git.object/v1", "td": "sergeant.td-observation/v1", "dagr": "dagr.capability/v1",
+	"sergeant": "sergeant.mission-source/v1", "receiving-system": "platoon.receiving-capability/v1alpha1",
+	"environment-classifier": "platoon.target-proof/v1alpha1", "validation-capability": "platoon.validation-capability/v1alpha1",
+	"platoon-policy": "platoon.policy/v1alpha1",
+}
+
+var stopFields = map[string]map[string]bool{
+	"git":                    {"quality": true, "revision": true, "objectId": true, "repository": true},
+	"td":                     {"quality": true, "revision": true, "observedAt": true},
+	"dagr":                   {"quality": true, "schemaVersion": true, "operations": true},
+	"sergeant":               {"quality": true, "revision": true, "observedAt": true},
+	"receiving-system":       {"quality": true, "authorityRevision": true, "environment": true, "production": true, "destructive": true},
+	"environment-classifier": {"quality": true, "environment": true, "production": true, "destructive": true, "expiresAt": true},
+	"validation-capability":  {"quality": true, "profileDigest": true},
+	"platoon-policy":         {"quality": true, "revision": true},
+}
+
 var effectRegistry = map[string]bool{
 	"read-source": true, "query-authority": true, "dagr-load-workflow": true, "dagr-start-run": true,
 	"dagr-ack-stage": true, "sergeant-dispatch": true, "sergeant-coordinator-request": true,
@@ -741,6 +911,27 @@ var effectRegistry = map[string]bool{
 var globallyForbiddenEffects = map[string]bool{
 	"merge": true, "push": true, "identity-switch": true, "credential-creation": true,
 	"production-activation": true, "child-state-write": true, "direct-session-injection": true,
+}
+
+var requiredEntryEffects = []string{
+	"dagr-load-workflow", "dagr-start-run", "dagr-ack-stage", "sergeant-dispatch", "run-validation",
+}
+
+var commonEffects = map[string]bool{
+	"read-source": true, "query-authority": true, "dagr-load-workflow": true, "dagr-start-run": true,
+	"dagr-ack-stage": true, "sergeant-dispatch": true, "sergeant-coordinator-request": true,
+	"publish-handoff": true, "route-finding": true, "run-validation": true,
+}
+
+var classEffectCeilings = map[string]map[string]bool{
+	"discover":         {},
+	"decide":           {},
+	"change-substrate": {"write-claimed-source": true},
+	"deliver":          {"write-claimed-source": true},
+	"validate":         {},
+	"operate":          {"receiving-system-operation": true, "request-sergeant-lifecycle": true},
+	"recover":          {"write-claimed-source": true, "receiving-system-operation": true, "request-sergeant-lifecycle": true},
+	"learn":            {},
 }
 
 var callerRoles = map[string]bool{"operator": true, "platoon": true, "external-scheduler": true, "stage": true}

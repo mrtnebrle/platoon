@@ -6,14 +6,44 @@ spec:
   objective: Deliver a synthetic API with independently reviewed acceptance evidence.
   class: deliver
   effects:
-    allowed: []
+    allowed: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
     prohibited: [production-activation, merge, push, identity-switch, child-state-write]
     stages:
-      build-api: []
-      review-api: []
-    callers: {}
+      build-api: [sergeant-dispatch, run-validation, write-claimed-source]
+      review-api: [sergeant-dispatch, run-validation]
+    callers:
+      dagr-load-workflow: [platoon]
+      dagr-start-run: [platoon]
+      dagr-ack-stage: [platoon]
+      sergeant-dispatch: [platoon]
+      run-validation: [platoon]
+      write-claimed-source: [stage]
   stops: []
-  authorityAssumptions: []
+  authorityAssumptions:
+    - id: mission-authority
+      source: mission-policy
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: platoon-attempt
+      source: mission-policy
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: platoon
+    - id: build-attempt
+      source: mission-policy
+      effects: [write-claimed-source]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: stage
+      stage: build-api
   unknowns: []
   contradictions: []
   outputs:
@@ -35,6 +65,7 @@ spec:
   sources:
     - id: mission-policy
       kind: platoon-policy
+      schema: platoon.policy/v1alpha1
       locator: synthetic-public-policy
       revision: v1
       role: mission-policy

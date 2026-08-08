@@ -27,6 +27,29 @@ func TestReadStableRejectsFileChangedDuringRead(t *testing.T) {
 	}
 }
 
+func TestReadStableRejectsInPlaceChangeWithRestoredMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mission.yaml")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = readStableWithHook(path, func() {
+		if writeErr := os.WriteFile(path, []byte("modified"), 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		if timeErr := os.Chtimes(path, info.ModTime(), info.ModTime()); timeErr != nil {
+			t.Fatal(timeErr)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed while reading") {
+		t.Fatalf("readStableWithHook() error = %v", err)
+	}
+}
+
 func TestDecodeRejectsAmbiguousYAMLFeatures(t *testing.T) {
 	for name, raw := range map[string]string{
 		"alias": "apiVersion: platoon.dev/mission/v1alpha1\nkind: Mission\nmetadata: &meta {name: sample}\nspec: *meta\n",

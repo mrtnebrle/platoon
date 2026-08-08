@@ -44,6 +44,14 @@ manifest stage must have an effects entry, and each class must declare its exact
 required completion outputs. Validation prints a concise human preview while
 plan and non-applied start return the matching machine-readable preview.
 
+Each source kind selects one closed schema identifier. Stop fields must belong
+to that schema, scoped stages must exist, and every disposition route must have
+exactly one `owner-may-disposition` assumption. Ready entry additionally
+requires the declared orchestration effects and complete source/actor authority.
+Mutable observation-policy sources and entry stops remain not ready until a
+future source bundle can supply evidence. Failures expose only fixed
+`mode`, `schema`, and `reason` diagnostics.
+
 This phase is preview-only. Typed `start --apply` refuses before state creation
 or adapter invocation.
 

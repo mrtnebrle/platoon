@@ -129,7 +129,7 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 	}{
 		"missing file": {
 			prepare: func(t *testing.T, dir string) { t.Helper(); os.Remove(filepath.Join(dir, "mission.yaml")) },
-			want:    "mission declaration is missing",
+			want:    "reason=missing",
 		},
 		"symlink": {
 			prepare: func(t *testing.T, dir string) {
@@ -142,7 +142,7 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			want: "regular file",
+			want: "reason=not-regular",
 		},
 		"oversized": {
 			prepare: func(t *testing.T, dir string) {
@@ -151,25 +151,35 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			want: "exceeds 1048576 bytes",
+			want: "reason=oversized",
 		},
 		"unknown schema": {
 			rewrite: func(s string) string {
 				return strings.Replace(s, "platoon.dev/mission/v1alpha1", "platoon.dev/mission/v2", 1)
 			},
-			want: "apiVersion",
+			want: "reason=unknown-schema",
 		},
 		"unknown field": {
 			rewrite: func(s string) string { return strings.Replace(s, "  objective:", "  extra: value\n  objective:", 1) },
-			want:    "field extra not found",
+			want:    "reason=unknown-field",
 		},
 		"unknown effect": {
-			rewrite: func(s string) string { return strings.Replace(s, "allowed: []", "allowed: [teleport]", 1) },
-			want:    "unknown effect",
+			rewrite: func(s string) string { return strings.Replace(s, "dagr-load-workflow", "teleport", 1) },
+			want:    "reason=unknown-effect",
+		},
+		"effect outside class ceiling": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "dagr-load-workflow", "receiving-system-operation", 1)
+			},
+			want: "reason=effect-class-ceiling",
 		},
 		"unknown output": {
 			rewrite: func(s string) string { return strings.Replace(s, "category: product-delta", "category: surprise", 1) },
-			want:    "unknown category",
+			want:    "reason=unknown-output",
+		},
+		"source schema mismatch": {
+			rewrite: func(s string) string { return strings.Replace(s, "platoon.policy/v1alpha1", "git.object/v1", 1) },
+			want:    "reason=invalid-source",
 		},
 		"malformed stop": {
 			rewrite: func(s string) string {
@@ -185,14 +195,46 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
         stages: []
         effects: []`, 1)
 			},
-			want: "stop",
+			want: "reason=malformed-stop",
+		},
+		"unknown stop stage": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  stops: []", `  stops:
+    - id: unsafe-entry
+      predicate:
+        source: mission-policy
+        field: quality
+        operator: quality_is
+        value: verified
+      scope:
+        entry: false
+        stages: [missing-stage]
+        effects: []
+      route: mission-policy`, 1)
+			},
+			want: "reason=unknown-stop-stage",
+		},
+		"unknown stop field": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  stops: []", `  stops:
+    - id: unsafe-entry
+      predicate:
+        source: mission-policy
+        field: arbitraryPrivateField
+        operator: exists
+      scope:
+        entry: true
+        stages: []
+        effects: []
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-stop",
 		},
 		"malformed authority tuple": {
 			rewrite: func(s string) string {
-				s = strings.Replace(s, "allowed: []", "allowed: [read-source]", 1)
-				return strings.Replace(s, "callers: {}", "callers: {read-source: [operator]}", 1)
+				return strings.Replace(s, "actorRole: platoon", "actorRole: nobody", 1)
 			},
-			want: "authority tuple",
+			want: "reason=malformed-authority",
 		},
 		"unrouted contradiction": {
 			rewrite: func(s string) string {
@@ -201,7 +243,18 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
       sources: [mission-policy, mission-policy]
       decision: entry`, 1)
 			},
-			want: "contradiction",
+			want: "reason=unrouted-contradiction",
+		},
+		"unowned unknown route": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  unknowns: []", `  unknowns:
+    - id: release-window
+      question: Is entry allowed?
+      blocking: true
+      attemptedSources: [mission-policy]
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-authority",
 		},
 	}
 
@@ -229,6 +282,25 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 	}
 }
 
+func TestTypedMissionErrorsDoNotExposeAuthorControlledValues(t *testing.T) {
+	privateValue := "/private/synthetic/" + strings.Repeat("x", 8192)
+	declaration := strings.Replace(validTypedMission, "dagr-load-workflow", privateValue, 1)
+	dir := t.TempDir()
+	manifestPath := writeTypedMissionFixture(t, dir, declaration)
+	var stdout, stderr bytes.Buffer
+	if code := cli.Run([]string{"validate", "--file", manifestPath}, &stdout, &stderr); code != 1 {
+		t.Fatalf("validate exit=%d stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), privateValue) || strings.Contains(stderr.String(), "/private/") || len(stderr.String()) > 512 {
+		t.Fatalf("diagnostic is not bounded and sanitized: %q", stderr.String())
+	}
+	for _, want := range []string{"mode=declaration-v1alpha1", "schema=platoon.dev/mission/v1alpha1", "reason=unknown-effect"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("diagnostic %q missing %q", stderr.String(), want)
+		}
+	}
+}
+
 func TestBlockingUnknownProducesDeterministicNotReadyPreview(t *testing.T) {
 	declaration := strings.Replace(validTypedMission, "  unknowns: []", `  unknowns:
     - id: release-window
@@ -236,6 +308,14 @@ func TestBlockingUnknownProducesDeterministicNotReadyPreview(t *testing.T) {
       blocking: true
       attemptedSources: [mission-policy]
       route: mission-policy`, 1)
+	declaration = strings.Replace(declaration, "  unknowns:", `    - id: release-owner
+      source: mission-policy
+      effects: []
+      claim: owner-may-disposition
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+  unknowns:`, 1)
 	dir := t.TempDir()
 	manifestPath := writeTypedMissionFixture(t, dir, declaration)
 	var first, second, stderr bytes.Buffer
@@ -419,15 +499,54 @@ spec:
   objective: Deliver a synthetic API and its public guide.
   class: deliver
   effects:
-    allowed: []
+    allowed: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
     prohibited: []
     stages:
-      build-api: []
-      write-guide: []
-      review-release: []
-    callers: {}
+      build-api: [sergeant-dispatch, run-validation, write-claimed-source]
+      write-guide: [sergeant-dispatch, run-validation, write-claimed-source]
+      review-release: [sergeant-dispatch, run-validation]
+    callers:
+      dagr-load-workflow: [platoon]
+      dagr-start-run: [platoon]
+      dagr-ack-stage: [platoon]
+      sergeant-dispatch: [platoon]
+      run-validation: [platoon]
+      write-claimed-source: [stage]
   stops: []
-  authorityAssumptions: []
+  authorityAssumptions:
+    - id: mission-authority
+      source: mission-policy
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: platoon-attempt
+      source: mission-policy
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: platoon
+    - id: build-attempt
+      source: mission-policy
+      effects: [write-claimed-source]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: stage
+      stage: build-api
+    - id: guide-attempt
+      source: mission-policy
+      effects: [write-claimed-source]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: stage
+      stage: write-guide
   unknowns: []
   contradictions: []
   outputs:
@@ -449,6 +568,7 @@ spec:
   sources:
     - id: mission-policy
       kind: platoon-policy
+      schema: platoon.policy/v1alpha1
       locator: public-policy
       revision: v1
       role: mission-policy

@@ -206,7 +206,7 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "kind", "locator", "role", "reason"],
+      "required": ["id", "kind", "schema", "locator", "role", "reason"],
       "oneOf": [
         { "required": ["revision"], "not": { "required": ["observationPolicy"] } },
         { "required": ["observationPolicy"], "not": { "required": ["revision"] } }
@@ -214,6 +214,7 @@
       "properties": {
         "id": { "$ref": "#/$defs/slug" },
         "kind": { "enum": ["git", "td", "dagr", "sergeant", "receiving-system", "environment-classifier", "validation-capability", "platoon-policy"] },
+        "schema": { "enum": ["git.object/v1", "sergeant.td-observation/v1", "dagr.capability/v1", "sergeant.mission-source/v1", "platoon.receiving-capability/v1alpha1", "platoon.target-proof/v1alpha1", "platoon.validation-capability/v1alpha1", "platoon.policy/v1alpha1"] },
         "locator": { "$ref": "#/$defs/opaque" },
         "revision": { "$ref": "#/$defs/opaque" },
         "observationPolicy": { "$ref": "#/$defs/opaque" },
