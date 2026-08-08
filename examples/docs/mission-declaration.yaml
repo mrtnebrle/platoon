@@ -1,0 +1,41 @@
+apiVersion: platoon.dev/mission/v1alpha1
+kind: Mission
+metadata:
+  name: synthetic-api-delivery
+spec:
+  objective: Deliver a synthetic API with independently reviewed acceptance evidence.
+  class: deliver
+  effects:
+    allowed: []
+    prohibited: [production-activation, merge, push, identity-switch, child-state-write]
+    stages:
+      build-api: []
+      review-api: []
+    callers: {}
+  stops: []
+  authorityAssumptions: []
+  unknowns: []
+  contradictions: []
+  outputs:
+    - id: product-change
+      category: product-delta
+      stage: build-api
+      schema: synthetic.product-delta/v1
+      evidenceRoles: [mission-policy]
+      gatesOutcome: completed
+    - id: acceptance-result
+      category: acceptance-evidence
+      stage: review-api
+      schema: synthetic.acceptance/v1
+      evidenceRoles: [mission-policy]
+      gatesOutcome: completed
+  handoffs: []
+  unattended:
+    requested: false
+  sources:
+    - id: mission-policy
+      kind: platoon-policy
+      locator: synthetic-public-policy
+      revision: v1
+      role: mission-policy
+      reason: Defines the synthetic mission boundary.

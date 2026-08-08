@@ -13,6 +13,7 @@ import (
 	"github.com/mrtnebrle/platoon/internal/adapter"
 	"github.com/mrtnebrle/platoon/internal/commander"
 	"github.com/mrtnebrle/platoon/internal/manifest"
+	"github.com/mrtnebrle/platoon/internal/missioncontrol"
 	"github.com/mrtnebrle/platoon/internal/planner"
 	"github.com/mrtnebrle/platoon/internal/state"
 )
@@ -67,7 +68,19 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "validate: %v\n", err)
 		return 1
 	}
+	mission, err := missioncontrol.Compile(m, *file)
+	if err != nil {
+		fmt.Fprintf(stderr, "validate: %v\n", err)
+		return 1
+	}
 	fmt.Fprintf(stdout, "valid: %s\n", m.Metadata.Name)
+	if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
+		fmt.Fprintf(stdout, "mission: mode=%s schema=%s class=%s ready=%t\n", mission.Mode, mission.Schema, mission.Class, mission.Ready)
+		fmt.Fprintf(stdout, "outputs: %s\n", strings.Join(mission.Outputs, ", "))
+		for _, decision := range mission.Sufficiency {
+			fmt.Fprintf(stdout, "sufficiency: %s: %s\n", decision.Status, decision.Reason)
+		}
+	}
 	return 0
 }
 
@@ -90,6 +103,22 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
+	}
+	mission, err := missioncontrol.Compile(m, *file)
+	if err != nil {
+		fmt.Fprintf(stderr, "plan: %v\n", err)
+		return 1
+	}
+	if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
+		preview := struct {
+			Mission   missioncontrol.Preview `json:"mission"`
+			Decisions []planner.Decision     `json:"decisions"`
+		}{Mission: mission, Decisions: planner.Plan(m, nil)}
+		if err := writeJSON(stdout, preview); err != nil {
+			fmt.Fprintf(stderr, "plan: write output: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if err := writeJSON(stdout, planner.Plan(m, nil)); err != nil {
 		fmt.Fprintf(stderr, "plan: write output: %v\n", err)
@@ -120,16 +149,29 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
 	}
+	mission, err := missioncontrol.Compile(m, *file)
+	if err != nil {
+		fmt.Fprintf(stderr, "start: %v\n", err)
+		return 1
+	}
 	if !*apply {
 		preview := struct {
-			Apply     bool               `json:"apply"`
-			Decisions []planner.Decision `json:"decisions"`
+			Apply     bool                    `json:"apply"`
+			Mission   *missioncontrol.Preview `json:"mission,omitempty"`
+			Decisions []planner.Decision      `json:"decisions"`
 		}{Apply: false, Decisions: planner.Plan(m, nil)}
+		if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
+			preview.Mission = &mission
+		}
 		if err := writeJSON(stdout, preview); err != nil {
 			fmt.Fprintf(stderr, "start: write preview: %v\n", err)
 			return 1
 		}
 		return 0
+	}
+	if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
+		fmt.Fprintln(stderr, "start: typed mission apply is not available in declaration preview mode")
+		return 1
 	}
 	runtimeManifest, manifestPath, intentPath, err := resolveRuntimeManifest(m, *file)
 	if err != nil {

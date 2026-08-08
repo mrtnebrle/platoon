@@ -23,6 +23,23 @@ func TestPublishedSchemaCompilesAndAcceptsExample(t *testing.T) {
 	}
 }
 
+func TestPublishedSchemasAcceptTypedExamples(t *testing.T) {
+	manifestSchema := compilePublishedSchema(t)
+	typedManifest := loadYAMLDocument(t, "../../examples/platoon-typed.yaml")
+	if err := manifestSchema.Validate(typedManifest); err != nil {
+		t.Fatalf("typed manifest fails schema: %v", err)
+	}
+	missionCompiler := jsonschema.NewCompiler()
+	missionSchema, err := missionCompiler.Compile("../../schema/mission.schema.json")
+	if err != nil {
+		t.Fatalf("compile mission schema: %v", err)
+	}
+	mission := loadYAMLDocument(t, "../../examples/docs/mission-declaration.yaml")
+	if err := missionSchema.Validate(mission); err != nil {
+		t.Fatalf("typed mission fails schema: %v", err)
+	}
+}
+
 func TestClaimPathSchemaRuntimeParity(t *testing.T) {
 	schema := compilePublishedSchema(t)
 	for _, value := range []string{
@@ -85,7 +102,12 @@ func compilePublishedSchema(t *testing.T) *jsonschema.Schema {
 
 func loadExampleDocument(t *testing.T) map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile("../../examples/platoon.yaml")
+	return loadYAMLDocument(t, "../../examples/platoon.yaml")
+}
+
+func loadYAMLDocument(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
