@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mrtnebrle/platoon/internal/manifest"
 )
 
 func TestReadStableRejectsFileChangedDuringRead(t *testing.T) {
@@ -24,6 +26,26 @@ func TestReadStableRejectsFileChangedDuringRead(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "changed while reading") {
 		t.Fatalf("readStableWithHook() error = %v", err)
+	}
+}
+
+func TestValidateEffectsRejectsEveryMutatingReviewEffect(t *testing.T) {
+	for _, effect := range []string{"write-claimed-source", "receiving-system-operation", "request-sergeant-lifecycle"} {
+		t.Run(effect, func(t *testing.T) {
+			m := &manifest.Manifest{Spec: manifest.Spec{Stages: []manifest.Stage{{ID: "review", Mode: manifest.Review}}}}
+			value := &effects{
+				Allowed: []string{effect}, Prohibited: []string{},
+				Stages:  map[string][]string{"review": {effect}},
+				Callers: map[string][]string{effect: {"operator"}},
+			}
+			class := "operate"
+			if effect == "write-claimed-source" {
+				class = "deliver"
+			}
+			if err := validateEffects(value, class, m); err == nil {
+				t.Fatalf("validateEffects accepted %s for review stage", effect)
+			}
+		})
 	}
 }
 

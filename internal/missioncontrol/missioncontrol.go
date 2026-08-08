@@ -651,7 +651,7 @@ func validateEffects(value *effects, class string, m *manifest.Manifest) error {
 			if !allowed[effect] {
 				return fmt.Errorf("mission stage %q uses effect %q outside allowed", stage.ID, effect)
 			}
-			if stage.Mode == manifest.Review && effect == "write-claimed-source" {
+			if stage.Mode == manifest.Review && reviewMutatingEffects[effect] {
 				return errors.New("mission review stage cannot use a write effect")
 			}
 		}
@@ -1123,6 +1123,10 @@ var classEffectCeilings = map[string]map[string]bool{
 	"operate":          {"receiving-system-operation": true, "request-sergeant-lifecycle": true},
 	"recover":          {"write-claimed-source": true, "receiving-system-operation": true, "request-sergeant-lifecycle": true},
 	"learn":            {},
+}
+
+var reviewMutatingEffects = map[string]bool{
+	"write-claimed-source": true, "receiving-system-operation": true, "request-sergeant-lifecycle": true,
 }
 
 var effectAuthorityKinds = map[string]map[string]bool{

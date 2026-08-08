@@ -93,7 +93,8 @@ orchestration effects, and unattended requests are not ready. Source kinds bind
 to closed source schemas; stop fields, typed predicate values, effect-specific
 authority sources, and disposition owners must resolve without ambiguity.
 String and boolean YAML types are explicit, Git authority uses full object IDs,
-and read-only review stages cannot receive write effects.
+and read-only review stages cannot receive source-write, receiving-system, or
+Sergeant lifecycle effects.
 
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 defines the later sourced cross-repository

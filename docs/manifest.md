@@ -52,7 +52,8 @@ effect authority must use the owning adapter source kind. Every schema-required
 field must be explicitly present. Ready entry additionally requires the declared
 orchestration effects and complete source/actor authority.
 String fields reject YAML scalar coercion, Git source revisions are full object
-IDs, and `write-claimed-source` is invalid for review stages.
+IDs. `write-claimed-source`, `receiving-system-operation`, and
+`request-sergeant-lifecycle` are invalid for review stages.
 Every allowed effect must have an effective caller tuple. Disposition-owner
 assumptions govern routes only and therefore require an empty effects list.
 Mutable observation-policy sources and entry stops remain not ready until a
