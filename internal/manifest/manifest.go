@@ -24,6 +24,9 @@ const (
 
 	Implementation Mode = "implementation"
 	Review         Mode = "review"
+
+	MissionReference           = "reference"
+	MissionDeclarationV1Alpha1 = "declaration-v1alpha1"
 )
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -42,14 +45,15 @@ type Metadata struct {
 }
 
 type Spec struct {
-	Project      string       `json:"project" yaml:"project"`
-	Mission      string       `json:"mission" yaml:"mission"`
-	Intent       string       `json:"intent" yaml:"intent"`
-	Limits       Limits       `json:"limits" yaml:"limits"`
-	Adapters     Adapters     `json:"adapters" yaml:"adapters"`
-	Routing      []Route      `json:"routing" yaml:"routing"`
-	Repositories []Repository `json:"repositories" yaml:"repositories"`
-	Stages       []Stage      `json:"stages" yaml:"stages"`
+	Project       string       `json:"project" yaml:"project"`
+	Mission       string       `json:"mission" yaml:"mission"`
+	MissionFormat string       `json:"missionFormat,omitempty" yaml:"missionFormat,omitempty"`
+	Intent        string       `json:"intent" yaml:"intent"`
+	Limits        Limits       `json:"limits" yaml:"limits"`
+	Adapters      Adapters     `json:"adapters" yaml:"adapters"`
+	Routing       []Route      `json:"routing" yaml:"routing"`
+	Repositories  []Repository `json:"repositories" yaml:"repositories"`
+	Stages        []Stage      `json:"stages" yaml:"stages"`
 }
 
 type Limits struct {
@@ -191,7 +195,11 @@ func Load(raw []byte) (*Manifest, error) {
 		return nil, errors.New("multiple YAML documents are not allowed")
 	}
 
-	applyDefaults(&result, defaultFieldPresence(&document))
+	presence := defaultFieldPresence(&document)
+	if presence.missionFormat && result.Spec.MissionFormat == "" {
+		return nil, errors.New("spec.missionFormat must not be empty when present")
+	}
+	applyDefaults(&result, presence)
 	if err := Validate(&result); err != nil {
 		return nil, err
 	}
@@ -201,6 +209,7 @@ func Load(raw []byte) (*Manifest, error) {
 type fieldPresence struct {
 	limits         map[string]bool
 	repoMaxWriters []bool
+	missionFormat  bool
 }
 
 func applyDefaults(m *Manifest, present fieldPresence) {
@@ -241,6 +250,9 @@ func Validate(m *Manifest) error {
 	}
 	if err := validateReference("spec.mission", m.Spec.Mission); err != nil {
 		return err
+	}
+	if m.Spec.MissionFormat != "" && m.Spec.MissionFormat != MissionReference && m.Spec.MissionFormat != MissionDeclarationV1Alpha1 {
+		return errors.New("spec.missionFormat must be reference or declaration-v1alpha1")
 	}
 	if err := validateReference("spec.intent", m.Spec.Intent); err != nil {
 		return err
@@ -666,6 +678,7 @@ func defaultFieldPresence(document *yaml.Node) fieldPresence {
 		root = root.Content[0]
 	}
 	spec := mappingValue(root, "spec")
+	present.missionFormat = mappingValue(spec, "missionFormat") != nil
 	limits := mappingValue(spec, "limits")
 	for _, field := range []string{"implementation", "review", "leaseTTL", "commandTimeout", "maxOutputBytes"} {
 		present.limits[field] = mappingValue(limits, field) != nil

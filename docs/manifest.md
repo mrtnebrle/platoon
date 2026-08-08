@@ -21,12 +21,47 @@ starts. Bare executable names resolve through the operator's process `PATH`.
 | `metadata.name` | yes | Lowercase run-name slug. |
 | `spec.project` | yes | Synthetic/portable Sergeant project slug. |
 | `spec.mission` | yes | Safe relative mission reference. |
+| `spec.missionFormat` | no | `reference` (the default) or `declaration-v1alpha1`. |
 | `spec.intent` | yes | Safe relative canonical intent reference; its SHA-256 binds child evidence. |
 | `spec.limits` | yes | Capacity and process bounds. Empty `{}` selects defaults. |
 | `spec.adapters` | yes | Dagr command/database and Sergeant command/fleet-state adapters. |
 | `spec.routing` | yes | Allowed model/risk/harness combinations. |
 | `spec.repositories` | yes | Repository-local write and integration policy. |
 | `spec.stages` | yes | One issue-owned implementation or review unit each. |
+
+## Mission Format
+
+Reference mode validates only the relative `spec.mission` path and never reads
+the referenced file. This includes explicit `missionFormat: reference`; typed
+content is not inferred from filenames or file bodies. An explicitly present
+empty `missionFormat` is invalid.
+
+`missionFormat: declaration-v1alpha1` requires a strict, regular, non-symlink
+mission file no larger than 1 MiB. The declaration schema is
+`schema/mission.schema.json`; `examples/platoon-typed.yaml` demonstrates it.
+Compilation validates closed mission classes, effects, stops, authority tuples,
+unknowns, contradictions, output categories, handoffs, and source kinds. Each
+manifest stage must have an effects entry, and each class must declare its exact
+required completion outputs. Validation prints a concise human preview while
+plan and non-applied start return the matching machine-readable preview.
+
+Each source kind selects one closed schema identifier. Stop fields, operators,
+and bounded values must match that schema; scoped stages must exist; every
+disposition route must have exactly one `owner-may-disposition` assumption; and
+effect authority must use the owning adapter source kind. Every schema-required
+field must be explicitly present. Ready entry additionally requires the declared
+orchestration effects and complete source/actor authority.
+String fields reject YAML scalar coercion, Git source revisions are full object
+IDs. `write-claimed-source`, `receiving-system-operation`, and
+`request-sergeant-lifecycle` are invalid for review stages.
+Every allowed effect must have an effective caller tuple. Disposition-owner
+assumptions govern routes only and therefore require an empty effects list.
+Mutable observation-policy sources and entry stops remain not ready until a
+future source bundle can supply evidence. Failures expose only fixed
+`mode`, `schema`, and `reason` diagnostics.
+
+This phase is preview-only. Typed `start --apply` refuses before state creation
+or adapter invocation.
 
 ## Limits
 

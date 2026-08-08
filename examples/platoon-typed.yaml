@@ -1,0 +1,66 @@
+apiVersion: platoon.dev/v1alpha1
+kind: Platoon
+metadata:
+  name: synthetic-typed-platoon
+spec:
+  project: synthetic-project
+  mission: docs/mission-declaration.yaml
+  missionFormat: declaration-v1alpha1
+  intent: docs/intent.md
+  limits: {}
+  adapters:
+    dagr:
+      executable: dagr
+      database: .platoon/dagr.db
+      inspectExecutable: sqlite3
+    sergeant:
+      fleetRoot: .platoon/fleets
+      originProfile: platoon-local
+      dispatch:
+        executable: sgt-dispatch
+      watch:
+        executable: sgt-watch
+      wake:
+        executable: sgt-wake
+      drain:
+        executable: sgt-drain
+  routing:
+    - model: reasoning
+      risk: high
+      harness: opencode
+  repositories:
+    - id: synthetic-api
+      path: repos/synthetic-api
+      branch: feat/synthetic-api
+      integration:
+        - executable: go
+          args: [test, ./...]
+  stages:
+    - id: build-api
+      repository: synthetic-api
+      task: task-build-api
+      mode: implementation
+      harness: opencode
+      model: reasoning
+      risk: high
+      dependsOn: []
+      claims:
+        paths: [internal/api]
+        semantic: [api-contract]
+      acceptance:
+        - executable: go
+          args: [test, ./internal/api/...]
+    - id: review-api
+      repository: synthetic-api
+      task: task-review-api
+      mode: review
+      harness: opencode
+      model: reasoning
+      risk: high
+      dependsOn: [build-api]
+      claims:
+        paths: []
+        semantic: []
+      acceptance:
+        - executable: go
+          args: [test, ./...]

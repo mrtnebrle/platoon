@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platoon.example/schema/mission-v1alpha1.json",
+  "title": "Platoon mission declaration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platoon.dev/mission/v1alpha1" },
+    "kind": { "const": "Mission" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": { "name": { "$ref": "#/$defs/slug" } }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "class", "effects", "stops", "authorityAssumptions", "unknowns", "contradictions", "outputs", "handoffs", "unattended", "sources"],
+      "properties": {
+        "objective": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "class": { "enum": ["discover", "decide", "change-substrate", "deliver", "validate", "operate", "recover", "learn"] },
+        "effects": { "$ref": "#/$defs/effects" },
+        "stops": { "type": "array", "items": { "$ref": "#/$defs/stop" } },
+        "authorityAssumptions": { "type": "array", "items": { "$ref": "#/$defs/authority" } },
+        "unknowns": { "type": "array", "items": { "$ref": "#/$defs/unknown" } },
+        "contradictions": { "type": "array", "items": { "$ref": "#/$defs/contradiction" } },
+        "outputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/output" } },
+        "handoffs": { "type": "array", "items": { "$ref": "#/$defs/handoff" } },
+        "unattended": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requested"],
+          "properties": { "requested": { "type": "boolean" } }
+        },
+        "sources": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/source" } }
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "opaque": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]+$",
+      "not": { "pattern": "\\.\\." }
+    },
+    "schemaID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+/v[0-9]+(?:alpha[0-9]+)?$"
+    },
+    "effect": {
+      "enum": [
+        "read-source", "query-authority", "dagr-load-workflow", "dagr-start-run", "dagr-ack-stage",
+        "sergeant-dispatch", "sergeant-coordinator-request", "publish-handoff", "route-finding",
+        "run-validation", "write-claimed-source", "receiving-system-operation", "request-sergeant-lifecycle",
+        "merge", "push", "identity-switch", "credential-creation", "production-activation",
+        "child-state-write", "direct-session-injection"
+      ]
+    },
+    "effectSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "callerSet": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["operator", "platoon", "external-scheduler", "stage"] }
+    },
+    "effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "prohibited", "stages", "callers"],
+      "properties": {
+        "allowed": { "$ref": "#/$defs/effectSet" },
+        "prohibited": { "$ref": "#/$defs/effectSet" },
+        "stages": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/slug" },
+          "additionalProperties": { "$ref": "#/$defs/effectSet" }
+        },
+        "callers": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/effect" },
+          "additionalProperties": { "$ref": "#/$defs/callerSet" }
+        }
+      }
+    },
+    "stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "predicate", "scope", "route"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "predicate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "field", "operator"],
+          "properties": {
+            "source": { "$ref": "#/$defs/slug" },
+            "field": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*(?:\\.[A-Za-z][A-Za-z0-9]*)*$" },
+            "operator": { "enum": ["equals", "not_equals", "in", "exists", "quality_is"] },
+            "value": {
+              "anyOf": [
+                { "type": "string", "minLength": 1, "maxLength": 256 },
+                { "type": "boolean" },
+                { "type": "array", "minItems": 1, "maxItems": 128, "items": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "boolean" }] } }
+              ]
+            }
+          }
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entry", "stages", "effects"],
+          "properties": {
+            "entry": { "type": "boolean" },
+            "stages": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+            "effects": { "$ref": "#/$defs/effectSet" }
+          }
+        },
+        "route": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source", "effects", "claim", "revisionPolicy", "route"],
+      "allOf": [
+        { "if": { "properties": { "claim": { "const": "owner-may-disposition" } }, "required": ["claim"] }, "then": { "properties": { "effects": { "maxItems": 0 } } } }
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "source": { "$ref": "#/$defs/slug" },
+        "effects": { "$ref": "#/$defs/effectSet" },
+        "claim": { "enum": ["source-is-authoritative", "actor-may-attempt", "owner-may-disposition"] },
+        "revisionPolicy": { "enum": ["exact", "current-at-invocation"] },
+        "expectedRevision": { "$ref": "#/$defs/opaque" },
+        "route": { "$ref": "#/$defs/slug" },
+        "actorRole": { "enum": ["operator", "platoon", "external-scheduler", "stage"] },
+        "stage": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "unknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "question", "blocking", "attemptedSources", "route"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "question": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "blocking": { "type": "boolean" },
+        "attemptedSources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+        "route": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "contradiction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sources", "decision", "dispositionAuthority"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "sources": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+        "decision": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "dispositionAuthority": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "outputCategory": {
+      "enum": [
+        "sourced-answers", "unknown-dispositions", "evidence-references", "finding-references", "decision",
+        "authority-decision-evidence", "decision-rationale", "downstream-effects", "product-delta",
+        "compatibility-evidence", "migration-evidence", "rollback-evidence", "dependency-evidence",
+        "invalidation-evidence", "acceptance-evidence", "independent-validation", "operation-receipt",
+        "resulting-state", "audit-evidence", "safe-state", "cause-classification", "recovery-evidence",
+        "recovery-disposition", "world-delta", "capability-candidates", "workflow-candidates"
+      ]
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "category", "stage", "schema", "evidenceRoles", "gatesOutcome"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "category": { "$ref": "#/$defs/outputCategory" },
+        "stage": { "$ref": "#/$defs/slug" },
+        "schema": { "$ref": "#/$defs/schemaID" },
+        "evidenceRoles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+        "gatesOutcome": { "const": "completed" }
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "producer", "consumer", "outputSchema", "evidenceRoles", "outputRole", "compatibility", "freshness", "missing", "incompatible"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "producer": { "$ref": "#/$defs/slug" },
+        "consumer": { "$ref": "#/$defs/slug" },
+        "outputSchema": { "$ref": "#/$defs/schemaID" },
+        "evidenceRoles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
+        "outputRole": { "$ref": "#/$defs/slug" },
+        "compatibility": { "$ref": "#/$defs/opaque" },
+        "freshness": { "$ref": "#/$defs/opaque" },
+        "missing": { "const": "block-consumer" },
+        "incompatible": { "const": "reassemble" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "schema", "locator", "role", "reason"],
+      "oneOf": [
+        { "required": ["revision"], "not": { "required": ["observationPolicy"] } },
+        { "required": ["observationPolicy"], "not": { "required": ["revision"] } }
+      ],
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "git.object/v1" }, "revision": { "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" } } } },
+        { "if": { "properties": { "kind": { "const": "td" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.td-observation/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "dagr" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "dagr.capability/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "sergeant" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.mission-source/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "receiving-system" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.receiving-capability/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "environment-classifier" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.target-proof/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "validation-capability" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.validation-capability/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "platoon-policy" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.policy/v1alpha1" } } } }
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "kind": { "enum": ["git", "td", "dagr", "sergeant", "receiving-system", "environment-classifier", "validation-capability", "platoon-policy"] },
+        "schema": { "enum": ["git.object/v1", "sergeant.td-observation/v1", "dagr.capability/v1", "sergeant.mission-source/v1", "platoon.receiving-capability/v1alpha1", "platoon.target-proof/v1alpha1", "platoon.validation-capability/v1alpha1", "platoon.policy/v1alpha1"] },
+        "locator": { "$ref": "#/$defs/opaque" },
+        "revision": { "$ref": "#/$defs/opaque" },
+        "observationPolicy": { "$ref": "#/$defs/opaque" },
+        "role": { "$ref": "#/$defs/slug" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    }
+  }
+}

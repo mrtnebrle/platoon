@@ -1,0 +1,121 @@
+apiVersion: platoon.dev/mission/v1alpha1
+kind: Mission
+metadata:
+  name: synthetic-api-delivery
+spec:
+  objective: Deliver a synthetic API with independently reviewed acceptance evidence.
+  class: deliver
+  effects:
+    allowed: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
+    prohibited: [production-activation, merge, push, identity-switch, child-state-write]
+    stages:
+      build-api: [sergeant-dispatch, run-validation, write-claimed-source]
+      review-api: [sergeant-dispatch, run-validation]
+    callers:
+      dagr-load-workflow: [platoon]
+      dagr-start-run: [platoon]
+      dagr-ack-stage: [platoon]
+      sergeant-dispatch: [platoon]
+      run-validation: [platoon]
+      write-claimed-source: [stage]
+  stops: []
+  authorityAssumptions:
+    - id: dagr-authority
+      source: dagr-authority
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: sergeant-authority
+      source: sergeant-authority
+      effects: [sergeant-dispatch]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: validation-authority
+      source: validation-authority
+      effects: [run-validation]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: git-authority
+      source: git-authority
+      effects: [write-claimed-source]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      route: mission-policy
+    - id: platoon-attempt
+      source: mission-policy
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: platoon
+    - id: build-attempt
+      source: mission-policy
+      effects: [write-claimed-source]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: stage
+      stage: build-api
+  unknowns: []
+  contradictions: []
+  outputs:
+    - id: product-change
+      category: product-delta
+      stage: build-api
+      schema: synthetic.product-delta/v1
+      evidenceRoles: [mission-policy]
+      gatesOutcome: completed
+    - id: acceptance-result
+      category: acceptance-evidence
+      stage: review-api
+      schema: synthetic.acceptance/v1
+      evidenceRoles: [mission-policy]
+      gatesOutcome: completed
+  handoffs: []
+  unattended:
+    requested: false
+  sources:
+    - id: mission-policy
+      kind: platoon-policy
+      schema: platoon.policy/v1alpha1
+      locator: synthetic-public-policy
+      revision: v1
+      role: mission-policy
+      reason: Defines the synthetic mission boundary.
+    - id: dagr-authority
+      kind: dagr
+      schema: dagr.capability/v1
+      locator: synthetic-dagr
+      revision: v1
+      role: dagr-authority
+      reason: Defines the synthetic Dagr capability boundary.
+    - id: sergeant-authority
+      kind: sergeant
+      schema: sergeant.mission-source/v1
+      locator: synthetic-sergeant
+      revision: v1
+      role: sergeant-authority
+      reason: Defines the synthetic Sergeant capability boundary.
+    - id: validation-authority
+      kind: validation-capability
+      schema: platoon.validation-capability/v1alpha1
+      locator: synthetic-validation
+      revision: v1
+      role: validation-authority
+      reason: Defines the synthetic validation capability boundary.
+    - id: git-authority
+      kind: git
+      schema: git.object/v1
+      locator: synthetic-repository
+      revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      role: git-authority
+      reason: Defines the synthetic repository boundary.

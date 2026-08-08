@@ -31,6 +31,7 @@ The repository includes a complete synthetic manifest.
 platoon validate --file examples/platoon.yaml
 platoon plan --file examples/platoon.yaml
 platoon start --file examples/platoon.yaml
+platoon plan --file examples/platoon-typed.yaml
 ```
 
 The third command is a preview. It does not create a state directory or invoke
@@ -45,8 +46,8 @@ platoon start --file examples/platoon.yaml --state .platoon --apply
 | Command | Behavior |
 |---|---|
 | `validate --file <manifest>` | Strictly validates YAML and domain rules without side effects. |
-| `plan --file <manifest>` | Prints deterministic JSON admission decisions without reading or mutating adapter state. |
-| `start --file <manifest> [--state <dir>]` | Prints the same read-only start preview. |
+| `plan --file <manifest>` | Prints deterministic JSON admission decisions and, for typed missions, compilation readiness without reading or mutating adapter state. |
+| `start --file <manifest> [--state <dir>]` | Prints the same read-only admission and typed-mission preview. |
 | `start --file <manifest> [--state <dir>] --apply` | Persists an initializing run, loads/starts the hookless dagr workflow, adopts configured fleets, and dispatches admitted stages. |
 | `reconcile --run <id> [--state <dir>]` | Prints local durable status as a read-only preview. |
 | `reconcile --run <id> [--state <dir>] --apply` | Runs one bounded reconciliation cycle. |
@@ -63,17 +64,40 @@ Validation, planning, status, and non-applied start/reconcile never create it.
 The supported API version is `platoon.dev/v1alpha1`.
 
 - [JSON Schema](schema/platoon.schema.json)
+- [Mission declaration schema](schema/mission.schema.json)
 - [Manifest reference](docs/manifest.md)
 - [Synthetic example](examples/platoon.yaml)
+- [Synthetic typed preview](examples/platoon-typed.yaml)
 
 Each stage declares one repository, one task, implementation or read-only
 review mode, an agent harness, model/risk classes, dependencies, path claims,
 semantic claims, and acceptance commands. `adoptFleet` explicitly binds a
 pre-existing fleet to a stage.
 
+`spec.missionFormat` is optional. Omission or `reference` preserves the original
+path-only behavior: Platoon does not read or sniff the mission file, even when
+its contents look typed. An explicitly empty format is invalid.
+`declaration-v1alpha1` explicitly opts into a strict,
+stable-read `platoon.dev/mission/v1alpha1` declaration. `validate`, `plan`, and
+non-applied `start` compile the same deterministic class, output, and sufficiency
+preview. Blocking unknowns and contradictions report `ready: false`; malformed,
+missing, changed, symlinked, or oversized declarations fail closed. Preview
+diagnostics contain only bounded mode/schema/reason identifiers, never mission
+bodies or resolved private paths. Typed applied start is intentionally disabled
+until immutable packet state is implemented in a later phase.
+
+Ready declarations explicitly allow the required Dagr, Sergeant, and validation
+effects within their class ceiling and provide exact actor/source authority
+coverage. Entry stops, mutable sources without an observation bundle, missing
+orchestration effects, and unattended requests are not ready. Source kinds bind
+to closed source schemas; stop fields, typed predicate values, effect-specific
+authority sources, and disposition owners must resolve without ambiguity.
+String and boolean YAML types are explicit, Git authority uses full object IDs,
+and read-only review stages cannot receive source-write, receiving-system, or
+Sergeant lifecycle effects.
+
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
-proposes activating the currently inert mission reference as a versioned,
-explicitly opted-in immutable declaration. It defines sourced cross-repository
+defines the later sourced cross-repository
 interpretation, handoffs, drift verdicts, trajectory, Mission Records, and a
 bounded whole-observation Sergeant status-query seam behind one interface for
 survey, start, reconcile, drain, resume, and status. It preserves Dagr
@@ -85,7 +109,7 @@ crash-safe effect attempts with pre-invocation cancellation, deny-by-default
 sandboxed validation/replay policies, complete authority coverage, terminal
 child convergence, and a tested
 compatibility artifact that keeps typed runs operable across rollback. The
-document is a design proposal; none of that proposed behavior is implemented.
+document remains a design proposal beyond the declaration-preview slice above.
 
 Implementation and review pools default to six and two tokens. A repository
 defaults to one writer. Raising `maxWriters` allows same-repository concurrency

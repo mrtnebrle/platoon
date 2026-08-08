@@ -21,6 +21,7 @@
       "properties": {
         "project": { "$ref": "#/$defs/slug" },
         "mission": { "$ref": "#/$defs/relativePath" },
+        "missionFormat": { "enum": ["reference", "declaration-v1alpha1"], "default": "reference" },
         "intent": { "$ref": "#/$defs/relativePath" },
         "limits": { "$ref": "#/$defs/limits" },
         "adapters": { "$ref": "#/$defs/adapters" },
