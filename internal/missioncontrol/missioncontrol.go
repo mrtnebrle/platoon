@@ -34,6 +34,7 @@ type Preview struct {
 	Ready       bool                  `json:"ready"`
 	Outputs     []string              `json:"outputs,omitempty"`
 	Sufficiency []SufficiencyDecision `json:"sufficiency,omitempty"`
+	Packet      *PacketPreview        `json:"packet,omitempty"`
 }
 
 type SufficiencyDecision struct {
