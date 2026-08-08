@@ -329,6 +329,24 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 			},
 			want: "reason=malformed-authority",
 		},
+		"disposition owner with effects": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  unknowns: []", `    - id: release-owner
+      source: mission-policy
+      effects: [dagr-start-run]
+      claim: owner-may-disposition
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+  unknowns:
+    - id: release-window
+      question: Is entry allowed?
+      blocking: true
+      attemptedSources: [mission-policy]
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-authority",
+		},
 		"missing authority effects": {
 			rewrite: func(s string) string {
 				return strings.Replace(s, "      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage]\n", "", 1)
@@ -344,6 +362,14 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 		"write effect on review stage": {
 			rewrite: func(s string) string {
 				return strings.Replace(s, "review-release: [sergeant-dispatch, run-validation]", "review-release: [sergeant-dispatch, run-validation, write-claimed-source]", 1)
+			},
+			want: "reason=invalid-declaration",
+		},
+		"stage caller without assignment": {
+			rewrite: func(s string) string {
+				s = strings.Replace(s, "build-api: [sergeant-dispatch, run-validation, write-claimed-source]", "build-api: [sergeant-dispatch, run-validation]", 1)
+				s = strings.Replace(s, "write-guide: [sergeant-dispatch, run-validation, write-claimed-source]", "write-guide: [sergeant-dispatch, run-validation]", 1)
+				return s
 			},
 			want: "reason=invalid-declaration",
 		},

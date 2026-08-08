@@ -33,7 +33,8 @@ starts. Bare executable names resolve through the operator's process `PATH`.
 
 Reference mode validates only the relative `spec.mission` path and never reads
 the referenced file. This includes explicit `missionFormat: reference`; typed
-content is not inferred from filenames or file bodies.
+content is not inferred from filenames or file bodies. An explicitly present
+empty `missionFormat` is invalid.
 
 `missionFormat: declaration-v1alpha1` requires a strict, regular, non-symlink
 mission file no larger than 1 MiB. The declaration schema is
@@ -52,6 +53,8 @@ field must be explicitly present. Ready entry additionally requires the declared
 orchestration effects and complete source/actor authority.
 String fields reject YAML scalar coercion, Git source revisions are full object
 IDs, and `write-claimed-source` is invalid for review stages.
+Every allowed effect must have an effective caller tuple. Disposition-owner
+assumptions govern routes only and therefore require an empty effects list.
 Mutable observation-policy sources and entry stops remain not ready until a
 future source bundle can supply evidence. Failures expose only fixed
 `mode`, `schema`, and `reason` diagnostics.

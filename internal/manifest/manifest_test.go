@@ -56,6 +56,12 @@ func TestLoadRejectsUnsafeOrAmbiguousManifests(t *testing.T) {
 			rewrite: func(s string) string { return strings.Replace(s, "platoon.dev/v1alpha1", "platoon.dev/v2", 1) },
 			want:    "apiVersion",
 		},
+		"explicit empty mission format": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  mission: docs/mission.md", "  mission: docs/mission.md\n  missionFormat: \"\"", 1)
+			},
+			want: "missionFormat",
+		},
 		"cycle": {
 			rewrite: func(s string) string { return strings.Replace(s, "dependsOn: []", "dependsOn: [verify]", 1) },
 			want:    "cycle",

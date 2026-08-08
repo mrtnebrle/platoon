@@ -76,7 +76,8 @@ pre-existing fleet to a stage.
 
 `spec.missionFormat` is optional. Omission or `reference` preserves the original
 path-only behavior: Platoon does not read or sniff the mission file, even when
-its contents look typed. `declaration-v1alpha1` explicitly opts into a strict,
+its contents look typed. An explicitly empty format is invalid.
+`declaration-v1alpha1` explicitly opts into a strict,
 stable-read `platoon.dev/mission/v1alpha1` declaration. `validate`, `plan`, and
 non-applied `start` compile the same deterministic class, output, and sufficiency
 preview. Blocking unknowns and contradictions report `ready: false`; malformed,

@@ -195,7 +195,11 @@ func Load(raw []byte) (*Manifest, error) {
 		return nil, errors.New("multiple YAML documents are not allowed")
 	}
 
-	applyDefaults(&result, defaultFieldPresence(&document))
+	presence := defaultFieldPresence(&document)
+	if presence.missionFormat && result.Spec.MissionFormat == "" {
+		return nil, errors.New("spec.missionFormat must not be empty when present")
+	}
+	applyDefaults(&result, presence)
 	if err := Validate(&result); err != nil {
 		return nil, err
 	}
@@ -205,6 +209,7 @@ func Load(raw []byte) (*Manifest, error) {
 type fieldPresence struct {
 	limits         map[string]bool
 	repoMaxWriters []bool
+	missionFormat  bool
 }
 
 func applyDefaults(m *Manifest, present fieldPresence) {
@@ -673,6 +678,7 @@ func defaultFieldPresence(document *yaml.Node) fieldPresence {
 		root = root.Content[0]
 	}
 	spec := mappingValue(root, "spec")
+	present.missionFormat = mappingValue(spec, "missionFormat") != nil
 	limits := mappingValue(spec, "limits")
 	for _, field := range []string{"implementation", "review", "leaseTTL", "commandTimeout", "maxOutputBytes"} {
 		present.limits[field] = mappingValue(limits, field) != nil

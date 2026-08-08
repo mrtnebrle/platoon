@@ -669,6 +669,15 @@ func validateEffects(value *effects, class string, m *manifest.Manifest) error {
 		if _, err := closedSet("caller", callers, callerRoles); err != nil {
 			return err
 		}
+		effective := false
+		for _, caller := range callers {
+			if caller != "stage" || len(stagesForEffect(value.Stages, effect)) > 0 {
+				effective = true
+			}
+		}
+		if !effective {
+			return errors.New("mission allowed effect has no effective caller tuple")
+		}
 	}
 	for effect := range value.Callers {
 		if !allowed[effect] {
@@ -771,6 +780,9 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 		}
 		if (len(assumption.Effects) == 0 && assumption.Claim != "owner-may-disposition") || hasDuplicates(assumption.Effects) || !allKnown(assumption.Effects, stringSet(effects.Allowed)) {
 			return fmt.Errorf("mission authority assumption %q has effects outside allowed", assumption.ID)
+		}
+		if assumption.Claim == "owner-may-disposition" && len(assumption.Effects) != 0 {
+			return errors.New("mission authority disposition owner must not govern effects")
 		}
 		if assumption.Claim == "actor-may-attempt" {
 			if !callerRoles[assumption.ActorRole] || (assumption.ActorRole == "stage") != (assumption.Stage != "") {

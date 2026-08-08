@@ -134,6 +134,9 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "source", "effects", "claim", "revisionPolicy", "route"],
+      "allOf": [
+        { "if": { "properties": { "claim": { "const": "owner-may-disposition" } }, "required": ["claim"] }, "then": { "properties": { "effects": { "maxItems": 0 } } } }
+      ],
       "properties": {
         "id": { "$ref": "#/$defs/slug" },
         "source": { "$ref": "#/$defs/slug" },
