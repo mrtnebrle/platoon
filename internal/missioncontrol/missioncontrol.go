@@ -22,8 +22,9 @@ const (
 )
 
 var (
-	slugPattern   = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
-	schemaPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/v[0-9]+(?:alpha[0-9]+)?$`)
+	slugPattern         = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	schemaPattern       = regexp.MustCompile(`^[A-Za-z0-9._-]+/v[0-9]+(?:alpha[0-9]+)?$`)
+	fullObjectIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 )
 
 type Preview struct {
@@ -357,6 +358,9 @@ func decode(raw []byte) (*declaration, error) {
 	if err := validateRequiredFields(&document, ""); err != nil {
 		return nil, err
 	}
+	if err := validateYAMLTypes(&document, ""); err != nil {
+		return nil, err
+	}
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
 	var result declaration
@@ -448,6 +452,54 @@ func validateRequiredFields(node *yaml.Node, field string) error {
 		}
 	}
 	return nil
+}
+
+func validateYAMLTypes(node *yaml.Node, field string) error {
+	switch node.Kind {
+	case yaml.DocumentNode:
+		for _, child := range node.Content {
+			if err := validateYAMLTypes(child, field); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			path := node.Content[index].Value
+			if field != "" {
+				path = field + "." + path
+			}
+			if err := validateYAMLTypes(node.Content[index+1], path); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for _, child := range node.Content {
+			if err := validateYAMLTypes(child, field+"[]"); err != nil {
+				return err
+			}
+		}
+	case yaml.ScalarNode:
+		if booleanMissionField(field) {
+			if node.Tag != "!!bool" {
+				return errors.New("mission declaration boolean field has the wrong type")
+			}
+			return nil
+		}
+		if field == "spec.stops[].predicate.value" || field == "spec.stops[].predicate.value[]" {
+			if node.Tag != "!!str" && node.Tag != "!!bool" {
+				return errors.New("mission stop value has the wrong type")
+			}
+			return nil
+		}
+		if node.Tag != "!!str" {
+			return errors.New("mission declaration string field has the wrong type")
+		}
+	}
+	return nil
+}
+
+func booleanMissionField(field string) bool {
+	return field == "spec.unattended.requested" || field == "spec.unknowns[].blocking" || field == "spec.stops[].scope.entry"
 }
 
 func validate(d *declaration, m *manifest.Manifest) error {
@@ -558,6 +610,9 @@ func validateSources(sources []source) (map[string]bool, map[string]bool, error)
 			(source.ObservationPolicy != "" && !safeOpaque(source.ObservationPolicy)) {
 			return nil, nil, fmt.Errorf("mission source %q requires exactly one safe revision or observationPolicy", source.ID)
 		}
+		if source.Kind == "git" && source.Revision != "" && !fullObjectIDPattern.MatchString(source.Revision) {
+			return nil, nil, errors.New("mission git source revision must be a full object ID")
+		}
 		roles[source.Role] = true
 	}
 	return ids, roles, nil
@@ -595,6 +650,9 @@ func validateEffects(value *effects, class string, m *manifest.Manifest) error {
 		for effect := range stageSet {
 			if !allowed[effect] {
 				return fmt.Errorf("mission stage %q uses effect %q outside allowed", stage.ID, effect)
+			}
+			if stage.Mode == manifest.Review && effect == "write-claimed-source" {
+				return errors.New("mission review stage cannot use a write effect")
 			}
 		}
 	}
@@ -747,18 +805,20 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 		}
 	}
 	for _, assumption := range assumptions {
-		if assumption.Claim != "actor-may-attempt" {
-			continue
-		}
-		matched := false
-		for effect, callers := range effects.Callers {
-			if contains(assumption.Effects, effect) && contains(callers, assumption.ActorRole) &&
-				(assumption.ActorRole != "stage" || contains(effects.Stages[assumption.Stage], effect)) {
-				matched = true
+		switch assumption.Claim {
+		case "actor-may-attempt":
+			for _, effect := range assumption.Effects {
+				if !contains(effects.Callers[effect], assumption.ActorRole) ||
+					(assumption.ActorRole == "stage" && !contains(effects.Stages[assumption.Stage], effect)) {
+					return fmt.Errorf("mission authority assumption %q has an unmatched actor effect", assumption.ID)
+				}
 			}
-		}
-		if !matched {
-			return fmt.Errorf("mission authority assumption %q matches no invocation tuple", assumption.ID)
+		case "source-is-authoritative":
+			for _, effect := range assumption.Effects {
+				if !authorityKindAllows(effect, sourceKindsByID[assumption.Source]) {
+					return errors.New("mission authority source kind does not own its effect")
+				}
+			}
 		}
 	}
 	for _, effect := range effects.Allowed {
@@ -823,7 +883,7 @@ func validateContradictions(contradictions []contradiction, sources map[string]b
 	for _, contradiction := range contradictions {
 		if !validSlug(contradiction.ID) || seen[contradiction.ID] || len(contradiction.Sources) < 2 ||
 			hasDuplicates(contradiction.Sources) || !allKnown(contradiction.Sources, sources) || strings.TrimSpace(contradiction.Decision) == "" ||
-			hasControl(contradiction.Decision) || !sources[contradiction.DispositionAuthority] {
+			len(contradiction.Decision) > 512 || hasControl(contradiction.Decision) || !sources[contradiction.DispositionAuthority] {
 			return errors.New("mission contradiction is malformed or unrouted")
 		}
 		seen[contradiction.ID] = true

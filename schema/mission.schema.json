@@ -164,7 +164,7 @@
       "required": ["id", "sources", "decision", "dispositionAuthority"],
       "properties": {
         "id": { "$ref": "#/$defs/slug" },
-        "sources": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/slug" } },
+        "sources": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "$ref": "#/$defs/slug" } },
         "decision": { "type": "string", "minLength": 1, "maxLength": 512 },
         "dispositionAuthority": { "$ref": "#/$defs/slug" }
       }
@@ -218,7 +218,7 @@
         { "required": ["observationPolicy"], "not": { "required": ["revision"] } }
       ],
       "allOf": [
-        { "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "git.object/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "git.object/v1" }, "revision": { "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" } } } },
         { "if": { "properties": { "kind": { "const": "td" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.td-observation/v1" } } } },
         { "if": { "properties": { "kind": { "const": "dagr" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "dagr.capability/v1" } } } },
         { "if": { "properties": { "kind": { "const": "sergeant" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.mission-source/v1" } } } },

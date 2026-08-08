@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,6 +164,12 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 			rewrite: func(s string) string { return strings.Replace(s, "  objective:", "  extra: value\n  objective:", 1) },
 			want:    "reason=unknown-field",
 		},
+		"scalar coercion": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "objective: Deliver a synthetic API and its public guide.", "objective: 123", 1)
+			},
+			want: "reason=invalid-schema",
+		},
 		"missing unattended boolean": {
 			rewrite: func(s string) string { return strings.Replace(s, "    requested: false\n", "", 1) },
 			want:    "reason=invalid-schema",
@@ -301,6 +308,27 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 			},
 			want: "reason=malformed-authority",
 		},
+		"partially unmatched actor assumption": {
+			rewrite: func(s string) string {
+				return strings.Replace(s,
+					"effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation]\n      claim: actor-may-attempt",
+					"effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]\n      claim: actor-may-attempt", 1)
+			},
+			want: "reason=malformed-authority",
+		},
+		"extra wrong-kind source authority": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  unknowns: []", `    - id: wrong-dagr-authority
+      source: mission-policy
+      effects: [dagr-start-run]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+  unknowns: []`, 1)
+			},
+			want: "reason=malformed-authority",
+		},
 		"missing authority effects": {
 			rewrite: func(s string) string {
 				return strings.Replace(s, "      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage]\n", "", 1)
@@ -312,6 +340,18 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 				return strings.Replace(s, "source: dagr-authority", "source: mission-policy", 1)
 			},
 			want: "reason=malformed-authority",
+		},
+		"write effect on review stage": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "review-release: [sergeant-dispatch, run-validation]", "review-release: [sergeant-dispatch, run-validation, write-claimed-source]", 1)
+			},
+			want: "reason=invalid-declaration",
+		},
+		"abbreviated git revision": {
+			rewrite: func(s string) string {
+				return strings.ReplaceAll(s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "v1")
+			},
+			want: "reason=invalid-source",
 		},
 		"unrouted contradiction": {
 			rewrite: func(s string) string {
@@ -549,6 +589,28 @@ func TestValidateReportsUsageWithoutAFile(t *testing.T) {
 	if !strings.Contains(stderr.String(), "--file is required") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
+}
+
+func TestValidateReportsOutputWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := os.ReadFile("../../examples/platoon.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, "platoon.yaml")
+	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := cli.Run([]string{"validate", "--file", manifestPath}, failingWriter{}, &stderr); code != 1 || !strings.Contains(stderr.String(), "write output") {
+		t.Fatalf("validate exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("synthetic write failure")
 }
 
 func writeTypedMissionFixture(t *testing.T, dir, declaration string) string {

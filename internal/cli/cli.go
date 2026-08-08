@@ -73,13 +73,18 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "validate: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "valid: %s\n", m.Metadata.Name)
+	var report strings.Builder
+	fmt.Fprintf(&report, "valid: %s\n", m.Metadata.Name)
 	if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
-		fmt.Fprintf(stdout, "mission: mode=%s schema=%s class=%s ready=%t\n", mission.Mode, mission.Schema, mission.Class, mission.Ready)
-		fmt.Fprintf(stdout, "outputs: %s\n", strings.Join(mission.Outputs, ", "))
+		fmt.Fprintf(&report, "mission: mode=%s schema=%s class=%s ready=%t\n", mission.Mode, mission.Schema, mission.Class, mission.Ready)
+		fmt.Fprintf(&report, "outputs: %s\n", strings.Join(mission.Outputs, ", "))
 		for _, decision := range mission.Sufficiency {
-			fmt.Fprintf(stdout, "sufficiency: %s: %s\n", decision.Status, decision.Reason)
+			fmt.Fprintf(&report, "sufficiency: %s: %s\n", decision.Status, decision.Reason)
 		}
+	}
+	if _, err := io.WriteString(stdout, report.String()); err != nil {
+		fmt.Fprintln(stderr, "validate: write output")
+		return 1
 	}
 	return 0
 }

@@ -50,6 +50,8 @@ disposition route must have exactly one `owner-may-disposition` assumption; and
 effect authority must use the owning adapter source kind. Every schema-required
 field must be explicitly present. Ready entry additionally requires the declared
 orchestration effects and complete source/actor authority.
+String fields reject YAML scalar coercion, Git source revisions are full object
+IDs, and `write-claimed-source` is invalid for review stages.
 Mutable observation-policy sources and entry stops remain not ready until a
 future source bundle can supply evidence. Failures expose only fixed
 `mode`, `schema`, and `reason` diagnostics.
