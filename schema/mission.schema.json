@@ -108,7 +108,13 @@
             "source": { "$ref": "#/$defs/slug" },
             "field": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*(?:\\.[A-Za-z][A-Za-z0-9]*)*$" },
             "operator": { "enum": ["equals", "not_equals", "in", "exists", "quality_is"] },
-            "value": {}
+            "value": {
+              "anyOf": [
+                { "type": "string", "minLength": 1, "maxLength": 256 },
+                { "type": "boolean" },
+                { "type": "array", "minItems": 1, "maxItems": 128, "items": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "boolean" }] } }
+              ]
+            }
           }
         },
         "scope": {
@@ -210,6 +216,16 @@
       "oneOf": [
         { "required": ["revision"], "not": { "required": ["observationPolicy"] } },
         { "required": ["observationPolicy"], "not": { "required": ["revision"] } }
+      ],
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "git.object/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "td" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.td-observation/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "dagr" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "dagr.capability/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "sergeant" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "sergeant.mission-source/v1" } } } },
+        { "if": { "properties": { "kind": { "const": "receiving-system" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.receiving-capability/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "environment-classifier" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.target-proof/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "validation-capability" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.validation-capability/v1alpha1" } } } },
+        { "if": { "properties": { "kind": { "const": "platoon-policy" } }, "required": ["kind"] }, "then": { "properties": { "schema": { "const": "platoon.policy/v1alpha1" } } } }
       ],
       "properties": {
         "id": { "$ref": "#/$defs/slug" },

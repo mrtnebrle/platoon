@@ -38,6 +38,10 @@ func TestPublishedSchemasAcceptTypedExamples(t *testing.T) {
 	if err := missionSchema.Validate(mission); err != nil {
 		t.Fatalf("typed mission fails schema: %v", err)
 	}
+	mission["spec"].(map[string]any)["sources"].([]any)[0].(map[string]any)["schema"] = "git.object/v1"
+	if err := missionSchema.Validate(mission); err == nil {
+		t.Fatal("mission schema accepted a source kind/schema mismatch")
+	}
 }
 
 func TestClaimPathSchemaRuntimeParity(t *testing.T) {

@@ -301,6 +301,15 @@ func classifyDecodeError(err error) string {
 	if strings.Contains(err.Error(), "field ") && strings.Contains(err.Error(), "not found") {
 		return "unknown-field"
 	}
+	if strings.Contains(err.Error(), "mission stop") {
+		return "malformed-stop"
+	}
+	if strings.Contains(err.Error(), "mission contradiction") {
+		return "unrouted-contradiction"
+	}
+	if strings.Contains(err.Error(), "mission authority") {
+		return "malformed-authority"
+	}
 	return "invalid-schema"
 }
 
@@ -343,6 +352,9 @@ func decode(raw []byte) (*declaration, error) {
 		return nil, fmt.Errorf("decode mission declaration: %w", err)
 	}
 	if err := rejectYAMLFeatures(&document); err != nil {
+		return nil, err
+	}
+	if err := validateRequiredFields(&document, ""); err != nil {
 		return nil, err
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
@@ -392,6 +404,52 @@ func rejectYAMLFeatures(node *yaml.Node) error {
 	return nil
 }
 
+func validateRequiredFields(node *yaml.Node, field string) error {
+	if node.Kind == yaml.DocumentNode {
+		if len(node.Content) != 1 {
+			return errors.New("mission declaration must contain one document root")
+		}
+		return validateRequiredFields(node.Content[0], field)
+	}
+	if node.Kind == yaml.SequenceNode {
+		for _, child := range node.Content {
+			if err := validateRequiredFields(child, field+"[]"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	present := map[string]bool{}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := node.Content[index].Value
+		present[key] = true
+		childPath := key
+		if field != "" {
+			childPath = field + "." + key
+		}
+		if err := validateRequiredFields(node.Content[index+1], childPath); err != nil {
+			return err
+		}
+	}
+	for _, required := range requiredFields[field] {
+		if !present[required] {
+			switch {
+			case strings.HasPrefix(field, "spec.stops[]"):
+				return errors.New("mission stop is missing a required field")
+			case field == "spec.contradictions[]":
+				return errors.New("mission contradiction is missing a required field")
+			case field == "spec.authorityAssumptions[]":
+				return errors.New("mission authority assumption is missing a required field")
+			}
+			return errors.New("mission declaration is missing a required field")
+		}
+	}
+	return nil
+}
+
 func validate(d *declaration, m *manifest.Manifest) error {
 	if d.APIVersion != declarationAPIVersion {
 		return fmt.Errorf("mission apiVersion must be %q", declarationAPIVersion)
@@ -431,7 +489,7 @@ func validate(d *declaration, m *manifest.Manifest) error {
 	if err := validateStops(d.Spec.Stops, sourceIDs, sourceKindByID(d.Spec.Sources), d.Spec.Effects, m); err != nil {
 		return err
 	}
-	if err := validateAuthority(d.Spec.AuthorityAssumptions, sourceIDs, d.Spec.Effects, m); err != nil {
+	if err := validateAuthority(d.Spec.AuthorityAssumptions, sourceIDs, sourceKindByID(d.Spec.Sources), sourceRevisionByID(d.Spec.Sources), d.Spec.Effects, m); err != nil {
 		return err
 	}
 	if err := validateUnknowns(d.Spec.Unknowns, sourceIDs); err != nil {
@@ -572,7 +630,8 @@ func validateStops(stops []stop, sources map[string]bool, sourceKindsByID map[st
 			return errors.New("mission stop is malformed")
 		}
 		seen[stop.ID] = true
-		if !stopFields[sourceKindsByID[stop.Predicate.Source]][stop.Predicate.Field] {
+		fieldType, knownField := stopFields[sourceKindsByID[stop.Predicate.Source]][stop.Predicate.Field]
+		if !knownField {
 			return errors.New("mission stop field is not in the source schema")
 		}
 		if stop.Predicate.Operator == "exists" && stop.Predicate.Value != nil {
@@ -582,16 +641,30 @@ func validateStops(stops []stop, sources map[string]bool, sourceKindsByID map[st
 			return fmt.Errorf("mission stop %q predicate requires value", stop.ID)
 		}
 		if stop.Predicate.Operator == "quality_is" {
+			if stop.Predicate.Field != "quality" {
+				return errors.New("mission stop operator does not match the source field")
+			}
 			value, ok := stop.Predicate.Value.(string)
 			if !ok || (value != "verified" && value != "inconclusive" && value != "unavailable") {
 				return errors.New("mission stop quality predicate has an invalid value")
 			}
 		}
+		if stop.Predicate.Field == "quality" && stop.Predicate.Operator != "quality_is" && stop.Predicate.Operator != "exists" {
+			return errors.New("mission stop operator does not match the quality field")
+		}
 		if stop.Predicate.Operator == "in" {
 			values, ok := stop.Predicate.Value.([]any)
-			if !ok || len(values) == 0 {
+			if !ok || len(values) == 0 || len(values) > 128 {
 				return errors.New("mission stop in predicate requires a nonempty list")
 			}
+			for _, value := range values {
+				if !validStopScalar(fieldType, value) {
+					return errors.New("mission stop list value does not match the source field")
+				}
+			}
+		}
+		if (stop.Predicate.Operator == "equals" || stop.Predicate.Operator == "not_equals") && !validStopScalar(fieldType, stop.Predicate.Value) {
+			return errors.New("mission stop value does not match the source field")
 		}
 		for _, effect := range stop.Scope.Effects {
 			if !allowed[effect] {
@@ -610,7 +683,20 @@ func validateStops(stops []stop, sources map[string]bool, sourceKindsByID map[st
 	return nil
 }
 
-func validateAuthority(assumptions []authorityAssumption, sources map[string]bool, effects *effects, m *manifest.Manifest) error {
+func validStopScalar(fieldType string, value any) bool {
+	switch fieldType {
+	case "string":
+		text, ok := value.(string)
+		return ok && text != "" && len(text) <= 256 && !hasControl(text)
+	case "bool":
+		_, ok := value.(bool)
+		return ok
+	default:
+		return false
+	}
+}
+
+func validateAuthority(assumptions []authorityAssumption, sources map[string]bool, sourceKindsByID, sourceRevisions map[string]string, effects *effects, m *manifest.Manifest) error {
 	seen := map[string]bool{}
 	for _, assumption := range assumptions {
 		if !validSlug(assumption.ID) || seen[assumption.ID] || !sources[assumption.Source] || !authorityClaims[assumption.Claim] ||
@@ -621,6 +707,9 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 		if (assumption.RevisionPolicy == "exact") != (assumption.ExpectedRevision != "") ||
 			(assumption.ExpectedRevision != "" && !safeOpaque(assumption.ExpectedRevision)) {
 			return fmt.Errorf("mission authority assumption %q has malformed revision policy", assumption.ID)
+		}
+		if assumption.RevisionPolicy == "exact" && sourceRevisions[assumption.Source] != assumption.ExpectedRevision {
+			return errors.New("mission authority exact revision does not match its source")
 		}
 		if (len(assumption.Effects) == 0 && assumption.Claim != "owner-may-disposition") || hasDuplicates(assumption.Effects) || !allKnown(assumption.Effects, stringSet(effects.Allowed)) {
 			return fmt.Errorf("mission authority assumption %q has effects outside allowed", assumption.ID)
@@ -675,7 +764,7 @@ func validateAuthority(assumptions []authorityAssumption, sources map[string]boo
 	for _, effect := range effects.Allowed {
 		matches := 0
 		for _, assumption := range assumptions {
-			if assumption.Claim == "source-is-authoritative" && contains(assumption.Effects, effect) {
+			if assumption.Claim == "source-is-authoritative" && contains(assumption.Effects, effect) && authorityKindAllows(effect, sourceKindsByID[assumption.Source]) {
 				matches++
 			}
 		}
@@ -788,6 +877,19 @@ func sourceKindByID(sources []source) map[string]string {
 	return result
 }
 
+func sourceRevisionByID(sources []source) map[string]string {
+	result := make(map[string]string, len(sources))
+	for _, source := range sources {
+		result[source.ID] = source.Revision
+	}
+	return result
+}
+
+func authorityKindAllows(effect, kind string) bool {
+	allowed := effectAuthorityKinds[effect]
+	return len(allowed) == 0 || allowed[kind]
+}
+
 func allKnown(values []string, known map[string]bool) bool {
 	for _, value := range values {
 		if !known[value] {
@@ -876,6 +978,23 @@ var outputCategories = func() map[string]struct{} {
 
 var fieldPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$`)
 
+var requiredFields = map[string][]string{
+	"":                            {"apiVersion", "kind", "metadata", "spec"},
+	"metadata":                    {"name"},
+	"spec":                        {"objective", "class", "effects", "stops", "authorityAssumptions", "unknowns", "contradictions", "outputs", "handoffs", "unattended", "sources"},
+	"spec.effects":                {"allowed", "prohibited", "stages", "callers"},
+	"spec.stops[]":                {"id", "predicate", "scope", "route"},
+	"spec.stops[].predicate":      {"source", "field", "operator"},
+	"spec.stops[].scope":          {"entry", "stages", "effects"},
+	"spec.authorityAssumptions[]": {"id", "source", "effects", "claim", "revisionPolicy", "route"},
+	"spec.unknowns[]":             {"id", "question", "blocking", "attemptedSources", "route"},
+	"spec.contradictions[]":       {"id", "sources", "decision", "dispositionAuthority"},
+	"spec.outputs[]":              {"id", "category", "stage", "schema", "evidenceRoles", "gatesOutcome"},
+	"spec.handoffs[]":             {"id", "producer", "consumer", "outputSchema", "evidenceRoles", "outputRole", "compatibility", "freshness", "missing", "incompatible"},
+	"spec.unattended":             {"requested"},
+	"spec.sources[]":              {"id", "kind", "schema", "locator", "role", "reason"},
+}
+
 var sourceKinds = map[string]bool{
 	"git": true, "td": true, "dagr": true, "sergeant": true, "receiving-system": true,
 	"environment-classifier": true, "validation-capability": true, "platoon-policy": true,
@@ -888,15 +1007,15 @@ var sourceSchemas = map[string]string{
 	"platoon-policy": "platoon.policy/v1alpha1",
 }
 
-var stopFields = map[string]map[string]bool{
-	"git":                    {"quality": true, "revision": true, "objectId": true, "repository": true},
-	"td":                     {"quality": true, "revision": true, "observedAt": true},
-	"dagr":                   {"quality": true, "schemaVersion": true, "operations": true},
-	"sergeant":               {"quality": true, "revision": true, "observedAt": true},
-	"receiving-system":       {"quality": true, "authorityRevision": true, "environment": true, "production": true, "destructive": true},
-	"environment-classifier": {"quality": true, "environment": true, "production": true, "destructive": true, "expiresAt": true},
-	"validation-capability":  {"quality": true, "profileDigest": true},
-	"platoon-policy":         {"quality": true, "revision": true},
+var stopFields = map[string]map[string]string{
+	"git":                    {"quality": "string", "revision": "string", "objectId": "string", "repository": "string"},
+	"td":                     {"quality": "string", "revision": "string", "observedAt": "string"},
+	"dagr":                   {"quality": "string", "schemaVersion": "string", "operations": "string"},
+	"sergeant":               {"quality": "string", "revision": "string", "observedAt": "string"},
+	"receiving-system":       {"quality": "string", "authorityRevision": "string", "environment": "string", "production": "bool", "destructive": "bool"},
+	"environment-classifier": {"quality": "string", "environment": "string", "production": "bool", "destructive": "bool", "expiresAt": "string"},
+	"validation-capability":  {"quality": "string", "profileDigest": "string"},
+	"platoon-policy":         {"quality": "string", "revision": "string"},
 }
 
 var effectRegistry = map[string]bool{
@@ -932,6 +1051,21 @@ var classEffectCeilings = map[string]map[string]bool{
 	"operate":          {"receiving-system-operation": true, "request-sergeant-lifecycle": true},
 	"recover":          {"write-claimed-source": true, "receiving-system-operation": true, "request-sergeant-lifecycle": true},
 	"learn":            {},
+}
+
+var effectAuthorityKinds = map[string]map[string]bool{
+	"dagr-load-workflow":           {"dagr": true},
+	"dagr-start-run":               {"dagr": true},
+	"dagr-ack-stage":               {"dagr": true},
+	"sergeant-dispatch":            {"sergeant": true},
+	"sergeant-coordinator-request": {"sergeant": true},
+	"request-sergeant-lifecycle":   {"sergeant": true},
+	"run-validation":               {"validation-capability": true},
+	"write-claimed-source":         {"git": true},
+	"receiving-system-operation":   {"receiving-system": true},
+	"query-authority":              {"receiving-system": true, "environment-classifier": true},
+	"publish-handoff":              {"git": true},
+	"route-finding":                {"td": true, "sergeant": true},
 }
 
 var callerRoles = map[string]bool{"operator": true, "platoon": true, "external-scheduler": true, "stage": true}

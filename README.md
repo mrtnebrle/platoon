@@ -89,8 +89,8 @@ Ready declarations explicitly allow the required Dagr, Sergeant, and validation
 effects within their class ceiling and provide exact actor/source authority
 coverage. Entry stops, mutable sources without an observation bundle, missing
 orchestration effects, and unattended requests are not ready. Source kinds bind
-to closed source schemas; stop fields and disposition owners must resolve
-without ambiguity.
+to closed source schemas; stop fields, typed predicate values, effect-specific
+authority sources, and disposition owners must resolve without ambiguity.
 
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 defines the later sourced cross-repository

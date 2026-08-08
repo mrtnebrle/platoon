@@ -163,6 +163,20 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 			rewrite: func(s string) string { return strings.Replace(s, "  objective:", "  extra: value\n  objective:", 1) },
 			want:    "reason=unknown-field",
 		},
+		"missing unattended boolean": {
+			rewrite: func(s string) string { return strings.Replace(s, "    requested: false\n", "", 1) },
+			want:    "reason=invalid-schema",
+		},
+		"missing unknown boolean": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  unknowns: []", `  unknowns:
+    - id: release-window
+      question: Is entry allowed?
+      attemptedSources: [mission-policy]
+      route: mission-policy`, 1)
+			},
+			want: "reason=invalid-schema",
+		},
 		"unknown effect": {
 			rewrite: func(s string) string { return strings.Replace(s, "dagr-load-workflow", "teleport", 1) },
 			want:    "reason=unknown-effect",
@@ -230,9 +244,72 @@ func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 			},
 			want: "reason=malformed-stop",
 		},
+		"stop operator field mismatch": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  stops: []", `  stops:
+    - id: revision-quality
+      predicate:
+        source: mission-policy
+        field: revision
+        operator: quality_is
+        value: verified
+      scope:
+        entry: false
+        stages: [build-api]
+        effects: []
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-stop",
+		},
+		"stop scalar type mismatch": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  stops: []", `  stops:
+    - id: revision-object
+      predicate:
+        source: mission-policy
+        field: revision
+        operator: equals
+        value: {nested: value}
+      scope:
+        entry: false
+        stages: [build-api]
+        effects: []
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-stop",
+		},
+		"stop mixed list": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "  stops: []", `  stops:
+    - id: revision-list
+      predicate:
+        source: mission-policy
+        field: revision
+        operator: in
+        value: [v1, true]
+      scope:
+        entry: false
+        stages: [build-api]
+        effects: []
+      route: mission-policy`, 1)
+			},
+			want: "reason=malformed-stop",
+		},
 		"malformed authority tuple": {
 			rewrite: func(s string) string {
 				return strings.Replace(s, "actorRole: platoon", "actorRole: nobody", 1)
+			},
+			want: "reason=malformed-authority",
+		},
+		"missing authority effects": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage]\n", "", 1)
+			},
+			want: "reason=malformed-authority",
+		},
+		"wrong authority source kind": {
+			rewrite: func(s string) string {
+				return strings.Replace(s, "source: dagr-authority", "source: mission-policy", 1)
 			},
 			want: "reason=malformed-authority",
 		},
@@ -514,12 +591,33 @@ spec:
       write-claimed-source: [stage]
   stops: []
   authorityAssumptions:
-    - id: mission-authority
-      source: mission-policy
-      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage, sergeant-dispatch, run-validation, write-claimed-source]
+    - id: dagr-authority
+      source: dagr-authority
+      effects: [dagr-load-workflow, dagr-start-run, dagr-ack-stage]
       claim: source-is-authoritative
       revisionPolicy: exact
       expectedRevision: v1
+      route: mission-policy
+    - id: sergeant-authority
+      source: sergeant-authority
+      effects: [sergeant-dispatch]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: validation-authority
+      source: validation-authority
+      effects: [run-validation]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+    - id: git-authority
+      source: git-authority
+      effects: [write-claimed-source]
+      claim: source-is-authoritative
+      revisionPolicy: exact
+      expectedRevision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       route: mission-policy
     - id: platoon-attempt
       source: mission-policy
@@ -573,4 +671,32 @@ spec:
       revision: v1
       role: mission-policy
       reason: Defines the synthetic mission boundary.
+    - id: dagr-authority
+      kind: dagr
+      schema: dagr.capability/v1
+      locator: synthetic-dagr
+      revision: v1
+      role: dagr-authority
+      reason: Defines the synthetic Dagr capability boundary.
+    - id: sergeant-authority
+      kind: sergeant
+      schema: sergeant.mission-source/v1
+      locator: synthetic-sergeant
+      revision: v1
+      role: sergeant-authority
+      reason: Defines the synthetic Sergeant capability boundary.
+    - id: validation-authority
+      kind: validation-capability
+      schema: platoon.validation-capability/v1alpha1
+      locator: synthetic-validation
+      revision: v1
+      role: validation-authority
+      reason: Defines the synthetic validation capability boundary.
+    - id: git-authority
+      kind: git
+      schema: git.object/v1
+      locator: synthetic-repository
+      revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      role: git-authority
+      reason: Defines the synthetic repository boundary.
 `
