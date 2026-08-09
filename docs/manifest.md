@@ -56,12 +56,18 @@ IDs. `write-claimed-source`, `receiving-system-operation`, and
 `request-sergeant-lifecycle` are invalid for review stages.
 Every allowed effect must have an effective caller tuple. Disposition-owner
 assumptions govern routes only and therefore require an empty effects list.
-Mutable observation-policy sources and entry stops remain not ready until a
-future source bundle can supply evidence. Failures expose only fixed
-`mode`, `schema`, and `reason` diagnostics.
+Mutable observation-policy sources and entry stops remain not ready without a
+validated source bundle. `survey --caller <role>` applies the declared
+read/query gate and emits bounded typed observations; `plan --source-bundle`
+consumes those exact bytes offline and emits a reproducible packet preview.
+Failures expose only fixed `mode`, `schema`, and `reason` diagnostics.
 
-This phase is preview-only. Typed `start --apply` refuses before state creation
-or adapter invocation.
+Typed `start --source-bundle <file> --apply` requeries supported declared sources
+and returns `replan_required` if content, revision, quality, or current freshness
+differs. It accepts a later `observedAt` when content identity is unchanged.
+This phase does not publish typed packet/run state or invoke effecting adapters.
+td and Sergeant query sources remain explicitly unsupported until the negotiated
+`SergeantMissionSource` contract exists.
 
 ## Limits
 

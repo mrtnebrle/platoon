@@ -122,6 +122,64 @@ func TestTypedMissionPreviewMatchesValidatePlanAndStartWithoutSideEffects(t *tes
 	}
 }
 
+func TestSurveyProducesBoundedBundleWithoutState(t *testing.T) {
+	declaration := strings.Replace(validTypedMission,
+		"allowed: [dagr-load-workflow", "allowed: [read-source, dagr-load-workflow", 1)
+	declaration = strings.Replace(declaration,
+		"    callers:\n", "    callers:\n      read-source: [operator]\n", 1)
+	declaration = strings.Replace(declaration,
+		"effects: [write-claimed-source]\n      claim: source-is-authoritative",
+		"effects: [read-source, write-claimed-source]\n      claim: source-is-authoritative", 1)
+	declaration = strings.Replace(declaration, "  unknowns: []", `    - id: operator-read
+      source: mission-policy
+      effects: [read-source]
+      claim: actor-may-attempt
+      revisionPolicy: exact
+      expectedRevision: v1
+      route: mission-policy
+      actorRole: operator
+  unknowns: []`, 1)
+	dir := t.TempDir()
+	manifestPath := writeTypedMissionFixture(t, dir, declaration)
+	stateRoot := filepath.Join(dir, "state")
+	var stdout, stderr bytes.Buffer
+	if code := cli.Run([]string{"survey", "--file", manifestPath, "--caller", "operator"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("survey exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"schema": "platoon.source-bundle/v1alpha1"`) ||
+		!strings.Contains(stdout.String(), `"quality": "unsupported"`) {
+		t.Fatalf("survey output=%s", stdout.String())
+	}
+	if _, err := os.Lstat(stateRoot); !os.IsNotExist(err) {
+		t.Fatalf("survey created state: %v", err)
+	}
+}
+
+func TestSurveyAndBundleFlagsPreserveReferenceModeWithoutState(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := os.ReadFile("../../examples/platoon.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, "platoon.yaml")
+	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Join(dir, "state")
+	for _, args := range [][]string{
+		{"survey", "--file", manifestPath, "--caller", "operator"},
+		{"plan", "--file", manifestPath, "--source-bundle", filepath.Join(dir, "missing.json")},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := cli.Run(args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "unsupported") {
+			t.Fatalf("args=%v exit=%d stderr=%q", args, code, stderr.String())
+		}
+		if _, err := os.Lstat(stateRoot); !os.IsNotExist(err) {
+			t.Fatalf("args=%v created state: %v", args, err)
+		}
+	}
+}
+
 func TestTypedMissionFailuresPrecedeStateAndAdapters(t *testing.T) {
 	tests := map[string]struct {
 		rewrite func(string) string

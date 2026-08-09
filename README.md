@@ -46,9 +46,10 @@ platoon start --file examples/platoon.yaml --state .platoon --apply
 | Command | Behavior |
 |---|---|
 | `validate --file <manifest>` | Strictly validates YAML and domain rules without side effects. |
-| `plan --file <manifest>` | Prints deterministic JSON admission decisions and, for typed missions, compilation readiness without reading or mutating adapter state. |
-| `start --file <manifest> [--state <dir>]` | Prints the same read-only admission and typed-mission preview. |
-| `start --file <manifest> [--state <dir>] --apply` | Persists an initializing run, loads/starts the hookless dagr workflow, adopts configured fleets, and dispatches admitted stages. |
+| `survey --file <manifest> --caller <role> [--stage <id>]` | For typed missions, applies the common read/query gate and prints a bounded `platoon.source-bundle/v1alpha1` without Platoon state or effects. Reference missions return unsupported. |
+| `plan --file <manifest> [--source-bundle <file>]` | Prints deterministic JSON admission decisions and, for typed missions, an offline reproducible packet preview when a valid bundle is supplied. It never queries mutable sources. |
+| `start --file <manifest> [--state <dir>] [--source-bundle <file>]` | Prints the same read-only admission and typed-mission packet preview. |
+| `start --file <manifest> [--state <dir>] --apply` | For reference missions, persists and starts the existing run. Typed missions require `--source-bundle` and perform revalidation only; they publish no state or effect in this phase. |
 | `reconcile --run <id> [--state <dir>]` | Prints local durable status as a read-only preview. |
 | `reconcile --run <id> [--state <dir>] --apply` | Runs one bounded reconciliation cycle. |
 | `reconcile --run <id> --apply --poll <duration> [--max-cycles <n>]` | Runs explicit bounded polling. The interval is 100 ms through 1 hour; cycles default to 60 and must be 1 through 10000. |
@@ -83,18 +84,35 @@ non-applied `start` compile the same deterministic class, output, and sufficienc
 preview. Blocking unknowns and contradictions report `ready: false`; malformed,
 missing, changed, symlinked, or oversized declarations fail closed. Preview
 diagnostics contain only bounded mode/schema/reason identifiers, never mission
-bodies or resolved private paths. Typed applied start is intentionally disabled
-until immutable packet state is implemented in a later phase.
+bodies or resolved private paths. Typed applied start requires
+`--source-bundle`, recompiles the packet, and requeries declared sources before
+any state or effect. It returns `replan_required` when schema, revision, quality,
+content identity, or freshness differs. Matching content observed later is
+accepted because `observedAt` is provenance rather than content. This phase
+validates only; durable typed packet and run publication remains disabled.
 
 Ready declarations explicitly allow the required Dagr, Sergeant, and validation
 effects within their class ceiling and provide exact actor/source authority
-coverage. Entry stops, mutable sources without an observation bundle, missing
-orchestration effects, and unattended requests are not ready. Source kinds bind
+coverage. Survey additionally requires declared `read-source` or
+`query-authority` permission for the exact caller and stage. Entry stops,
+mutable sources without an observation bundle, missing orchestration effects,
+and unattended requests are not ready. Source kinds bind
 to closed source schemas; stop fields, typed predicate values, effect-specific
 authority sources, and disposition owners must resolve without ambiguity.
 String and boolean YAML types are explicit, Git authority uses full object IDs,
 and read-only review stages cannot receive source-write, receiving-system, or
 Sergeant lifecycle effects.
+
+Source bundles contain only schema-validated typed observations, sorted source
+identities, quality/revision/freshness metadata, and domain-separated canonical
+SHA-256 identities. `contentDigest` excludes collection time;
+`envelopeDigest` and bundle identity include it; `contentSetDigest` binds the
+ordered content identities. Nulls, duplicate or undeclared sources, unknown
+schemas or fields, future pre-start Dagr run/stage identities, secret-like or
+raw-body fields, absolute paths, stale evidence, and observations over 1 MiB are
+rejected. td and Sergeant observations use only the negotiated
+`SergeantMissionSource` seam and currently report `unsupported`; Platoon never
+traverses td or fleet state to emulate it.
 
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 defines the later sourced cross-repository

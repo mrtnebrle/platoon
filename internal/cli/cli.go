@@ -26,6 +26,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "validate":
 		return runValidate(args[1:], stdout, stderr)
+	case "survey":
+		return runSurvey(args[1:], stdout, stderr)
 	case "plan":
 		return runPlan(args[1:], stdout, stderr)
 	case "start":
@@ -46,6 +48,43 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+}
+
+func runSurvey(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("survey", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	file := flags.String("file", "", "manifest YAML file")
+	caller := flags.String("caller", "", "mission caller role")
+	stage := flags.String("stage", "", "stage ID for a stage caller")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *file == "" || *caller == "" {
+		fmt.Fprintln(stderr, "survey: --file and --caller are required")
+		return 2
+	}
+	m, err := manifest.LoadFile(*file)
+	if err != nil {
+		fmt.Fprintf(stderr, "survey: %v\n", err)
+		return 1
+	}
+	runtimeManifest, err := manifest.ResolveRuntimePaths(m, *file)
+	if err != nil {
+		fmt.Fprintf(stderr, "survey: %v\n", err)
+		return 1
+	}
+	bundle, err := missioncontrol.Survey(context.Background(), missioncontrol.SurveyInput{
+		Manifest: m, ManifestFile: *file, CallerRole: *caller, Stage: *stage,
+	}, adapter.NewMissionSourceRegistry(runtimeManifest, adapter.OSExecutor{}, nil))
+	if err != nil {
+		fmt.Fprintf(stderr, "survey: %v\n", err)
+		return 1
+	}
+	if err := writeJSON(stdout, bundle); err != nil {
+		fmt.Fprintf(stderr, "survey: write output: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runValidate(args []string, stdout, stderr io.Writer) int {
@@ -93,6 +132,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	file := flags.String("file", "", "manifest YAML file")
+	bundleFile := flags.String("source-bundle", "", "immutable source survey bundle")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -109,7 +149,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
 	}
-	mission, err := missioncontrol.Compile(m, *file)
+	mission, err := compileMissionPreview(m, *file, *bundleFile, nil, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
@@ -138,6 +178,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	file := flags.String("file", "", "manifest YAML file")
 	stateRoot := flags.String("state", ".platoon", "Platoon state root")
 	apply := flags.Bool("apply", false, "create the dagr run and dispatch admitted stages")
+	bundleFile := flags.String("source-bundle", "", "immutable source survey bundle")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -154,7 +195,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
 	}
-	mission, err := missioncontrol.Compile(m, *file)
+	var bundleBytes []byte
+	if *bundleFile != "" && m.Spec.MissionFormat == manifest.MissionDeclarationV1Alpha1 {
+		bundleBytes, err = missioncontrol.ReadSourceBundleFile(*bundleFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "start: %v\n", err)
+			return 1
+		}
+	}
+	mission, err := compileMissionPreview(m, *file, *bundleFile, bundleBytes, *apply)
 	if err != nil {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
@@ -175,8 +224,35 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if mission.Mode == manifest.MissionDeclarationV1Alpha1 {
-		fmt.Fprintln(stderr, "start: typed mission apply is not available in declaration preview mode")
-		return 1
+		if *bundleFile == "" || mission.Packet == nil || !mission.Ready {
+			fmt.Fprintln(stderr, "start: typed mission apply requires a ready compiled source bundle")
+			return 1
+		}
+		runtimeManifest, err := manifest.ResolveRuntimePaths(m, *file)
+		if err != nil {
+			fmt.Fprintf(stderr, "start: %v\n", err)
+			return 1
+		}
+		result, err := missioncontrol.Revalidate(context.Background(), missioncontrol.RevalidateInput{
+			Manifest: m, ManifestFile: *file, BundleBytes: bundleBytes, CallerRole: "platoon", ExpectedIntentRevision: mission.Packet.IntentRevision,
+		}, adapter.NewMissionSourceRegistry(runtimeManifest, adapter.OSExecutor{}, nil))
+		if err != nil {
+			fmt.Fprintf(stderr, "start: %v\n", err)
+			return 1
+		}
+		if err := writeJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "start: write revalidation: %v\n", err)
+			return 1
+		}
+		if result.Status != missioncontrol.RevalidationValidated {
+			fmt.Fprintln(stderr, "start: source revalidation requires a new plan")
+			return 1
+		}
+		if result.BundleID != mission.Packet.BundleID || result.ContentSetDigest != mission.Packet.ContentSetDigest {
+			fmt.Fprintln(stderr, "start: source revalidation does not match the compiled packet")
+			return 1
+		}
+		return 0
 	}
 	runtimeManifest, manifestPath, intentPath, err := resolveRuntimeManifest(m, *file)
 	if err != nil {
@@ -208,6 +284,26 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string, bundleBytes []byte, forApply bool) (missioncontrol.Preview, error) {
+	if bundleFile == "" {
+		return missioncontrol.Compile(m, manifestFile)
+	}
+	if m.Spec.MissionFormat != manifest.MissionDeclarationV1Alpha1 {
+		return missioncontrol.Preview{}, fmt.Errorf("source bundles are unsupported for reference missions")
+	}
+	if bundleBytes == nil {
+		var err error
+		bundleBytes, err = missioncontrol.ReadSourceBundleFile(bundleFile)
+		if err != nil {
+			return missioncontrol.Preview{}, err
+		}
+	}
+	if forApply {
+		return missioncontrol.CompileForApply(m, manifestFile, bundleBytes)
+	}
+	return missioncontrol.CompileWithBundle(m, manifestFile, bundleBytes, time.Now().UTC())
 }
 
 func runReconcile(args []string, stdout, stderr io.Writer) int {
@@ -483,5 +579,5 @@ func writeJSON(writer io.Writer, value any) error {
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: platoon <validate|plan|start|reconcile|status|drain|resume> [options]")
+	fmt.Fprintln(writer, "usage: platoon <validate|survey|plan|start|reconcile|status|drain|resume> [options]")
 }
