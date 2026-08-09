@@ -71,6 +71,7 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 		base.Revision = objectID
 		base.Payload = map[string]any{"repository": query.Locator, "objectId": objectID}
 	case "dagr":
+		base.AdapterVersion = "dagr-unavailable-v1"
 		executable, err := inspectExecutable(s.manifest.Spec.Adapters.Dagr.Executable)
 		if err != nil {
 			return unavailableObservation(base), nil

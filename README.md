@@ -112,7 +112,9 @@ schemas or fields, future pre-start Dagr run/stage identities, secret-like or
 raw-body fields, absolute paths, stale evidence, and observations over 1 MiB are
 rejected. td and Sergeant observations use only the negotiated
 `SergeantMissionSource` seam and currently report `unsupported`; Platoon never
-traverses td or fleet state to emulate it.
+traverses td or fleet state to emulate it. Missing or incompatible Dagr
+executables produce a valid `unavailable` observation rather than an inferred
+capability or a malformed bundle.
 
 The [Atlas-inspired Mission Control PRD](docs/atlas-mission-control-prd.md)
 defines the later sourced cross-repository

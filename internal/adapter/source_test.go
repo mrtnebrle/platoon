@@ -155,6 +155,23 @@ func TestMissionSourcesRejectDagrExecutableChangeDuringCapabilityQuery(t *testin
 	}
 }
 
+func TestMissionSourcesReturnValidUnavailableDagrEnvelope(t *testing.T) {
+	m := &manifest.Manifest{Spec: manifest.Spec{
+		Limits:   manifest.Limits{CommandTimeout: "1s"},
+		Adapters: manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: "missing-dagr", Database: "missing.db", InspectExecutable: "sqlite3"}},
+	}}
+	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{}}
+	observation, err := sources.Query(context.Background(), missioncontrol.SourceQuery{
+		SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr", ExpectedRevision: "v1",
+	})
+	if err != nil || observation.Quality != missioncontrol.QualityUnavailable {
+		t.Fatalf("unavailable Dagr observation=%#v err=%v", observation, err)
+	}
+	if _, err := missioncontrol.NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", []missioncontrol.SourceObservation{observation}); err != nil {
+		t.Fatalf("unavailable Dagr envelope is invalid: %v", err)
+	}
+}
+
 func TestDagrHelpRejectsMalformedCommandEvidence(t *testing.T) {
 	for name, raw := range map[string]string{
 		"duplicate":   "Manage workflows\n\nUsage:\n  dagr workflow [command]\n\nAvailable Commands:\n  load first\n  load second\n\n",
