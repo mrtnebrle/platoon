@@ -635,7 +635,52 @@ func (s *TypedRunStore) buildRecoveryChain(runID string, pointer runPointer, bas
 	if err != nil {
 		return recoveryChain{}, err
 	}
-	return recoveryChain{quarantine: quarantine, repair: repair}, nil
+	chain := recoveryChain{quarantine: quarantine, repair: repair}
+	if err := s.preflightRecoveryDestinations(runID, chain); err != nil {
+		return recoveryChain{}, err
+	}
+	return chain, nil
+}
+
+func (s *TypedRunStore) preflightRecoveryDestinations(runID string, chain recoveryChain) error {
+	for _, candidate := range []struct {
+		kind   string
+		digest string
+		value  any
+	}{
+		{"events", chain.quarantine.event.Digest, chain.quarantine.event},
+		{"transitions", chain.quarantine.commit.Digest, chain.quarantine.commit},
+		{"events", chain.repair.event.Digest, chain.repair.event},
+		{"transitions", chain.repair.commit.Digest, chain.repair.commit},
+	} {
+		if err := s.preflightImmutableDestination(runID, candidate.kind, candidate.digest, candidate.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *TypedRunStore) preflightImmutableDestination(runID, kind, digest string, value any) error {
+	limit, err := typedObjectLimit(kind)
+	if err != nil {
+		return err
+	}
+	want, err := canonicalJSON(value)
+	if err != nil || len(want) > limit {
+		return errors.New("typed recovery destination is invalid")
+	}
+	path := filepath.Join(s.runDir(runID), "objects", kind, digest+".json")
+	existing, err := readBoundedRegularLimit(path, limit)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(existing, want) {
+		return errors.New("typed recovery destination conflicts with existing bytes")
+	}
+	return nil
 }
 
 func (s *TypedRunStore) buildQuarantineCandidate(runID string, pointer runPointer, base transitionCommit) (transitionCandidate, error) {

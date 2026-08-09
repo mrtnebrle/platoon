@@ -238,7 +238,8 @@ the invalid state, skips a generation, or chooses an orphan descendant. Retrying
 the original recovery fence resumes its own quarantine or returns its completed
 repair. Counter overflow, nonadjacent recovery, and an invalid generated
 candidate are rejected before object or pointer publication; quarantine and its
-mandatory repair are preflighted together before either generation is written.
+mandatory repair are preflighted together, including immutable destination byte
+compatibility, before either generation is written.
 Publication is refused before creating run files unless a trusted verifier
 recognizes rollback metadata that pins a creation-disabled artifact and its
 synthetic compatibility-fixture digest for the typed schema.

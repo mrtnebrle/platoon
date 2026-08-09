@@ -421,6 +421,68 @@ func TestRecoveryChainPreflightRejectsSecondStepCounterOverflowWithoutWrites(t *
 	})
 }
 
+func TestRecoveryChainPreflightRejectsImmutableDestinationConflictsWithoutWrites(t *testing.T) {
+	for _, target := range []string{"quarantine event", "quarantine transition", "repair event", "repair transition"} {
+		t.Run(target, func(t *testing.T) {
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+			genesis, err := store.PublishGenesis(testGenesisInput(t, "destination-conflict"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var base transitionCommit
+			if err := store.readObject("destination-conflict", "transitions", genesis.Fence.TransitionDigest, &base); err != nil {
+				t.Fatal(err)
+			}
+			invalid := runPointer{
+				Schema: runPointerSchema, RunID: "destination-conflict",
+				Current: TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+				Previous: &TransitionReference{
+					Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+					ResultingStateDigest: genesis.State.ResultingStateDigest,
+				},
+			}
+			chain, err := store.buildRecoveryChain("destination-conflict", invalid, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kind, digest := "events", chain.quarantine.event.Digest
+			switch target {
+			case "quarantine transition":
+				kind, digest = "transitions", chain.quarantine.commit.Digest
+			case "repair event":
+				kind, digest = "events", chain.repair.event.Digest
+			case "repair transition":
+				kind, digest = "transitions", chain.repair.commit.Digest
+			}
+			conflictPath := filepath.Join(store.runDir("destination-conflict"), "objects", kind, digest+".json")
+			if err := os.WriteFile(conflictPath, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeTestPointer(t, store.pointerPath("destination-conflict"), invalid)
+			pointerBefore, err := os.ReadFile(store.pointerPath("destination-conflict"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			eventsPath := filepath.Join(store.runDir("destination-conflict"), "objects", "events")
+			transitionsPath := filepath.Join(store.runDir("destination-conflict"), "objects", "transitions")
+			eventsBefore, _ := os.ReadDir(eventsPath)
+			transitionsBefore, _ := os.ReadDir(transitionsPath)
+			if _, err := store.Recover("destination-conflict", TypedRunFence{Generation: 2, TransitionDigest: invalid.Current.TransitionDigest}); err == nil {
+				t.Fatal("conflicting recovery destination was accepted")
+			}
+			pointerAfter, err := os.ReadFile(store.pointerPath("destination-conflict"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			eventsAfter, _ := os.ReadDir(eventsPath)
+			transitionsAfter, _ := os.ReadDir(transitionsPath)
+			if !bytes.Equal(pointerBefore, pointerAfter) || len(eventsBefore) != len(eventsAfter) || len(transitionsBefore) != len(transitionsAfter) {
+				t.Fatal("destination conflict changed recovery authority or objects")
+			}
+		})
+	}
+}
+
 func TestTypedRunPublishesFencedEffectDisabledSuccessorAndRetriesExactly(t *testing.T) {
 	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "successor-run"))
