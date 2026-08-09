@@ -93,7 +93,7 @@ func surveyValidated(ctx context.Context, d *declaration, declarationBytes []byt
 			return SourceBundle{}, fmt.Errorf("source survey: source=%s reason=query-failed", declared.ID)
 		}
 		if observation.SourceID != declared.ID || observation.Kind != declared.Kind || observation.Schema != declared.Schema ||
-			(declared.Revision != "" && observation.Revision != declared.Revision) {
+			!sourceMatchesDeclaration(declared, observation) {
 			return SourceBundle{}, fmt.Errorf("source survey: source=%s reason=mismatched-observation", declared.ID)
 		}
 		observation.FreshnessPolicy = declared.ObservationPolicy
@@ -106,7 +106,11 @@ func surveyValidated(ctx context.Context, d *declaration, declarationBytes []byt
 	if err != nil {
 		return SourceBundle{}, errors.New("source survey catalog cannot be canonicalized")
 	}
-	return NewSourceBundle(sha256Hex(declarationBytes), catalogDigest, callerRole, surveyQueryScope(callerRole, stage), observations)
+	declarationDigest, err := declarationIdentity(declarationBytes)
+	if err != nil {
+		return SourceBundle{}, errors.New("source survey declaration cannot be canonicalized")
+	}
+	return NewSourceBundle(declarationDigest, catalogDigest, callerRole, surveyQueryScope(callerRole, stage), observations)
 }
 
 func gateSurvey(d *declaration, callerRole, stage string) error {
@@ -116,11 +120,6 @@ func gateSurvey(d *declaration, callerRole, stage string) error {
 	for _, unknown := range d.Spec.Unknowns {
 		if unknown.Blocking {
 			return errors.New("source survey gate refused a blocking unknown")
-		}
-	}
-	for _, stop := range d.Spec.Stops {
-		if stop.Scope.Entry {
-			return errors.New("source survey gate refused an active entry stop")
 		}
 	}
 	allowed := stringSet(d.Spec.Effects.Allowed)

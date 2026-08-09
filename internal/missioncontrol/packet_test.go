@@ -77,7 +77,7 @@ func TestCompileWithBundleReturnsNotReadyForMismatchedOrInconclusiveSource(t *te
 }
 
 func TestStopMatchesObservationQualityOutsidePayload(t *testing.T) {
-	observation := SourceObservation{Quality: QualityVerified, Payload: map[string]any{"policyDigest": "stable"}}
+	observation := SourceObservation{Quality: QualityVerified, Payload: map[string]any{"policyDigest": strings.Repeat("a", 64)}}
 	if stopMatches(stopPredicate{Field: "quality", Operator: "quality_is", Value: "unavailable"}, observation) {
 		t.Fatal("verified observation activated unavailable-quality stop")
 	}
@@ -93,6 +93,73 @@ func TestPacketNormalizationSortsNestedSchemaSets(t *testing.T) {
 	rightJSON, _ := canonicalJSON(normalizePacketValue(right, ""))
 	if string(leftJSON) != string(rightJSON) {
 		t.Fatalf("nested set order changed canonical packet: %s != %s", leftJSON, rightJSON)
+	}
+}
+
+func TestDeclarationIdentityIgnoresEquivalentMapAndSetOrder(t *testing.T) {
+	left, err := declarationIdentity([]byte("spec:\n  effects:\n    allowed: [read-source, query-authority]\nmetadata:\n  name: synthetic\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := declarationIdentity([]byte("metadata:\n  name: synthetic\nspec:\n  effects:\n    allowed: [query-authority, read-source]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != right {
+		t.Fatalf("equivalent declaration identities differ: %s != %s", left, right)
+	}
+}
+
+func TestCompileBindsFreshnessPolicyAndGitPayload(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "examples", "platoon-typed.yaml")
+	m, err := manifest.LoadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := bundleForManifest(t, m, manifestPath, "2026-08-08T10:00:00Z")
+	for index := range bundle.Observations {
+		if bundle.Observations[index].Kind == "git" {
+			bundle.Observations[index].Payload["repository"] = "different-repository"
+		}
+	}
+	bundle, err = NewSourceBundle(bundle.DeclarationDigest, bundle.SourceCatalogDigest, bundle.CallerRole, bundle.QueryScope, bundle.Observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(bundle)
+	preview, err := CompileWithBundle(m, manifestPath, raw, time.Date(2026, 8, 8, 10, 1, 0, 0, time.UTC))
+	if err != nil || preview.Ready || preview.Packet != nil {
+		t.Fatalf("mismatched Git preview=%#v err=%v", preview, err)
+	}
+}
+
+func TestCompileRejectsSubstitutedFreshnessAndCallerScope(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "examples", "platoon-typed.yaml")
+	m, err := manifest.LoadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := bundleForManifest(t, m, manifestPath, "2026-08-08T10:00:00Z")
+	bundle.Observations[0].FreshnessPolicy = "max-age:5m"
+	bundle, err = NewSourceBundle(bundle.DeclarationDigest, bundle.SourceCatalogDigest, bundle.CallerRole, bundle.QueryScope, bundle.Observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(bundle)
+	preview, err := CompileWithBundle(m, manifestPath, raw, time.Date(2026, 8, 8, 10, 1, 0, 0, time.UTC))
+	if err != nil || preview.Ready {
+		t.Fatalf("substituted freshness preview=%#v err=%v", preview, err)
+	}
+
+	bundle = bundleForManifest(t, m, manifestPath, "2026-08-08T10:00:00Z")
+	bundle, err = NewSourceBundle(bundle.DeclarationDigest, bundle.SourceCatalogDigest, "operator", "entry-platoon", bundle.Observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = json.Marshal(bundle)
+	preview, err = CompileWithBundle(m, manifestPath, raw, time.Date(2026, 8, 8, 10, 1, 0, 0, time.UTC))
+	if err != nil || preview.Ready {
+		t.Fatalf("cross-scope preview=%#v err=%v", preview, err)
 	}
 }
 
@@ -119,7 +186,11 @@ func bundleForManifest(t *testing.T, m *manifest.Manifest, manifestPath, observe
 			Payload: testPayload(declared.Kind, strings.Repeat("a", 64)),
 		})
 	}
-	bundle, err := NewSourceBundle(sha256Hex(raw), catalogDigest, "operator", "entry-operator", observations)
+	declarationDigest, err := declarationIdentity(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := NewSourceBundle(declarationDigest, catalogDigest, "operator", "entry-operator", observations)
 	if err != nil {
 		t.Fatal(err)
 	}

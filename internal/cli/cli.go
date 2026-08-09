@@ -68,9 +68,14 @@ func runSurvey(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "survey: %v\n", err)
 		return 1
 	}
+	runtimeManifest, err := manifest.ResolveRuntimePaths(m, *file)
+	if err != nil {
+		fmt.Fprintf(stderr, "survey: %v\n", err)
+		return 1
+	}
 	bundle, err := missioncontrol.Survey(context.Background(), missioncontrol.SurveyInput{
 		Manifest: m, ManifestFile: *file, CallerRole: *caller, Stage: *stage,
-	}, missioncontrol.SourceRegistry{})
+	}, adapter.NewMissionSourceRegistry(runtimeManifest, adapter.OSExecutor{}, nil))
 	if err != nil {
 		fmt.Fprintf(stderr, "survey: %v\n", err)
 		return 1
@@ -144,7 +149,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
 	}
-	mission, err := compileMissionPreview(m, *file, *bundleFile)
+	mission, err := compileMissionPreview(m, *file, *bundleFile, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
@@ -190,7 +195,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
 	}
-	mission, err := compileMissionPreview(m, *file, *bundleFile)
+	mission, err := compileMissionPreview(m, *file, *bundleFile, *apply)
 	if err != nil {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
@@ -220,9 +225,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "start: %v\n", err)
 			return 1
 		}
+		runtimeManifest, err := manifest.ResolveRuntimePaths(m, *file)
+		if err != nil {
+			fmt.Fprintf(stderr, "start: %v\n", err)
+			return 1
+		}
 		result, err := missioncontrol.Revalidate(context.Background(), missioncontrol.RevalidateInput{
 			Manifest: m, ManifestFile: *file, BundleBytes: bundleBytes, CallerRole: "platoon",
-		}, missioncontrol.SourceRegistry{})
+		}, adapter.NewMissionSourceRegistry(runtimeManifest, adapter.OSExecutor{}, nil))
 		if err != nil {
 			fmt.Fprintf(stderr, "start: %v\n", err)
 			return 1
@@ -269,7 +279,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string) (missioncontrol.Preview, error) {
+func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string, forApply bool) (missioncontrol.Preview, error) {
 	if bundleFile == "" {
 		return missioncontrol.Compile(m, manifestFile)
 	}
@@ -279,6 +289,9 @@ func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string
 	bundleBytes, err := missioncontrol.ReadSourceBundleFile(bundleFile)
 	if err != nil {
 		return missioncontrol.Preview{}, err
+	}
+	if forApply {
+		return missioncontrol.CompileForApply(m, manifestFile, bundleBytes)
 	}
 	return missioncontrol.CompileWithBundle(m, manifestFile, bundleBytes, time.Now().UTC())
 }

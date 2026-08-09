@@ -27,6 +27,14 @@ type PacketPreview struct {
 }
 
 func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []byte, evaluatedAt time.Time) (Preview, error) {
+	return compileWithBundle(m, manifestFile, bundleBytes, evaluatedAt, true)
+}
+
+func CompileForApply(m *manifest.Manifest, manifestFile string, bundleBytes []byte) (Preview, error) {
+	return compileWithBundle(m, manifestFile, bundleBytes, time.Time{}, false)
+}
+
+func compileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []byte, evaluatedAt time.Time, checkFreshness bool) (Preview, error) {
 	preview, err := Compile(m, manifestFile)
 	if err != nil || preview.Mode != manifest.MissionDeclarationV1Alpha1 {
 		return preview, err
@@ -39,7 +47,12 @@ func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []
 	if err != nil {
 		return Preview{}, compileFailure(classifyDecodeError(err))
 	}
-	bundle, err := DecodeSourceBundle(bundleBytes, evaluatedAt)
+	var bundle SourceBundle
+	if checkFreshness {
+		bundle, err = DecodeSourceBundle(bundleBytes, evaluatedAt)
+	} else {
+		bundle, err = decodeSourceBundleIdentity(bundleBytes)
+	}
 	if err != nil {
 		return notReadyPreview(preview, bundleReason(err)), nil
 	}
@@ -47,8 +60,12 @@ func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []
 	if err != nil {
 		return Preview{}, compileFailure("invalid-source")
 	}
-	if bundle.DeclarationDigest != sha256Hex(declarationBytes) || bundle.SourceCatalogDigest != catalogDigest {
+	declarationDigest, err := declarationIdentity(declarationBytes)
+	if err != nil || bundle.DeclarationDigest != declarationDigest || bundle.SourceCatalogDigest != catalogDigest {
 		return notReadyPreview(preview, "source bundle does not match the declaration"), nil
+	}
+	if !bundleScopeValid(bundle.CallerRole, bundle.QueryScope) {
+		return notReadyPreview(preview, "source bundle caller provenance is invalid"), nil
 	}
 
 	observed := make(map[string]SourceObservation, len(bundle.Observations))
@@ -59,7 +76,7 @@ func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []
 	for _, declared := range d.Spec.Sources {
 		observation, ok := observed[declared.ID]
 		if !ok || observation.Kind != declared.Kind || observation.Schema != declared.Schema ||
-			(declared.Revision != "" && observation.Revision != declared.Revision) {
+			observation.FreshnessPolicy != declared.ObservationPolicy || !sourceMatchesDeclaration(declared, observation) {
 			reasons = append(reasons, "source "+declared.ID+" is absent or mismatched")
 			continue
 		}
@@ -108,6 +125,14 @@ func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []
 	return preview, nil
 }
 
+func declarationIdentity(raw []byte) (string, error) {
+	value, err := yamlValue(raw)
+	if err != nil {
+		return "", err
+	}
+	return canonicalDigest("platoon.normalized-declaration/v1alpha1", normalizePacketValue(value, ""))
+}
+
 func compilePacket(m *manifest.Manifest, declarationBytes []byte, d *declaration, manifestBytes, intentBytes []byte, bundle SourceBundle) (PacketPreview, error) {
 	manifestValue, err := jsonValue(m)
 	if err != nil {
@@ -129,14 +154,44 @@ func compilePacket(m *manifest.Manifest, declarationBytes []byte, d *declaration
 		Schema: PacketSchema, ManifestSourceDigest: sha256Hex(manifestBytes), DeclarationSourceDigest: sha256Hex(declarationBytes),
 		IntentRevision: sha256Hex(intentBytes), IntentMediaType: mediaType, BundleID: bundle.BundleID, ContentSetDigest: bundle.ContentSetDigest,
 	}
+	manifestDigest, err := canonicalDigest("platoon.normalized-manifest/v1alpha1", manifestValue)
+	if err != nil {
+		return PacketPreview{}, err
+	}
+	declarationDigest, err := canonicalDigest("platoon.normalized-declaration/v1alpha1", declarationValue)
+	if err != nil {
+		return PacketPreview{}, err
+	}
 	envelope := map[string]any{
 		"schema": PacketSchema, "manifest": manifestValue, "declaration": declarationValue,
-		"manifestSourceDigest": packet.ManifestSourceDigest, "declarationSourceDigest": packet.DeclarationSourceDigest,
+		"manifestDigest": manifestDigest, "declarationDigest": declarationDigest,
 		"intentRevision": packet.IntentRevision, "intentMediaType": packet.IntentMediaType,
 		"handoffs": spec["handoffs"], "sources": spec["sources"], "bundleId": packet.BundleID, "contentSetDigest": packet.ContentSetDigest,
 	}
 	packet.ID, err = canonicalDigest(PacketSchema, envelope)
 	return packet, err
+}
+
+func sourceMatchesDeclaration(declared source, observation SourceObservation) bool {
+	if declared.Revision != "" && observation.Revision != declared.Revision {
+		return false
+	}
+	if observation.Quality != QualityVerified {
+		return true
+	}
+	if declared.Kind == "git" {
+		repository, repositoryOK := observation.Payload["repository"].(string)
+		objectID, objectOK := observation.Payload["objectId"].(string)
+		return repositoryOK && objectOK && repository == declared.Locator && objectID == declared.Revision
+	}
+	return true
+}
+
+func bundleScopeValid(callerRole, queryScope string) bool {
+	if callerRole != "stage" {
+		return queryScope == surveyQueryScope(callerRole, "")
+	}
+	return strings.HasPrefix(queryScope, "stage-") && strings.HasSuffix(queryScope, "-stage") && len(queryScope) > len("stage--stage")
 }
 
 func sourceCatalogDigest(sources []source) (string, error) {

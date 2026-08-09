@@ -7,16 +7,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gowebpki/jcs"
 )
 
 const (
 	SourceBundleSchema = "platoon.source-bundle/v1alpha1"
 	maxObservationSize = 1 << 20
+	maxBundleSize      = 4 << 20
+)
+
+var (
+	windowsAbsolutePath = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
+	digestPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 type SourceQuality string
@@ -84,11 +93,23 @@ func NewSourceBundle(declarationDigest, catalogDigest, callerRole, queryScope st
 	}
 	result.ContentSetDigest, _ = canonicalDigest("platoon.source-content-set/v1alpha1", contentSet)
 	result.BundleID, _ = canonicalDigest(SourceBundleSchema, result)
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded) > maxBundleSize {
+		return SourceBundle{}, errors.New("source bundle exceeds its aggregate size limit")
+	}
 	return result, nil
 }
 
 func DecodeSourceBundle(raw []byte, evaluatedAt time.Time) (SourceBundle, error) {
-	if len(raw) == 0 || len(raw) > 4<<20 {
+	return decodeSourceBundle(raw, evaluatedAt, true)
+}
+
+func decodeSourceBundleIdentity(raw []byte) (SourceBundle, error) {
+	return decodeSourceBundle(raw, time.Time{}, false)
+}
+
+func decodeSourceBundle(raw []byte, evaluatedAt time.Time, checkFreshness bool) (SourceBundle, error) {
+	if len(raw) == 0 || len(raw) > maxBundleSize {
 		return SourceBundle{}, errors.New("source bundle size is invalid")
 	}
 	if _, err := parseStrictJSON(raw); err != nil {
@@ -114,21 +135,48 @@ func DecodeSourceBundle(raw []byte, evaluatedAt time.Time) (SourceBundle, error)
 			supplied.Observations[index].EnvelopeDigest != rebuilt.Observations[index].EnvelopeDigest {
 			return SourceBundle{}, errors.New("source observation identity does not match its content")
 		}
-		if err := observationFresh(rebuilt.Observations[index], evaluatedAt); err != nil {
-			return SourceBundle{}, err
+		if checkFreshness {
+			if err := observationFresh(rebuilt.Observations[index], evaluatedAt); err != nil {
+				return SourceBundle{}, err
+			}
 		}
 	}
 	return rebuilt, nil
 }
 
 func ReadSourceBundleFile(file string) ([]byte, error) {
-	info, err := os.Lstat(file)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > 4<<20 {
+	first, err := readBoundedBundle(file)
+	if err != nil {
+		return nil, err
+	}
+	second, err := readBoundedBundle(file)
+	if err != nil || !bytes.Equal(first, second) {
+		return nil, errors.New("source bundle file changed or exceeded its size limit")
+	}
+	return first, nil
+}
+
+func readBoundedBundle(file string) ([]byte, error) {
+	before, err := os.Lstat(file)
+	if err != nil || !before.Mode().IsRegular() || before.Size() > maxBundleSize {
 		return nil, errors.New("source bundle file is unavailable or invalid")
 	}
-	raw, err := readStable(file)
-	if err != nil || len(raw) > 4<<20 {
-		return nil, errors.New("source bundle file changed or exceeded its size limit")
+	handle, err := os.Open(file)
+	if err != nil {
+		return nil, errors.New("source bundle file is unavailable or invalid")
+	}
+	defer handle.Close()
+	opened, err := handle.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, errors.New("source bundle file changed while opening")
+	}
+	raw, err := io.ReadAll(io.LimitReader(handle, maxBundleSize+1))
+	if err != nil || len(raw) > maxBundleSize {
+		return nil, errors.New("source bundle file exceeded its size limit")
+	}
+	after, err := os.Lstat(file)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return nil, errors.New("source bundle file changed while reading")
 	}
 	return raw, nil
 }
@@ -320,8 +368,14 @@ func normalizeJSON(value any, field string) (any, error) {
 		}
 		return normalizeJSON(values, field)
 	case string:
-		if len(current) > maxObservationSize || hasControl(current) || strings.HasPrefix(current, "/") || strings.HasPrefix(current, `\\`) {
+		lower := strings.ToLower(current)
+		if len(current) > maxObservationSize || hasControl(current) || strings.HasPrefix(current, "/") || strings.Contains(current, `\`) ||
+			windowsAbsolutePath.MatchString(current) || strings.Contains(lower, "token=") || strings.Contains(lower, "password=") ||
+			strings.Contains(lower, "secret=") || strings.Contains(lower, "authorization:") {
 			return nil, errors.New("source observation contains a private or invalid value")
+		}
+		if strings.HasSuffix(strings.ToLower(field), "digest") && !digestPattern.MatchString(current) {
+			return nil, errors.New("source observation digest is invalid")
 		}
 		return current, nil
 	case bool, json.Number, float64:
@@ -359,84 +413,11 @@ func canonicalDigest(domain string, value any) (string, error) {
 }
 
 func canonicalJSON(value any) ([]byte, error) {
-	var output bytes.Buffer
-	if err := writeCanonicalJSON(&output, value); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
-}
-
-func writeCanonicalJSON(output *bytes.Buffer, value any) error {
 	raw, err := json.Marshal(value)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	parsed, err := parseStrictJSON(raw)
-	if err != nil {
-		return err
-	}
-	return writeCanonicalValue(output, parsed)
-}
-
-func writeCanonicalValue(output *bytes.Buffer, value any) error {
-	switch current := value.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(current))
-		for key := range current {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		output.WriteByte('{')
-		for index, key := range keys {
-			if index > 0 {
-				output.WriteByte(',')
-			}
-			writeJSONString(output, key)
-			output.WriteByte(':')
-			if err := writeCanonicalValue(output, current[key]); err != nil {
-				return err
-			}
-		}
-		output.WriteByte('}')
-	case []any:
-		output.WriteByte('[')
-		for index, child := range current {
-			if index > 0 {
-				output.WriteByte(',')
-			}
-			if err := writeCanonicalValue(output, child); err != nil {
-				return err
-			}
-		}
-		output.WriteByte(']')
-	case string:
-		writeJSONString(output, current)
-	case bool:
-		output.WriteString(strconv.FormatBool(current))
-	case json.Number:
-		number, err := strconv.ParseFloat(string(current), 64)
-		if err != nil {
-			return err
-		}
-		if number == 0 {
-			output.WriteByte('0')
-		} else {
-			output.WriteString(strconv.FormatFloat(number, 'g', -1, 64))
-		}
-	case nil:
-		output.WriteString("null")
-	default:
-		return errors.New("canonical JSON value is unsupported")
-	}
-	return nil
-}
-
-func writeJSONString(output *bytes.Buffer, value string) {
-	var encoded bytes.Buffer
-	encoder := json.NewEncoder(&encoded)
-	encoder.SetEscapeHTML(false)
-	_ = encoder.Encode(value)
-	output.Write(bytes.TrimSuffix(encoded.Bytes(), []byte("\n")))
+	return jcs.Transform(raw)
 }
 
 func parseStrictJSON(raw []byte) (any, error) {

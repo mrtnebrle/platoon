@@ -84,6 +84,38 @@ func TestDecodeSourceBundleRejectsTamperingPrivacyAndStaleness(t *testing.T) {
 	}
 }
 
+func TestCanonicalJSONUsesRFC8785Encoding(t *testing.T) {
+	canonical, err := canonicalJSON(map[string]any{"line": "\u2028", "number": json.Number("1e+30"), "zero": json.Number("-0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonical) != "{\"line\":\"\u2028\",\"number\":1e+30,\"zero\":0}" {
+		t.Fatalf("canonical JSON = %s", canonical)
+	}
+}
+
+func TestSourceBundleRejectsSecretValuesAndAggregateOverflow(t *testing.T) {
+	secret := testObservation("2026-08-08T10:00:00Z")
+	secret.Payload["databaseIdentity"] = "token=synthetic"
+	if _, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", []SourceObservation{secret}); err == nil {
+		t.Fatal("accepted secret-like source value")
+	}
+
+	large := make([]SourceObservation, 5)
+	operations := make([]any, 130000)
+	for index := range operations {
+		operations[index] = "read"
+	}
+	for index := range large {
+		large[index] = testObservation("2026-08-08T10:00:00Z")
+		large[index].SourceID = "dagr-source-" + string(rune('a'+index))
+		large[index].Payload["operations"] = operations
+	}
+	if _, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", large); err == nil || !strings.Contains(err.Error(), "aggregate") {
+		t.Fatalf("aggregate overflow error = %v", err)
+	}
+}
+
 func testObservation(observedAt string) SourceObservation {
 	return SourceObservation{
 		SourceID: "dagr-authority", Kind: "dagr", Schema: "dagr.capability/v1", AdapterVersion: "v1",
