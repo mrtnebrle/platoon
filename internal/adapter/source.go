@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -70,16 +71,16 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 		base.Revision = objectID
 		base.Payload = map[string]any{"repository": query.Locator, "objectId": objectID}
 	case "dagr":
-		executableHash, err := executableDigest(s.manifest.Spec.Adapters.Dagr.Executable)
+		executable, err := inspectExecutable(s.manifest.Spec.Adapters.Dagr.Executable)
 		if err != nil {
 			return unavailableObservation(base), nil
 		}
-		base.AdapterVersion = "dagr-" + executableHash[:16]
+		base.AdapterVersion = "dagr-" + executable.digest[:16]
 		help, err := s.executor.Run(ctx, Invocation{
-			Executable: s.manifest.Spec.Adapters.Dagr.Executable, Args: []string{"--help"},
+			Executable: executable.path, Args: []string{"capabilities", "--format", "platoon.dagr-capability/v1"},
 			Timeout: s.manifest.Spec.Limits.CommandDuration(), MaxOutput: 64 << 10,
 		})
-		if err != nil || len(help.Stderr) != 0 || !dagrHelpProvesOperations(string(help.Stdout)) {
+		if err != nil || len(help.Stderr) != 0 || !dagrReceiptProvesOperations(help.Stdout) || !executable.unchanged() {
 			return unavailableObservation(base), nil
 		}
 		info, err := os.Lstat(s.manifest.Spec.Adapters.Dagr.Database)
@@ -140,38 +141,60 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 	return base, nil
 }
 
-func dagrHelpProvesOperations(help string) bool {
-	for _, required := range []string{"workflow", "load", "stage", "list", "run", "start", "watch", "step-done", "step-fail"} {
-		if !strings.Contains(help, required) {
+func dagrReceiptProvesOperations(raw []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var receipt struct {
+		Schema     string   `json:"schema"`
+		Operations []string `json:"operations"`
+	}
+	if err := decoder.Decode(&receipt); err != nil || receipt.Schema != "platoon.dagr-capability/v1" || len(receipt.Operations) != 5 {
+		return false
+	}
+	want := []string{"ack", "list", "load", "start", "watch"}
+	for index := range want {
+		if receipt.Operations[index] != want[index] {
 			return false
 		}
 	}
 	return true
 }
 
-func executableDigest(executable string) (string, error) {
+type executableObservation struct {
+	path   string
+	digest string
+	info   os.FileInfo
+}
+
+func inspectExecutable(executable string) (executableObservation, error) {
 	path := executable
 	if !strings.ContainsRune(executable, os.PathSeparator) {
 		resolved, err := exec.LookPath(executable)
 		if err != nil {
-			return "", err
+			return executableObservation{}, err
 		}
 		path = resolved
 	}
 	handle, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return executableObservation{}, err
 	}
 	defer handle.Close()
 	info, err := handle.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > 64<<20 {
-		return "", errors.New("source executable is unavailable or oversized")
+		return executableObservation{}, errors.New("source executable is unavailable or oversized")
 	}
 	digest := sha256.New()
 	if _, err := io.Copy(digest, io.LimitReader(handle, 64<<20)); err != nil {
-		return "", err
+		return executableObservation{}, err
 	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
+	return executableObservation{path: path, digest: hex.EncodeToString(digest.Sum(nil)), info: info}, nil
+}
+
+func (e executableObservation) unchanged() bool {
+	after, err := inspectExecutable(e.path)
+	return err == nil && os.SameFile(e.info, after.info) && e.info.Size() == after.info.Size() &&
+		e.info.ModTime().Equal(after.info.ModTime()) && e.digest == after.digest
 }
 
 func unavailableObservation(observation missioncontrol.SourceObservation) missioncontrol.SourceObservation {

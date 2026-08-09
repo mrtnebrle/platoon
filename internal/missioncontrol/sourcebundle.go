@@ -318,11 +318,7 @@ func validateObservationPayload(observation SourceObservation) error {
 		}
 	}
 	if observation.Schema == "platoon.target-proof/v1alpha1" {
-		issuedAt, issuedErr := time.Parse(time.RFC3339Nano, observation.Payload["issuedAt"].(string))
-		expiresAt, expiresErr := time.Parse(time.RFC3339Nano, observation.Payload["expiresAt"].(string))
-		if issuedErr != nil || expiresErr != nil || !expiresAt.After(issuedAt) {
-			return errors.New("source observation target proof time is invalid")
-		}
+		return errors.New("verified target proof is unsupported without a configured trust verifier")
 	}
 	return nil
 }

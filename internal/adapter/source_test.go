@@ -120,10 +120,38 @@ func TestMissionSourcesRejectDagrDatabaseChangeDuringInspection(t *testing.T) {
 	}
 }
 
+func TestMissionSourcesRejectDagrExecutableChangeDuringCapabilityQuery(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "dagr.db")
+	executable := filepath.Join(dir, "dagr")
+	for path, body := range map[string]string{database: "database", executable: "first executable"} {
+		if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	executor := sourceExecutor(func(_ context.Context, _ Invocation) (Result, error) {
+		if err := os.WriteFile(executable, []byte("second executable"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return Result{Stdout: []byte(dagrCapabilityHelp)}, nil
+	})
+	m := &manifest.Manifest{Spec: manifest.Spec{
+		Limits:   manifest.Limits{CommandTimeout: "1s"},
+		Adapters: manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: executable, Database: database, InspectExecutable: "sqlite3"}},
+	}}
+	sources := &MissionSources{manifest: m, executor: executor}
+	observation, err := sources.Query(context.Background(), missioncontrol.SourceQuery{
+		SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr", ExpectedRevision: "v1",
+	})
+	if err != nil || observation.Quality != missioncontrol.QualityUnavailable {
+		t.Fatalf("changed executable observation=%#v err=%v", observation, err)
+	}
+}
+
 type sourceExecutor func(context.Context, Invocation) (Result, error)
 
 func (run sourceExecutor) Run(ctx context.Context, invocation Invocation) (Result, error) {
 	return run(ctx, invocation)
 }
 
-const dagrCapabilityHelp = "workflow load stage list run start watch step-done step-fail"
+const dagrCapabilityHelp = `{"schema":"platoon.dagr-capability/v1","operations":["ack","list","load","start","watch"]}`
