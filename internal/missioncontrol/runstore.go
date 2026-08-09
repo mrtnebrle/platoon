@@ -417,7 +417,7 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 		return nil, err
 	}
 	var pointer runPointer
-	if err := decodeStrictJSON(pointerRaw, &pointer); err != nil {
+	if err := decodeCanonicalJSON(pointerRaw, &pointer); err != nil {
 		return nil, errors.New("typed run pointer is malformed")
 	}
 	if pointer.RepairEpoch != input.Expected.RepairEpoch || pointer.Current.Generation != input.Expected.Generation ||
@@ -447,9 +447,17 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 	if err != nil {
 		return nil, err
 	}
+	nextGeneration, err := checkedIncrement(current.Fence.Generation)
+	if err != nil {
+		return nil, err
+	}
+	nextSequence, err := checkedIncrement(previousEvent.Sequence)
+	if err != nil {
+		return nil, err
+	}
 	event := eventObject{
-		Schema: eventSchema, RunID: input.RunID, Sequence: previousEvent.Sequence + 1, PreviousEventDigest: &predecessor.EventDigest,
-		RunGeneration: current.Fence.Generation + 1, ProjectionRevision: current.State.ProjectionRevision,
+		Schema: eventSchema, RunID: input.RunID, Sequence: nextSequence, PreviousEventDigest: &predecessor.EventDigest,
+		RunGeneration: nextGeneration, ProjectionRevision: current.State.ProjectionRevision,
 		OccurredAt: input.PublishedAt.Format(time.RFC3339Nano), Type: "typed_generation_published", Subject: input.RunID,
 		EvidenceDigests: append([]string(nil), current.State.ObservationDigests...),
 	}
@@ -467,7 +475,7 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 	previousDigest, previousGeneration, previousState := current.Fence.TransitionDigest, current.Fence.Generation, current.State.ResultingStateDigest
 	previousEventDigest, previousProjectionRevision := predecessor.EventDigest, current.State.ProjectionRevision
 	commit := transitionCommit{
-		Schema: transitionSchema, RunID: input.RunID, RepairEpoch: current.Fence.RepairEpoch, Generation: current.Fence.Generation + 1,
+		Schema: transitionSchema, RunID: input.RunID, RepairEpoch: current.Fence.RepairEpoch, Generation: nextGeneration,
 		PreviousTransitionDigest: &previousDigest, PreviousGeneration: &previousGeneration, PreviousResultingStateDigest: &previousState,
 		PreviousEventDigest: &previousEventDigest, PreviousProjectionRevision: &previousProjectionRevision,
 		PacketDigest: state.PacketDigest, ObservationDigests: append([]string(nil), state.ObservationDigests...),
@@ -483,13 +491,8 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 		Current:  TransitionReference{Generation: commit.Generation, TransitionDigest: commit.Digest, ResultingStateDigest: state.ResultingStateDigest},
 		Previous: &priorReference,
 	}
-	for _, candidate := range []struct {
-		kind  string
-		value any
-	}{{"events", event}, {"transitions", commit}, {"pointer", next}} {
-		if err := validateTypedObjectSize(candidate.kind, candidate.value); err != nil {
-			return nil, err
-		}
+	if err := validateGeneratedCandidate(event, commit, next, priorReference, &priorReference, current.State, current.State.Status); err != nil {
+		return nil, err
 	}
 	if err := s.writeRecoveryObjects(input.RunID, event, commit); err != nil {
 		return nil, err
@@ -518,7 +521,7 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 		return nil, err
 	}
 	var pointer runPointer
-	if err := decodeStrictJSON(pointerRaw, &pointer); err != nil {
+	if err := decodeCanonicalJSON(pointerRaw, &pointer); err != nil {
 		return nil, errors.New("typed run pointer is malformed")
 	}
 	if pointer.Schema != runPointerSchema || pointer.RunID != runID || pointer.Current.Generation == 0 ||
@@ -527,6 +530,27 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 	}
 	if pointer.RepairEpoch != expected.RepairEpoch || pointer.Current.Generation != expected.Generation ||
 		pointer.Current.TransitionDigest != expected.TransitionDigest {
+		current, loadErr := s.Load(runID)
+		if loadErr == nil {
+			switch current.State.Status {
+			case TypedRunQuarantined:
+				var quarantine transitionCommit
+				if err := s.readObject(runID, "transitions", pointer.Current.TransitionDigest, &quarantine); err == nil && recoveryMatchesExpected(quarantine, expected) {
+					return s.publishRepair(runID, pointerRaw, pointer)
+				}
+			case TypedRunReconcileRequired:
+				if pointer.Previous != nil {
+					var quarantine transitionCommit
+					if err := s.readObject(runID, "transitions", pointer.Previous.TransitionDigest, &quarantine); err == nil &&
+						quarantine.ResultingState.Status == TypedRunQuarantined && recoveryMatchesExpected(quarantine, expected) {
+						if err := syncTypedDirectory(filepath.Dir(s.pointerPath(runID))); err != nil {
+							return nil, err
+						}
+						return current, nil
+					}
+				}
+			}
+		}
 		return nil, ErrTypedRunFenced
 	}
 
@@ -547,6 +571,10 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 	if pointer.Previous == nil {
 		return nil, fmt.Errorf("typed current transition is invalid without a verified predecessor: %w", loadErr)
 	}
+	wantInvalidGeneration, err := checkedIncrement(pointer.Previous.Generation)
+	if err != nil || wantInvalidGeneration != pointer.Current.Generation {
+		return nil, errors.New("typed invalid transition is not adjacent to its verified predecessor")
+	}
 	base, err := s.loadVerifiedReference(runID, *pointer.Previous)
 	if err != nil {
 		return nil, err
@@ -559,10 +587,19 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 		return nil, err
 	}
 	var quarantinePointer runPointer
-	if err := decodeStrictJSON(quarantineRaw, &quarantinePointer); err != nil {
+	if err := decodeCanonicalJSON(quarantineRaw, &quarantinePointer); err != nil {
 		return nil, err
 	}
 	return s.publishRepair(runID, quarantineRaw, quarantinePointer)
+}
+
+func recoveryMatchesExpected(quarantine transitionCommit, expected TypedRunFence) bool {
+	if quarantine.Quarantined == nil {
+		return false
+	}
+	nextEpoch, err := checkedIncrement(expected.RepairEpoch)
+	return err == nil && quarantine.RepairEpoch == nextEpoch && quarantine.Quarantined.Generation == expected.Generation &&
+		quarantine.Quarantined.TransitionDigest == expected.TransitionDigest
 }
 
 func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, pointer runPointer, base transitionCommit) (*TypedRunSnapshot, error) {
@@ -570,7 +607,19 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, pointer.Current.Generation+1, previousEvent.Sequence+1, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
+	nextGeneration, err := checkedIncrement(pointer.Current.Generation)
+	if err != nil {
+		return nil, err
+	}
+	nextSequence, err := checkedIncrement(previousEvent.Sequence)
+	if err != nil {
+		return nil, err
+	}
+	nextEpoch, err := checkedIncrement(pointer.RepairEpoch)
+	if err != nil {
+		return nil, err
+	}
+	event := recoveryEvent(runID, nextGeneration, nextSequence, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -588,7 +637,7 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	previousDigest, previousGeneration, previousState := invalid.TransitionDigest, invalid.Generation, invalid.ResultingStateDigest
 	previousEventDigest, previousProjectionRevision := base.EventDigest, base.ResultingState.ProjectionRevision
 	commit := transitionCommit{
-		Schema: transitionSchema, RunID: runID, RepairEpoch: pointer.RepairEpoch + 1, Generation: invalid.Generation + 1,
+		Schema: transitionSchema, RunID: runID, RepairEpoch: nextEpoch, Generation: nextGeneration,
 		PreviousTransitionDigest: &previousDigest, PreviousGeneration: &previousGeneration, PreviousResultingStateDigest: &previousState,
 		PreviousEventDigest: &previousEventDigest, PreviousProjectionRevision: &previousProjectionRevision,
 		Quarantined: &invalid, RecoveryBase: &recoveryBase, Reason: "current_transition_invalid",
@@ -603,6 +652,9 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 		Schema: runPointerSchema, RunID: runID, RepairEpoch: commit.RepairEpoch,
 		Current:  TransitionReference{Generation: commit.Generation, TransitionDigest: commit.Digest, ResultingStateDigest: state.ResultingStateDigest},
 		Previous: &recoveryBase,
+	}
+	if err := validateGeneratedCandidate(event, commit, next, invalid, &recoveryBase, base.ResultingState, TypedRunQuarantined); err != nil {
+		return nil, err
 	}
 	if err := s.writeRecoveryObjects(runID, event, commit); err != nil {
 		return nil, err
@@ -628,7 +680,15 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, pointer.Current.Generation+1, previousEvent.Sequence+1, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
+	nextGeneration, err := checkedIncrement(pointer.Current.Generation)
+	if err != nil {
+		return nil, err
+	}
+	nextSequence, err := checkedIncrement(previousEvent.Sequence)
+	if err != nil {
+		return nil, err
+	}
+	event := recoveryEvent(runID, nextGeneration, nextSequence, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -645,7 +705,7 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	previousEventDigest, previousProjectionRevision := quarantine.EventDigest, quarantine.ResultingState.ProjectionRevision
 	recoveryBase := *pointer.Previous
 	commit := transitionCommit{
-		Schema: transitionSchema, RunID: runID, RepairEpoch: pointer.RepairEpoch, Generation: pointer.Current.Generation + 1,
+		Schema: transitionSchema, RunID: runID, RepairEpoch: pointer.RepairEpoch, Generation: nextGeneration,
 		PreviousTransitionDigest: &previousDigest, PreviousGeneration: &previousGeneration, PreviousResultingStateDigest: &previousState,
 		PreviousEventDigest: &previousEventDigest, PreviousProjectionRevision: &previousProjectionRevision,
 		RecoveryBase: &recoveryBase, PacketDigest: quarantine.PacketDigest,
@@ -661,6 +721,9 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 		Schema: runPointerSchema, RunID: runID, RepairEpoch: pointer.RepairEpoch,
 		Current:  TransitionReference{Generation: commit.Generation, TransitionDigest: commit.Digest, ResultingStateDigest: state.ResultingStateDigest},
 		Previous: &quarantineReference,
+	}
+	if err := validateGeneratedCandidate(event, commit, next, quarantineReference, &quarantineReference, quarantine.ResultingState, TypedRunReconcileRequired); err != nil {
+		return nil, err
 	}
 	if err := s.writeRecoveryObjects(runID, event, commit); err != nil {
 		return nil, err
@@ -925,8 +988,13 @@ func (s *TypedRunStore) validateQuarantineCommit(runID string, pointer runPointe
 		commit.PreviousGeneration == nil || *commit.PreviousGeneration != commit.Quarantined.Generation ||
 		commit.PreviousResultingStateDigest == nil || *commit.PreviousResultingStateDigest != commit.Quarantined.ResultingStateDigest ||
 		commit.PreviousEventDigest == nil || commit.PreviousProjectionRevision == nil ||
-		*commit.RecoveryBase != *pointer.Previous || commit.Quarantined.Generation+1 != commit.Generation {
+		*commit.RecoveryBase != *pointer.Previous {
 		return errors.New("typed quarantine transition binding is invalid")
+	}
+	invalidGeneration, incrementErr := checkedIncrement(commit.RecoveryBase.Generation)
+	quarantineGeneration, quarantineErr := checkedIncrement(commit.Quarantined.Generation)
+	if incrementErr != nil || quarantineErr != nil || invalidGeneration != commit.Quarantined.Generation || quarantineGeneration != commit.Generation {
+		return errors.New("typed quarantine transition generations are invalid")
 	}
 	if err := s.validateTransitionState(pointer, commit, TypedRunQuarantined); err != nil {
 		return err
@@ -941,6 +1009,15 @@ func (s *TypedRunStore) validateQuarantineCommit(runID string, pointer runPointe
 	}
 	if *commit.PreviousEventDigest != base.EventDigest || *commit.PreviousProjectionRevision != base.ResultingState.ProjectionRevision {
 		return errors.New("typed quarantine recovery base is inconsistent")
+	}
+	expectedState := base.ResultingState
+	expectedState.Status = TypedRunQuarantined
+	expectedState.EventDigest = commit.EventDigest
+	expectedState.ResultingStateDigest = ""
+	expectedState.ResultingStateDigest, err = digestState(expectedState)
+	if err != nil || !canonicalEqual(expectedState, commit.ResultingState) || commit.PacketDigest != base.PacketDigest ||
+		!sameStrings(commit.ObservationDigests, base.ObservationDigests) || commit.ProjectionDigest != base.ProjectionDigest {
+		return errors.New("typed quarantine state does not derive from recovery base")
 	}
 	baseEvent, err := s.loadEvent(runID, base.EventDigest)
 	if err != nil {
@@ -981,6 +1058,18 @@ func (s *TypedRunStore) validateRepairCommit(runID string, pointer runPointer, c
 	}
 	if *commit.PreviousEventDigest != quarantine.EventDigest || *commit.PreviousProjectionRevision != quarantine.ResultingState.ProjectionRevision {
 		return errors.New("typed repair predecessor is inconsistent")
+	}
+	if quarantine.RecoveryBase == nil || *commit.RecoveryBase != *quarantine.RecoveryBase {
+		return errors.New("typed repair recovery base is inconsistent")
+	}
+	expectedState := quarantine.ResultingState
+	expectedState.Status = TypedRunReconcileRequired
+	expectedState.EventDigest = commit.EventDigest
+	expectedState.ResultingStateDigest = ""
+	expectedState.ResultingStateDigest, err = digestState(expectedState)
+	if err != nil || !canonicalEqual(expectedState, commit.ResultingState) || commit.PacketDigest != quarantine.PacketDigest ||
+		!sameStrings(commit.ObservationDigests, quarantine.ObservationDigests) || commit.ProjectionDigest != quarantine.ProjectionDigest {
+		return errors.New("typed repair state does not derive from quarantine")
 	}
 	quarantineEvent, err := s.loadEvent(runID, quarantine.EventDigest)
 	if err != nil {
@@ -1072,7 +1161,7 @@ func buildProjectionEntries(sources []source, observations []SourceObservation) 
 			revision = observation.ObservedAt
 		}
 		entries = append(entries, projectionEntry{
-			Role: declared.Role, SourceLabel: declared.ID, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
+			Role: declared.Role, SourceLabel: declared.Kind, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
 			Reason: declared.Reason, Exposure: "bound", ObservationDigest: observation.EnvelopeDigest,
 		})
 	}
@@ -1087,7 +1176,7 @@ func validateProjectionEntries(entries []projectionEntry, observations []string)
 	seenSources := make(map[string]bool, len(entries))
 	seenObservations := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		if !validSlug(entry.Role) || !validSlug(entry.SourceLabel) || entry.SourceLabel != entry.SourceID || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
+		if !validSlug(entry.Role) || !sourceKinds[entry.SourceLabel] || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
 			!safeOpaque(entry.Revision) || secretLike(entry.Locator) || secretLike(entry.Revision) || secretLike(entry.Reason) ||
 			entry.Reason == "" || len(entry.Reason) > 512 || hasControl(entry.Reason) || entry.Exposure != "bound" || !allowed[entry.ObservationDigest] {
 			return errors.New("typed projection entry is unsafe or unbound")
@@ -1112,6 +1201,54 @@ func validateTypedObjectSize(kind string, value any) error {
 	}
 	if len(raw) > limit {
 		return errors.New("typed state object exceeds its size limit")
+	}
+	return nil
+}
+
+func validateGeneratedCandidate(event eventObject, commit transitionCommit, pointer runPointer, commitPrevious TransitionReference, pointerPrevious *TransitionReference, baseState TypedRunState, status TypedRunStatus) error {
+	if event.Schema != eventSchema || commit.Schema != transitionSchema || pointer.Schema != runPointerSchema ||
+		event.RunID == "" || event.RunID != commit.RunID || event.RunID != pointer.RunID || event.RunGeneration != commit.Generation ||
+		event.Digest != commit.EventDigest || event.ProjectionRevision != commit.ResultingState.ProjectionRevision ||
+		commit.ResultingState.RunID != commit.RunID || commit.ResultingState.EffectsEnabled ||
+		commit.ResultingState.PacketDigest != commit.PacketDigest || !sameStrings(commit.ResultingState.ObservationDigests, commit.ObservationDigests) ||
+		commit.ResultingState.ProjectionDigest != commit.ProjectionDigest || commit.ResultingState.EventDigest != commit.EventDigest ||
+		commit.PreviousTransitionDigest == nil || *commit.PreviousTransitionDigest != commitPrevious.TransitionDigest ||
+		commit.PreviousGeneration == nil || *commit.PreviousGeneration != commitPrevious.Generation ||
+		commit.PreviousResultingStateDigest == nil || *commit.PreviousResultingStateDigest != commitPrevious.ResultingStateDigest ||
+		commit.PreviousEventDigest == nil || !sameOptionalString(event.PreviousEventDigest, commit.PreviousEventDigest) ||
+		pointer.RepairEpoch != commit.RepairEpoch || pointer.Current.Generation != commit.Generation ||
+		pointer.Current.TransitionDigest != commit.Digest || pointer.Current.ResultingStateDigest != commit.ResultingState.ResultingStateDigest ||
+		pointerPrevious == nil || pointer.Previous == nil || *pointer.Previous != *pointerPrevious {
+		return errors.New("generated typed transition binding is invalid")
+	}
+	expectedState := baseState
+	expectedState.Status = status
+	expectedState.EventDigest = event.Digest
+	expectedState.ResultingStateDigest = ""
+	expectedDigest, err := digestState(expectedState)
+	expectedState.ResultingStateDigest = expectedDigest
+	if err != nil || !canonicalEqual(expectedState, commit.ResultingState) {
+		return errors.New("generated typed state does not derive from verified base")
+	}
+	wantEvent, err := digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
+	if err != nil || wantEvent != event.Digest {
+		return errors.New("generated typed event digest is invalid")
+	}
+	wantState, err := digestState(commit.ResultingState)
+	if err != nil || wantState != commit.ResultingState.ResultingStateDigest {
+		return errors.New("generated typed state digest is invalid")
+	}
+	wantCommit, err := digestWithoutField(transitionSchema, commit, func(value *transitionCommit) { value.Digest = "" })
+	if err != nil || wantCommit != commit.Digest {
+		return errors.New("generated typed transition digest is invalid")
+	}
+	for _, candidate := range []struct {
+		kind  string
+		value any
+	}{{"events", event}, {"transitions", commit}, {"pointer", pointer}} {
+		if err := validateTypedObjectSize(candidate.kind, candidate.value); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1241,6 +1378,13 @@ func validDigest(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil && value == strings.ToLower(value)
+}
+
+func checkedIncrement(value uint64) (uint64, error) {
+	if value == ^uint64(0) {
+		return 0, errors.New("typed transition counter overflow")
+	}
+	return value + 1, nil
 }
 
 func digestCanonicalBytes(domain string, raw []byte) string {
@@ -1471,7 +1615,18 @@ func readStrictJSON(path string, destination any) error {
 	if err != nil {
 		return err
 	}
-	return decodeStrictJSON(raw, destination)
+	return decodeCanonicalJSON(raw, destination)
+}
+
+func decodeCanonicalJSON(raw []byte, destination any) error {
+	if err := decodeStrictJSON(raw, destination); err != nil {
+		return err
+	}
+	canonical, err := canonicalJSON(destination)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return errors.New("typed authority bytes are not canonical")
+	}
+	return nil
 }
 
 func decodeStrictJSON(raw []byte, destination any) error {
@@ -1642,7 +1797,14 @@ func (s *TypedRunStore) readObject(runID, kind, digest string, destination any) 
 	if err != nil {
 		return err
 	}
-	return decodeStrictJSON(raw, destination)
+	if err := decodeStrictJSON(raw, destination); err != nil {
+		return err
+	}
+	canonical, err := canonicalJSON(destination)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return errors.New("typed immutable object bytes are not canonical")
+	}
+	return nil
 }
 
 func syncTypedDirectory(path string) error {

@@ -1,8 +1,10 @@
 package missioncontrol
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -388,6 +390,59 @@ func TestTypedRunRecoveryUsesVerifiedNonGenesisPredecessor(t *testing.T) {
 	}
 }
 
+func TestTypedRunRecoveryExactOriginalFenceRetriesEveryBoundary(t *testing.T) {
+	tests := []struct {
+		boundary   PublicationBoundary
+		occurrence int
+	}{
+		{BoundaryEventPublished, 1}, {BoundaryEventSynced, 1}, {BoundaryTransitionPublished, 1}, {BoundaryTransitionSynced, 1},
+		{BoundaryBeforePointerPublish, 1}, {BoundaryAfterPointerPublish, 1}, {BoundaryAfterPointerSync, 1},
+		{BoundaryEventPublished, 2}, {BoundaryEventSynced, 2}, {BoundaryTransitionPublished, 2}, {BoundaryTransitionSynced, 2},
+		{BoundaryBeforePointerPublish, 2}, {BoundaryAfterPointerPublish, 2}, {BoundaryAfterPointerSync, 2},
+	}
+	for _, test := range tests {
+		name := fmt.Sprintf("%s-%d", test.boundary, test.occurrence)
+		t.Run(name, func(t *testing.T) {
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+			genesis, err := store.PublishGenesis(testGenesisInput(t, "recovery-retry"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			invalid := runPointer{
+				Schema: runPointerSchema, RunID: "recovery-retry",
+				Current: TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+				Previous: &TransitionReference{
+					Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+					ResultingStateDigest: genesis.State.ResultingStateDigest,
+				},
+			}
+			writeTestPointer(t, store.pointerPath("recovery-retry"), invalid)
+			expected := TypedRunFence{Generation: 2, TransitionDigest: invalid.Current.TransitionDigest}
+			seen := 0
+			store.failpoint = func(boundary PublicationBoundary) error {
+				if boundary == test.boundary {
+					seen++
+					if seen == test.occurrence {
+						return errors.New("synthetic crash")
+					}
+				}
+				return nil
+			}
+			if _, err := store.Recover("recovery-retry", expected); err == nil {
+				t.Fatal("recovery crossed injected crash")
+			}
+			store.failpoint = nil
+			repaired, err := store.Recover("recovery-retry", expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repaired.Fence.Generation != 4 || repaired.Fence.RepairEpoch != 1 || repaired.State.Status != TypedRunReconcileRequired {
+				t.Fatalf("retried recovery = %#v", repaired)
+			}
+		})
+	}
+}
+
 func TestTypedRunGenesisRejectsUnsafeProjectionBeforeWritingObjects(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	store := openTestTypedRunStore(t, root)
@@ -472,6 +527,123 @@ func TestTypedRunRecoveryCASRejectsPointerChangeAtPublicationBoundary(t *testing
 	}
 }
 
+func TestTypedRunRecoveryRejectsNonadjacentBaseAndCounterOverflowBeforeMutation(t *testing.T) {
+	for name, pointer := range map[string]runPointer{
+		"nonadjacent": {
+			Schema: runPointerSchema, RunID: "preflight-run",
+			Current: TransitionReference{Generation: 3, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+		},
+		"epoch overflow": {
+			Schema: runPointerSchema, RunID: "preflight-run", RepairEpoch: ^uint64(0),
+			Current: TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("e", 64), ResultingStateDigest: strings.Repeat("f", 64)},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+			genesis, err := store.PublishGenesis(testGenesisInput(t, "preflight-run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := pointer
+			candidate.Previous = &TransitionReference{
+				Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+				ResultingStateDigest: genesis.State.ResultingStateDigest,
+			}
+			writeTestPointer(t, store.pointerPath("preflight-run"), candidate)
+			before, err := os.ReadFile(store.pointerPath("preflight-run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := TypedRunFence{
+				RepairEpoch: candidate.RepairEpoch, Generation: candidate.Current.Generation,
+				TransitionDigest: candidate.Current.TransitionDigest,
+			}
+			if _, err := store.Recover("preflight-run", expected); err == nil {
+				t.Fatal("invalid recovery preflight succeeded")
+			}
+			after, err := os.ReadFile(store.pointerPath("preflight-run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed recovery preflight changed current pointer")
+			}
+		})
+	}
+	if _, err := checkedIncrement(^uint64(0)); err == nil {
+		t.Fatal("counter overflow was accepted")
+	}
+}
+
+func TestTypedRunRecoveryStateMustDeriveFromVerifiedBase(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	genesis, err := store.PublishGenesis(testGenesisInput(t, "derived-recovery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := runPointer{
+		Schema: runPointerSchema, RunID: "derived-recovery",
+		Current: TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+		Previous: &TransitionReference{
+			Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+			ResultingStateDigest: genesis.State.ResultingStateDigest,
+		},
+	}
+	writeTestPointer(t, store.pointerPath("derived-recovery"), invalid)
+	store.failpoint = func(boundary PublicationBoundary) error {
+		if boundary == BoundaryAfterPointerSync {
+			return errors.New("stop after quarantine")
+		}
+		return nil
+	}
+	_, _ = store.Recover("derived-recovery", TypedRunFence{Generation: 2, TransitionDigest: invalid.Current.TransitionDigest})
+	store.failpoint = nil
+	quarantineSnapshot, err := store.Load("derived-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var quarantine transitionCommit
+	if err := store.readObject("derived-recovery", "transitions", quarantineSnapshot.Fence.TransitionDigest, &quarantine); err != nil {
+		t.Fatal(err)
+	}
+	quarantine.ResultingState.SourceBundle.QueryScope = "different-scope"
+	quarantine.ResultingState.ResultingStateDigest, _ = digestState(quarantine.ResultingState)
+	quarantine.Digest = ""
+	quarantine.Digest, _ = digestWithoutField(transitionSchema, quarantine, func(value *transitionCommit) { value.Digest = "" })
+	quarantinePointer := runPointer{
+		Schema: runPointerSchema, RunID: "derived-recovery", RepairEpoch: quarantine.RepairEpoch,
+		Current: TransitionReference{
+			Generation: quarantine.Generation, TransitionDigest: quarantine.Digest,
+			ResultingStateDigest: quarantine.ResultingState.ResultingStateDigest,
+		},
+		Previous: quarantine.RecoveryBase,
+	}
+	if err := store.validateQuarantineCommit("derived-recovery", quarantinePointer, quarantine); err == nil || !strings.Contains(err.Error(), "derive") {
+		t.Fatalf("divergent quarantine error = %v", err)
+	}
+
+	repaired, err := store.Recover("derived-recovery", quarantineSnapshot.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repair transitionCommit
+	if err := store.readObject("derived-recovery", "transitions", repaired.Fence.TransitionDigest, &repair); err != nil {
+		t.Fatal(err)
+	}
+	repair.ResultingState.SourceBundle.QueryScope = "different-scope"
+	repair.ResultingState.ResultingStateDigest, _ = digestState(repair.ResultingState)
+	repair.Digest = ""
+	repair.Digest, _ = digestWithoutField(transitionSchema, repair, func(value *transitionCommit) { value.Digest = "" })
+	repairPointer := runPointer{
+		Schema: runPointerSchema, RunID: "derived-recovery", RepairEpoch: repair.RepairEpoch,
+		Current:  TransitionReference{Generation: repair.Generation, TransitionDigest: repair.Digest, ResultingStateDigest: repair.ResultingState.ResultingStateDigest},
+		Previous: repaired.Previous,
+	}
+	if err := store.validateRepairCommit("derived-recovery", repairPointer, repair); err == nil || !strings.Contains(err.Error(), "derive") {
+		t.Fatalf("divergent repair error = %v", err)
+	}
+}
+
 func TestTypedRunLoadIgnoresUnreferencedPartialObjectsAndForks(t *testing.T) {
 	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "fork-run"))
@@ -547,6 +719,76 @@ func TestTypedRunLoadRejectsChangedMissingUnsupportedAndMalformedAuthority(t *te
 				t.Fatal("invalid authority loaded successfully")
 			}
 		})
+	}
+}
+
+func TestTypedRunLoadRejectsNoncanonicalImmutableObjectBytes(t *testing.T) {
+	for _, kind := range []string{"packets", "observations", "projections", "events", "transitions"} {
+		t.Run(kind, func(t *testing.T) {
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+			published, err := store.PublishGenesis(testGenesisInput(t, "canonical-run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := map[string]string{
+				"packets": published.State.PacketDigest, "observations": published.State.ObservationDigests[0],
+				"projections": published.State.ProjectionDigest, "events": published.State.EventDigest,
+				"transitions": published.Fence.TransitionDigest,
+			}[kind]
+			path := filepath.Join(store.runDir("canonical-run"), "objects", kind, digest+".json")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, append([]byte(" "), raw...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Load("canonical-run"); err == nil || !strings.Contains(err.Error(), "canonical") {
+				t.Fatalf("noncanonical %s error = %v", kind, err)
+			}
+		})
+	}
+
+	t.Run("duplicate known key", func(t *testing.T) {
+		store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+		published, err := store.PublishGenesis(testGenesisInput(t, "duplicate-run"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(store.runDir("duplicate-run"), "objects", "transitions", published.Fence.TransitionDigest+".json")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		duplicate := append([]byte(`{"schema":"platoon.transition-commit/v1alpha1",`), raw[1:]...)
+		if err := os.WriteFile(path, duplicate, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Load("duplicate-run"); err == nil {
+			t.Fatal("duplicate known key was accepted")
+		}
+	})
+}
+
+func TestProjectionPersistsClosedSourceLabelSeparateFromSourceID(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	published, err := store.PublishGenesis(testGenesisInput(t, "source-label-run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection projectionObject
+	if err := store.readObject("source-label-run", "projections", published.State.ProjectionDigest, &projection); err != nil {
+		t.Fatal(err)
+	}
+	foundDistinct := false
+	for _, entry := range projection.Entries {
+		if !sourceKinds[entry.SourceLabel] {
+			t.Fatalf("source label is not closed: %#v", entry)
+		}
+		foundDistinct = foundDistinct || entry.SourceLabel != entry.SourceID
+	}
+	if !foundDistinct {
+		t.Fatal("projection source labels duplicate declaration IDs")
 	}
 }
 

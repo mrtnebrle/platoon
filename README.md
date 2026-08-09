@@ -215,24 +215,29 @@ the complete stage, reservation, lease, and recovery model.
 
 Typed fixture state is separate from legacy `platoon.state/v1alpha1`. Packet,
 observation, projection-revision-zero, event, and transition objects are
-canonical, digest-addressed, restrictive files under one typed run directory.
-They are non-authoritative until `current.json` atomically names a fully
-verified transition. The pointer retains current and previous transition
-references and fences mutation by repair epoch, generation, and transition
-digest. Partial objects, exact unreferenced forks, and commits left before a
-pointer replacement are ignored; exact-byte retries re-sync and converge.
+canonical, digest-addressed, restrictive files under one typed run directory;
+semantically equivalent but byte-different JSON is rejected. They are
+non-authoritative until `current.json` atomically names a fully verified
+transition. The pointer retains current and previous transition references and
+fences mutation by repair epoch, generation, and transition digest. Partial
+objects, exact unreferenced forks, and commits left before a pointer replacement
+are ignored; exact-byte retries re-sync and converge.
 Projection entries are derived from packet source descriptors, and loading
 recomputes the exact source-bundle identity from persisted observation
-envelopes before accepting packet, projection, or event bindings. Events are
-capped at 64 KiB and complete observation objects at 1 MiB.
+envelopes before accepting packet, projection, or event bindings. Each entry
+keeps its declaration ID separately from its closed source-kind label. Events
+are capped at 64 KiB and complete observation objects at 1 MiB.
 
 If a pointer names an invalid current transition but a verified previous
 transition, recovery first publishes a no-effect quarantine at `N+1` and
 `E+1`, then a no-effect `reconcile_required` successor at `N+2`. It never adopts
-the invalid state or chooses an orphan descendant. Publication is refused
-before creating run files unless a trusted verifier recognizes rollback metadata
-that pins a creation-disabled artifact and its synthetic compatibility-fixture
-digest for the typed schema.
+the invalid state, skips a generation, or chooses an orphan descendant. Retrying
+the original recovery fence resumes its own quarantine or returns its completed
+repair. Counter overflow, nonadjacent recovery, and an invalid generated
+candidate are rejected before object or pointer publication. Publication is
+refused before creating run files unless a trusted verifier recognizes rollback
+metadata that pins a creation-disabled artifact and its synthetic
+compatibility-fixture digest for the typed schema.
 
 ## Safety
 
