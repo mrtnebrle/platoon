@@ -132,6 +132,17 @@ type TypedRunStore struct {
 	pointerSync func(string) error
 }
 
+type transitionCandidate struct {
+	event   eventObject
+	commit  transitionCommit
+	pointer runPointer
+}
+
+type recoveryChain struct {
+	quarantine transitionCandidate
+	repair     transitionCandidate
+}
+
 type compiledPacket struct {
 	Envelope json.RawMessage
 	Bundle   SourceBundle
@@ -592,18 +603,18 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.publishQuarantine(runID, pointerRaw, pointer, base); err != nil {
+	chain, err := s.buildRecoveryChain(runID, pointer, base)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.publishCandidate(runID, pointerRaw, chain.quarantine); err != nil {
 		return nil, err
 	}
 	quarantineRaw, err := readBoundedRegular(s.pointerPath(runID))
 	if err != nil {
 		return nil, err
 	}
-	var quarantinePointer runPointer
-	if err := decodeCanonicalJSON(quarantineRaw, &quarantinePointer); err != nil {
-		return nil, err
-	}
-	return s.publishRepair(runID, quarantineRaw, quarantinePointer)
+	return s.publishCandidate(runID, quarantineRaw, chain.repair)
 }
 
 func recoveryMatchesExpected(quarantine transitionCommit, expected TypedRunFence) bool {
@@ -615,30 +626,42 @@ func recoveryMatchesExpected(quarantine transitionCommit, expected TypedRunFence
 		quarantine.Quarantined.TransitionDigest == expected.TransitionDigest
 }
 
-func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, pointer runPointer, base transitionCommit) (*TypedRunSnapshot, error) {
+func (s *TypedRunStore) buildRecoveryChain(runID string, pointer runPointer, base transitionCommit) (recoveryChain, error) {
+	quarantine, err := s.buildQuarantineCandidate(runID, pointer, base)
+	if err != nil {
+		return recoveryChain{}, err
+	}
+	repair, err := s.buildRepairCandidate(runID, quarantine.pointer, quarantine.commit, quarantine.event)
+	if err != nil {
+		return recoveryChain{}, err
+	}
+	return recoveryChain{quarantine: quarantine, repair: repair}, nil
+}
+
+func (s *TypedRunStore) buildQuarantineCandidate(runID string, pointer runPointer, base transitionCommit) (transitionCandidate, error) {
 	previousEvent, err := s.loadEvent(runID, base.EventDigest)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	nextGeneration, err := checkedIncrement(pointer.Current.Generation)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	nextSequence, err := checkedIncrement(previousEvent.Sequence)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	nextEpoch, err := checkedIncrement(pointer.RepairEpoch)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	event, err := recoveryEvent(runID, nextGeneration, nextSequence, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	state := base.ResultingState
 	state.Status = TypedRunQuarantined
@@ -646,7 +669,7 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	state.ResultingStateDigest = ""
 	state.ResultingStateDigest, err = digestState(state)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	invalid := pointer.Current
 	recoveryBase := *pointer.Previous
@@ -662,7 +685,7 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	}
 	commit.Digest, err = digestWithoutField(transitionSchema, commit, func(value *transitionCommit) { value.Digest = "" })
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	next := runPointer{
 		Schema: runPointerSchema, RunID: runID, RepairEpoch: commit.RepairEpoch,
@@ -670,15 +693,9 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 		Previous: &recoveryBase,
 	}
 	if err := validateGeneratedCandidate(event, commit, next, invalid, &recoveryBase, base.ResultingState, TypedRunQuarantined); err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
-	if err := s.writeRecoveryObjects(runID, event, commit); err != nil {
-		return nil, err
-	}
-	if err := s.replacePointer(runID, pointerRaw, next); err != nil {
-		return nil, err
-	}
-	return s.Load(runID)
+	return transitionCandidate{event: event, commit: commit, pointer: next}, nil
 }
 
 func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer runPointer) (*TypedRunSnapshot, error) {
@@ -696,21 +713,32 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	if err != nil {
 		return nil, err
 	}
-	nextGeneration, err := checkedIncrement(pointer.Current.Generation)
+	candidate, err := s.buildRepairCandidate(runID, pointer, quarantine, previousEvent)
 	if err != nil {
 		return nil, err
+	}
+	return s.publishCandidate(runID, pointerRaw, candidate)
+}
+
+func (s *TypedRunStore) buildRepairCandidate(runID string, pointer runPointer, quarantine transitionCommit, previousEvent eventObject) (transitionCandidate, error) {
+	if pointer.Previous == nil {
+		return transitionCandidate{}, errors.New("typed quarantine lacks a recovery base")
+	}
+	nextGeneration, err := checkedIncrement(pointer.Current.Generation)
+	if err != nil {
+		return transitionCandidate{}, err
 	}
 	nextSequence, err := checkedIncrement(previousEvent.Sequence)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	event, err := recoveryEvent(runID, nextGeneration, nextSequence, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	state := quarantine.ResultingState
 	state.Status = TypedRunReconcileRequired
@@ -718,7 +746,7 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	state.ResultingStateDigest = ""
 	state.ResultingStateDigest, err = digestState(state)
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	previousDigest, previousGeneration, previousState := pointer.Current.TransitionDigest, pointer.Current.Generation, pointer.Current.ResultingStateDigest
 	previousEventDigest, previousProjectionRevision := quarantine.EventDigest, quarantine.ResultingState.ProjectionRevision
@@ -733,7 +761,7 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	}
 	commit.Digest, err = digestWithoutField(transitionSchema, commit, func(value *transitionCommit) { value.Digest = "" })
 	if err != nil {
-		return nil, err
+		return transitionCandidate{}, err
 	}
 	quarantineReference := pointer.Current
 	next := runPointer{
@@ -742,12 +770,16 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 		Previous: &quarantineReference,
 	}
 	if err := validateGeneratedCandidate(event, commit, next, quarantineReference, &quarantineReference, quarantine.ResultingState, TypedRunReconcileRequired); err != nil {
+		return transitionCandidate{}, err
+	}
+	return transitionCandidate{event: event, commit: commit, pointer: next}, nil
+}
+
+func (s *TypedRunStore) publishCandidate(runID string, pointerRaw []byte, candidate transitionCandidate) (*TypedRunSnapshot, error) {
+	if err := s.writeRecoveryObjects(runID, candidate.event, candidate.commit); err != nil {
 		return nil, err
 	}
-	if err := s.writeRecoveryObjects(runID, event, commit); err != nil {
-		return nil, err
-	}
-	if err := s.replacePointer(runID, pointerRaw, next); err != nil {
+	if err := s.replacePointer(runID, pointerRaw, candidate.pointer); err != nil {
 		return nil, err
 	}
 	return s.Load(runID)

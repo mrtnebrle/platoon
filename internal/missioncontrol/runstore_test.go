@@ -251,7 +251,7 @@ func TestTypedRunRejectsUnrepresentableGeneratedTimesBeforePublication(t *testin
 	t.Run("recovery overflow", func(t *testing.T) {
 		store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 		input := testGenesisInput(t, "bad-recovery-time")
-		input.PublishedAt = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
+		input.PublishedAt = time.Date(9999, 12, 31, 23, 59, 59, 999999998, time.UTC)
 		genesis, err := store.PublishGenesis(input)
 		if err != nil {
 			t.Fatal(err)
@@ -269,6 +269,8 @@ func TestTypedRunRejectsUnrepresentableGeneratedTimesBeforePublication(t *testin
 		if err != nil {
 			t.Fatal(err)
 		}
+		eventsBefore, _ := os.ReadDir(filepath.Join(store.runDir("bad-recovery-time"), "objects", "events"))
+		transitionsBefore, _ := os.ReadDir(filepath.Join(store.runDir("bad-recovery-time"), "objects", "transitions"))
 		if _, err := store.Recover("bad-recovery-time", TypedRunFence{Generation: 2, TransitionDigest: invalid.Current.TransitionDigest}); err == nil {
 			t.Fatal("recovery timestamp overflow was accepted")
 		}
@@ -278,6 +280,11 @@ func TestTypedRunRejectsUnrepresentableGeneratedTimesBeforePublication(t *testin
 		}
 		if !bytes.Equal(before, after) {
 			t.Fatal("recovery timestamp overflow changed authority")
+		}
+		eventsAfter, _ := os.ReadDir(filepath.Join(store.runDir("bad-recovery-time"), "objects", "events"))
+		transitionsAfter, _ := os.ReadDir(filepath.Join(store.runDir("bad-recovery-time"), "objects", "transitions"))
+		if len(eventsAfter) != len(eventsBefore) || len(transitionsAfter) != len(transitionsBefore) {
+			t.Fatal("second-step timestamp overflow wrote recovery objects")
 		}
 	})
 }
@@ -345,6 +352,73 @@ func TestTypedRunRecoveryQuarantinesInvalidCurrentBeforeReconcileRequired(t *tes
 	if current.Fence != repaired.Fence {
 		t.Fatalf("stale recovery changed authority: %#v", current.Fence)
 	}
+}
+
+func TestRecoveryChainPreflightRejectsSecondStepCounterOverflowWithoutWrites(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	genesis, err := store.PublishGenesis(testGenesisInput(t, "chain-overflow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base transitionCommit
+	if err := store.readObject("chain-overflow", "transitions", genesis.Fence.TransitionDigest, &base); err != nil {
+		t.Fatal(err)
+	}
+	baseReference := TransitionReference{
+		Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+		ResultingStateDigest: genesis.State.ResultingStateDigest,
+	}
+	assertNoWrites := func(t *testing.T, build func() error) {
+		t.Helper()
+		eventsPath := filepath.Join(store.runDir("chain-overflow"), "objects", "events")
+		transitionsPath := filepath.Join(store.runDir("chain-overflow"), "objects", "transitions")
+		eventsBefore, _ := os.ReadDir(eventsPath)
+		transitionsBefore, _ := os.ReadDir(transitionsPath)
+		if err := build(); err == nil {
+			t.Fatal("second-step counter overflow was accepted")
+		}
+		eventsAfter, _ := os.ReadDir(eventsPath)
+		transitionsAfter, _ := os.ReadDir(transitionsPath)
+		if len(eventsAfter) != len(eventsBefore) || len(transitionsAfter) != len(transitionsBefore) {
+			t.Fatal("failed chain preflight wrote recovery objects")
+		}
+	}
+
+	t.Run("generation", func(t *testing.T) {
+		pointer := runPointer{
+			Schema: runPointerSchema, RunID: "chain-overflow",
+			Current:  TransitionReference{Generation: ^uint64(0) - 1, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+			Previous: &baseReference,
+		}
+		assertNoWrites(t, func() error {
+			_, err := store.buildRecoveryChain("chain-overflow", pointer, base)
+			return err
+		})
+	})
+
+	t.Run("event sequence", func(t *testing.T) {
+		var previous eventObject
+		if err := store.readObject("chain-overflow", "events", base.EventDigest, &previous); err != nil {
+			t.Fatal(err)
+		}
+		previous.Sequence = ^uint64(0) - 1
+		previous.Digest = ""
+		previous.Digest, _ = digestWithoutField(eventSchema, previous, func(value *eventObject) { value.Digest = "" })
+		if err := store.writeImmutable("chain-overflow", "events", previous.Digest, previous); err != nil {
+			t.Fatal(err)
+		}
+		sequenceBase := base
+		sequenceBase.EventDigest = previous.Digest
+		pointer := runPointer{
+			Schema: runPointerSchema, RunID: "chain-overflow",
+			Current:  TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("e", 64), ResultingStateDigest: strings.Repeat("f", 64)},
+			Previous: &baseReference,
+		}
+		assertNoWrites(t, func() error {
+			_, err := store.buildRecoveryChain("chain-overflow", pointer, sequenceBase)
+			return err
+		})
+	})
 }
 
 func TestTypedRunPublishesFencedEffectDisabledSuccessorAndRetriesExactly(t *testing.T) {
