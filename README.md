@@ -225,8 +225,11 @@ are ignored; exact-byte retries re-sync and converge.
 Projection entries are derived from packet source descriptors, and loading
 recomputes the exact source-bundle identity from persisted observation
 envelopes before accepting packet, projection, or event bindings. Each entry
-keeps its declaration ID separately from its closed source-kind label. Events
-are capped at 64 KiB and complete observation objects at 1 MiB.
+keeps its declaration ID separately from its closed provenance label: receiving
+and environment-classification sources map to `receiving_system`, while
+validation and Platoon-policy sources map to `platoon`. Events are capped at 64
+KiB and complete observation objects at 1 MiB. Generated event times must be
+canonical, representable RFC 3339 timestamps before any object write.
 
 If a pointer names an invalid current transition but a verified previous
 transition, recovery first publishes a no-effect quarantine at `N+1` and

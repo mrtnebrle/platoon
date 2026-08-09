@@ -208,6 +208,80 @@ func TestTypedObjectLimitsBoundEventsAndObservations(t *testing.T) {
 	}
 }
 
+func TestTypedRunRejectsUnrepresentableGeneratedTimesBeforePublication(t *testing.T) {
+	t.Run("genesis", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		store := openTestTypedRunStore(t, root)
+		input := testGenesisInput(t, "bad-genesis-time")
+		input.PublishedAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+		if _, err := store.PublishGenesis(input); err == nil {
+			t.Fatal("unrepresentable genesis time was accepted")
+		}
+		if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("invalid genesis time created state: %v", err)
+		}
+	})
+
+	t.Run("successor", func(t *testing.T) {
+		store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+		genesis, err := store.PublishGenesis(testGenesisInput(t, "bad-successor-time"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(store.pointerPath("bad-successor-time"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.PublishSuccessor(SuccessorInput{
+			RunID: "bad-successor-time", Expected: genesis.Fence,
+			PublishedAt: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+		if err == nil {
+			t.Fatal("unrepresentable successor time was accepted")
+		}
+		after, err := os.ReadFile(store.pointerPath("bad-successor-time"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("invalid successor time changed authority")
+		}
+	})
+
+	t.Run("recovery overflow", func(t *testing.T) {
+		store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+		input := testGenesisInput(t, "bad-recovery-time")
+		input.PublishedAt = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
+		genesis, err := store.PublishGenesis(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		invalid := runPointer{
+			Schema: runPointerSchema, RunID: "bad-recovery-time",
+			Current: TransitionReference{Generation: 2, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+			Previous: &TransitionReference{
+				Generation: genesis.Fence.Generation, TransitionDigest: genesis.Fence.TransitionDigest,
+				ResultingStateDigest: genesis.State.ResultingStateDigest,
+			},
+		}
+		writeTestPointer(t, store.pointerPath("bad-recovery-time"), invalid)
+		before, err := os.ReadFile(store.pointerPath("bad-recovery-time"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Recover("bad-recovery-time", TypedRunFence{Generation: 2, TransitionDigest: invalid.Current.TransitionDigest}); err == nil {
+			t.Fatal("recovery timestamp overflow was accepted")
+		}
+		after, err := os.ReadFile(store.pointerPath("bad-recovery-time"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("recovery timestamp overflow changed authority")
+		}
+	})
+}
+
 func TestTypedRunRecoveryQuarantinesInvalidCurrentBeforeReconcileRequired(t *testing.T) {
 	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "repair-run"))
@@ -340,6 +414,39 @@ func TestTypedRunSuccessorRetriesEveryPublicationBoundary(t *testing.T) {
 				t.Fatalf("retried successor = %#v", retried)
 			}
 		})
+	}
+}
+
+func TestTypedRunRecognizedSuccessorRetryResyncsPointerDirectory(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	genesis, err := store.PublishGenesis(testGenesisInput(t, "successor-sync"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := SuccessorInput{
+		RunID: "successor-sync", Expected: genesis.Fence,
+		PublishedAt: time.Date(2026, 8, 8, 10, 3, 0, 0, time.UTC),
+	}
+	store.failpoint = func(boundary PublicationBoundary) error {
+		if boundary == BoundaryAfterPointerPublish {
+			return errors.New("synthetic crash before pointer directory sync")
+		}
+		return nil
+	}
+	if _, err := store.PublishSuccessor(input); err == nil {
+		t.Fatal("successor crossed pre-sync crash")
+	}
+	store.failpoint = nil
+	syncs := 0
+	store.pointerSync = func(string) error {
+		syncs++
+		return nil
+	}
+	if _, err := store.PublishSuccessor(input); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("recognized retry pointer syncs = %d, want 1", syncs)
 	}
 }
 
@@ -782,13 +889,36 @@ func TestProjectionPersistsClosedSourceLabelSeparateFromSourceID(t *testing.T) {
 	}
 	foundDistinct := false
 	for _, entry := range projection.Entries {
-		if !sourceKinds[entry.SourceLabel] {
+		if !provenanceLabels[entry.SourceLabel] {
 			t.Fatalf("source label is not closed: %#v", entry)
 		}
 		foundDistinct = foundDistinct || entry.SourceLabel != entry.SourceID
 	}
 	if !foundDistinct {
 		t.Fatal("projection source labels duplicate declaration IDs")
+	}
+	for kind, want := range map[string]string{
+		"git": "git", "td": "td", "dagr": "dagr", "sergeant": "sergeant",
+		"receiving-system": "receiving_system", "environment-classifier": "receiving_system",
+		"validation-capability": "platoon", "platoon-policy": "platoon",
+	} {
+		if got := sourceProvenanceLabels[kind]; got != want {
+			t.Errorf("source label for %s = %q, want %q", kind, got, want)
+		}
+	}
+	for _, kind := range []string{"receiving-system", "environment-classifier", "validation-capability", "platoon-policy"} {
+		label := sourceProvenanceLabels[kind]
+		entries := []projectionEntry{{
+			Role: "authority", SourceLabel: label, SourceID: "synthetic-source", Locator: "synthetic-locator",
+			Revision: "revision-v1", Reason: "synthetic evidence", Exposure: "bound", ObservationDigest: strings.Repeat("a", 64),
+		}}
+		if err := validateProjectionEntries(entries, []string{strings.Repeat("a", 64)}); err != nil {
+			t.Fatalf("mapped source label %s rejected: %v", label, err)
+		}
+		entries[0].SourceLabel = kind
+		if err := validateProjectionEntries(entries, []string{strings.Repeat("a", 64)}); err == nil {
+			t.Fatalf("unmapped source kind %s accepted as provenance label", kind)
+		}
 	}
 }
 

@@ -126,9 +126,10 @@ type TypedRunSnapshot struct {
 }
 
 type TypedRunStore struct {
-	root      string
-	rollback  RollbackVerifier
-	failpoint func(PublicationBoundary) error
+	root        string
+	rollback    RollbackVerifier
+	failpoint   func(PublicationBoundary) error
+	pointerSync func(string) error
 }
 
 type compiledPacket struct {
@@ -245,9 +246,12 @@ func OpenTypedRunStore(root string, rollback RollbackVerifier) (*TypedRunStore, 
 }
 
 func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, error) {
-	if s == nil || !opaqueid.Valid(input.RunID) || input.Packet.compiled == nil || input.Packet.ID == "" ||
-		input.PublishedAt.IsZero() || input.PublishedAt.Location() != time.UTC {
+	if s == nil || !opaqueid.Valid(input.RunID) || input.Packet.compiled == nil || input.Packet.ID == "" {
 		return nil, errors.New("typed genesis input is invalid")
+	}
+	publishedAt, err := formatEventTime(input.PublishedAt)
+	if err != nil {
+		return nil, errors.New("typed genesis input time is invalid")
 	}
 	if err := s.validateRollbackEvidence(input.Rollback); err != nil {
 		return nil, err
@@ -308,11 +312,14 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 	}
 	event := eventObject{
 		Schema: eventSchema, RunID: input.RunID, Sequence: 1, PreviousEventDigest: nil,
-		RunGeneration: 1, ProjectionRevision: 0, OccurredAt: input.PublishedAt.Format(time.RFC3339Nano),
+		RunGeneration: 1, ProjectionRevision: 0, OccurredAt: publishedAt,
 		Type: "packet_run_published", Subject: input.RunID, EvidenceDigests: append([]string(nil), observationDigests...),
 	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
+		return nil, err
+	}
+	if err := validateEventSemantics(event); err != nil {
 		return nil, err
 	}
 	state := TypedRunState{
@@ -358,7 +365,7 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 	}
 	if existing, loadErr := s.Load(input.RunID); loadErr == nil {
 		if existing.Fence.RepairEpoch == 0 && existing.Fence.Generation == 1 && existing.Fence.TransitionDigest == commit.Digest {
-			if err := syncTypedDirectory(filepath.Dir(s.pointerPath(input.RunID))); err != nil {
+			if err := s.syncPointerDirectory(input.RunID); err != nil {
 				return nil, err
 			}
 			return existing, nil
@@ -400,9 +407,12 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 }
 
 func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapshot, error) {
-	if s == nil || !opaqueid.Valid(input.RunID) || input.Expected.Generation == 0 || !validDigest(input.Expected.TransitionDigest) ||
-		input.PublishedAt.IsZero() || input.PublishedAt.Location() != time.UTC {
+	if s == nil || !opaqueid.Valid(input.RunID) || input.Expected.Generation == 0 || !validDigest(input.Expected.TransitionDigest) {
 		return nil, errors.New("typed successor input is invalid")
+	}
+	publishedAt, err := formatEventTime(input.PublishedAt)
+	if err != nil {
+		return nil, errors.New("typed successor input time is invalid")
 	}
 	if err := s.validateRunDirectories(input.RunID); err != nil {
 		return nil, err
@@ -426,7 +436,10 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 		if loadErr == nil && pointer.Previous != nil && pointer.RepairEpoch == input.Expected.RepairEpoch &&
 			pointer.Previous.Generation == input.Expected.Generation && pointer.Previous.TransitionDigest == input.Expected.TransitionDigest {
 			event, eventErr := s.loadEvent(input.RunID, current.State.EventDigest)
-			if eventErr == nil && event.Type == "typed_generation_published" && event.OccurredAt == input.PublishedAt.Format(time.RFC3339Nano) {
+			if eventErr == nil && event.Type == "typed_generation_published" && event.OccurredAt == publishedAt {
+				if err := s.syncPointerDirectory(input.RunID); err != nil {
+					return nil, err
+				}
 				return current, nil
 			}
 		}
@@ -458,7 +471,7 @@ func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapsho
 	event := eventObject{
 		Schema: eventSchema, RunID: input.RunID, Sequence: nextSequence, PreviousEventDigest: &predecessor.EventDigest,
 		RunGeneration: nextGeneration, ProjectionRevision: current.State.ProjectionRevision,
-		OccurredAt: input.PublishedAt.Format(time.RFC3339Nano), Type: "typed_generation_published", Subject: input.RunID,
+		OccurredAt: publishedAt, Type: "typed_generation_published", Subject: input.RunID,
 		EvidenceDigests: append([]string(nil), current.State.ObservationDigests...),
 	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
@@ -543,7 +556,7 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 					var quarantine transitionCommit
 					if err := s.readObject(runID, "transitions", pointer.Previous.TransitionDigest, &quarantine); err == nil &&
 						quarantine.ResultingState.Status == TypedRunQuarantined && recoveryMatchesExpected(quarantine, expected) {
-						if err := syncTypedDirectory(filepath.Dir(s.pointerPath(runID))); err != nil {
+						if err := s.syncPointerDirectory(runID); err != nil {
 							return nil, err
 						}
 						return current, nil
@@ -560,7 +573,7 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 		case TypedRunQuarantined:
 			return s.publishRepair(runID, pointerRaw, pointer)
 		case TypedRunInitializing, TypedRunReconcileRequired:
-			if err := syncTypedDirectory(filepath.Dir(s.pointerPath(runID))); err != nil {
+			if err := s.syncPointerDirectory(runID); err != nil {
 				return nil, err
 			}
 			return current, nil
@@ -619,7 +632,10 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, nextGeneration, nextSequence, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
+	event, err := recoveryEvent(runID, nextGeneration, nextSequence, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
+	if err != nil {
+		return nil, err
+	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -688,7 +704,10 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, nextGeneration, nextSequence, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
+	event, err := recoveryEvent(runID, nextGeneration, nextSequence, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
+	if err != nil {
+		return nil, err
+	}
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -734,14 +753,54 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	return s.Load(runID)
 }
 
-func recoveryEvent(runID string, generation, sequence uint64, eventType, previousDigest string, observations []string, previousTime string) eventObject {
-	occurredAt, _ := time.Parse(time.RFC3339Nano, previousTime)
-	occurredAt = occurredAt.Add(time.Nanosecond)
+func recoveryEvent(runID string, generation, sequence uint64, eventType, previousDigest string, observations []string, previousTime string) (eventObject, error) {
+	occurredAt, err := time.Parse(time.RFC3339Nano, previousTime)
+	if err != nil || occurredAt.Format(time.RFC3339Nano) != previousTime {
+		return eventObject{}, errors.New("typed recovery event predecessor time is invalid")
+	}
+	formatted, err := formatEventTime(occurredAt.Add(time.Nanosecond))
+	if err != nil {
+		return eventObject{}, err
+	}
 	return eventObject{
 		Schema: eventSchema, RunID: runID, Sequence: sequence, PreviousEventDigest: &previousDigest,
-		RunGeneration: generation, ProjectionRevision: 0, OccurredAt: occurredAt.Format(time.RFC3339Nano),
+		RunGeneration: generation, ProjectionRevision: 0, OccurredAt: formatted,
 		Type: eventType, Subject: runID, EvidenceDigests: append([]string(nil), observations...),
+	}, nil
+}
+
+func validateEventSemantics(event eventObject) error {
+	if event.Schema != eventSchema || !opaqueid.Valid(event.RunID) || event.Sequence == 0 || event.RunGeneration == 0 ||
+		event.ProjectionRevision != 0 || !eventTypes[event.Type] || event.Subject != event.RunID || !validUniqueDigests(event.EvidenceDigests) ||
+		(event.PreviousEventDigest != nil && !validDigest(*event.PreviousEventDigest)) {
+		return errors.New("typed event semantics are invalid")
 	}
+	parsed, err := time.Parse(time.RFC3339Nano, event.OccurredAt)
+	if err != nil || parsed.Location() != time.UTC || parsed.Format(time.RFC3339Nano) != event.OccurredAt {
+		return errors.New("typed event time is invalid")
+	}
+	wantDigest, err := digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
+	if err != nil || wantDigest != event.Digest {
+		return errors.New("typed event digest is invalid")
+	}
+	return nil
+}
+
+func formatEventTime(value time.Time) (string, error) {
+	if value.IsZero() || value.Location() != time.UTC {
+		return "", errors.New("typed event time must be nonzero UTC")
+	}
+	formatted := value.Format(time.RFC3339Nano)
+	parsed, err := time.Parse(time.RFC3339Nano, formatted)
+	if err != nil || parsed.Format(time.RFC3339Nano) != formatted {
+		return "", errors.New("typed event time is outside the durable range")
+	}
+	return formatted, nil
+}
+
+var eventTypes = map[string]bool{
+	"packet_run_published": true, "typed_generation_published": true,
+	"current_transition_quarantined": true, "reconcile_required": true,
 }
 
 func (s *TypedRunStore) writeRecoveryObjects(runID string, event eventObject, commit transitionCommit) error {
@@ -927,13 +986,9 @@ func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCom
 	if err := s.readObject(runID, "events", commit.EventDigest, &event); err != nil {
 		return fmt.Errorf("load event object: %w", err)
 	}
-	wantEvent, err := digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
-	if _, timeErr := time.Parse(time.RFC3339Nano, event.OccurredAt); timeErr != nil {
-		return errors.New("typed event time is invalid")
-	}
-	if err != nil || event.Schema != eventSchema || event.RunID != runID || event.Sequence != expected.Sequence || event.RunGeneration != commit.Generation ||
+	if err := validateEventSemantics(event); err != nil || event.RunID != runID || event.Sequence != expected.Sequence || event.RunGeneration != commit.Generation ||
 		event.ProjectionRevision != 0 || !sameOptionalString(event.PreviousEventDigest, expected.PreviousDigest) || event.Type != expected.Type || event.Subject != runID ||
-		event.Digest != commit.EventDigest || wantEvent != event.Digest || !sameStrings(event.EvidenceDigests, commit.ObservationDigests) {
+		event.Digest != commit.EventDigest || !sameStrings(event.EvidenceDigests, commit.ObservationDigests) {
 		return errors.New("typed event object is invalid")
 	}
 	return nil
@@ -1160,8 +1215,12 @@ func buildProjectionEntries(sources []source, observations []SourceObservation) 
 		if declared.ObservationPolicy != "" {
 			revision = observation.ObservedAt
 		}
+		label, ok := sourceProvenanceLabels[declared.Kind]
+		if !ok {
+			return nil, errors.New("compiled projection source label is unsupported")
+		}
 		entries = append(entries, projectionEntry{
-			Role: declared.Role, SourceLabel: declared.Kind, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
+			Role: declared.Role, SourceLabel: label, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
 			Reason: declared.Reason, Exposure: "bound", ObservationDigest: observation.EnvelopeDigest,
 		})
 	}
@@ -1176,7 +1235,7 @@ func validateProjectionEntries(entries []projectionEntry, observations []string)
 	seenSources := make(map[string]bool, len(entries))
 	seenObservations := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		if !validSlug(entry.Role) || !sourceKinds[entry.SourceLabel] || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
+		if !validSlug(entry.Role) || !provenanceLabels[entry.SourceLabel] || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
 			!safeOpaque(entry.Revision) || secretLike(entry.Locator) || secretLike(entry.Revision) || secretLike(entry.Reason) ||
 			entry.Reason == "" || len(entry.Reason) > 512 || hasControl(entry.Reason) || entry.Exposure != "bound" || !allowed[entry.ObservationDigest] {
 			return errors.New("typed projection entry is unsafe or unbound")
@@ -1188,6 +1247,16 @@ func validateProjectionEntries(entries []projectionEntry, observations []string)
 		return errors.New("typed projection observation set is incomplete")
 	}
 	return nil
+}
+
+var sourceProvenanceLabels = map[string]string{
+	"git": "git", "td": "td", "dagr": "dagr", "sergeant": "sergeant",
+	"receiving-system": "receiving_system", "environment-classifier": "receiving_system",
+	"validation-capability": "platoon", "platoon-policy": "platoon",
+}
+
+var provenanceLabels = map[string]bool{
+	"git": true, "td": true, "dagr": true, "sergeant": true, "receiving_system": true, "platoon": true,
 }
 
 func validateTypedObjectSize(kind string, value any) error {
@@ -1206,6 +1275,9 @@ func validateTypedObjectSize(kind string, value any) error {
 }
 
 func validateGeneratedCandidate(event eventObject, commit transitionCommit, pointer runPointer, commitPrevious TransitionReference, pointerPrevious *TransitionReference, baseState TypedRunState, status TypedRunStatus) error {
+	if err := validateEventSemantics(event); err != nil {
+		return err
+	}
 	if event.Schema != eventSchema || commit.Schema != transitionSchema || pointer.Schema != runPointerSchema ||
 		event.RunID == "" || event.RunID != commit.RunID || event.RunID != pointer.RunID || event.RunGeneration != commit.Generation ||
 		event.Digest != commit.EventDigest || event.ProjectionRevision != commit.ResultingState.ProjectionRevision ||
@@ -1229,10 +1301,6 @@ func validateGeneratedCandidate(event eventObject, commit transitionCommit, poin
 	expectedState.ResultingStateDigest = expectedDigest
 	if err != nil || !canonicalEqual(expectedState, commit.ResultingState) {
 		return errors.New("generated typed state does not derive from verified base")
-	}
-	wantEvent, err := digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
-	if err != nil || wantEvent != event.Digest {
-		return errors.New("generated typed event digest is invalid")
 	}
 	wantState, err := digestState(commit.ResultingState)
 	if err != nil || wantState != commit.ResultingState.ResultingStateDigest {
@@ -1822,4 +1890,12 @@ func (s *TypedRunStore) runDir(runID string) string {
 
 func (s *TypedRunStore) pointerPath(runID string) string {
 	return filepath.Join(s.runDir(runID), "current.json")
+}
+
+func (s *TypedRunStore) syncPointerDirectory(runID string) error {
+	directory := filepath.Dir(s.pointerPath(runID))
+	if s.pointerSync != nil {
+		return s.pointerSync(directory)
+	}
+	return syncTypedDirectory(directory)
 }
