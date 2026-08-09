@@ -75,6 +75,13 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 			return unavailableObservation(base), nil
 		}
 		base.AdapterVersion = "dagr-" + executableHash[:16]
+		help, err := s.executor.Run(ctx, Invocation{
+			Executable: s.manifest.Spec.Adapters.Dagr.Executable, Args: []string{"--help"},
+			Timeout: s.manifest.Spec.Limits.CommandDuration(), MaxOutput: 64 << 10,
+		})
+		if err != nil || len(help.Stderr) != 0 || !dagrHelpProvesOperations(string(help.Stdout)) {
+			return unavailableObservation(base), nil
+		}
 		info, err := os.Lstat(s.manifest.Spec.Adapters.Dagr.Database)
 		if err != nil || !info.Mode().IsRegular() {
 			return unavailableObservation(base), nil
@@ -93,6 +100,10 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 			return unavailableObservation(base), nil
 		}
 		if _, err := strconv.ParseUint(schemaVersion, 10, 64); err != nil {
+			return unavailableObservation(base), nil
+		}
+		after, err := os.Lstat(s.manifest.Spec.Adapters.Dagr.Database)
+		if err != nil || !after.Mode().IsRegular() || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
 			return unavailableObservation(base), nil
 		}
 		base.Payload = map[string]any{
@@ -118,12 +129,24 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 		}
 	case "validation-capability":
 		base.AdapterVersion = "unsupported-v1"
+		if base.Revision == "" {
+			base.Revision = "unsupported"
+		}
 		base.Quality = missioncontrol.QualityUnsupported
 		base.Payload = map[string]any{"status": "unsupported"}
 	default:
 		return unavailableObservation(base), nil
 	}
 	return base, nil
+}
+
+func dagrHelpProvesOperations(help string) bool {
+	for _, required := range []string{"workflow", "load", "stage", "list", "run", "start", "watch", "step-done", "step-fail"} {
+		if !strings.Contains(help, required) {
+			return false
+		}
+	}
+	return true
 }
 
 func executableDigest(executable string) (string, error) {

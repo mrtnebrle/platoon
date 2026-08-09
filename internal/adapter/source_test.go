@@ -27,7 +27,7 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: dagrExecutable, Database: database, InspectExecutable: "sqlite3"}},
 		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: t.TempDir()}},
 	}}
-	executor := &sequenceExecutor{results: []Result{{Stdout: []byte(revision + "\n")}, {Stdout: []byte("1\n")}}}
+	executor := &sequenceExecutor{results: []Result{{Stdout: []byte(revision + "\n")}, {Stdout: []byte(dagrCapabilityHelp)}, {Stdout: []byte("1\n")}}}
 	now := func() time.Time { return time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC) }
 	sources := &MissionSources{manifest: m, executor: executor, now: now}
 
@@ -49,7 +49,7 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 	if err != nil || policyObservation.Quality != missioncontrol.QualityVerified || len(policyObservation.Payload["policyDigest"].(string)) != 64 {
 		t.Fatalf("policy observation=%#v err=%v", policyObservation, err)
 	}
-	if len(executor.invocations) != 2 {
+	if len(executor.invocations) != 3 {
 		t.Fatalf("read-only adapter invocations=%#v", executor.invocations)
 	}
 }
@@ -69,7 +69,7 @@ func TestMissionSourcesDeriveMutableNativeRevisions(t *testing.T) {
 		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: executable, Database: database, InspectExecutable: "sqlite3"}},
 		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: dir}},
 	}}
-	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{results: []Result{{Stdout: []byte(objectID + "\n")}, {Stdout: []byte("2\n")}}}}
+	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{results: []Result{{Stdout: []byte(objectID + "\n")}, {Stdout: []byte(dagrCapabilityHelp)}, {Stdout: []byte("2\n")}}}}
 	queries := []missioncontrol.SourceQuery{
 		{SourceID: "git-source", Kind: "git", Schema: "git.object/v1", Locator: "synthetic-repository"},
 		{SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr"},
@@ -82,3 +82,48 @@ func TestMissionSourcesDeriveMutableNativeRevisions(t *testing.T) {
 		}
 	}
 }
+
+func TestMissionSourcesRejectDagrDatabaseChangeDuringInspection(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "dagr.db")
+	executable := filepath.Join(dir, "dagr")
+	for path, body := range map[string]string{database: "first", executable: "executable"} {
+		if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := 0
+	executor := sourceExecutor(func(_ context.Context, _ Invocation) (Result, error) {
+		calls++
+		if calls == 1 {
+			return Result{Stdout: []byte(dagrCapabilityHelp)}, nil
+		}
+		replacement := filepath.Join(dir, "replacement.db")
+		if err := os.WriteFile(replacement, []byte("second"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacement, database); err != nil {
+			t.Fatal(err)
+		}
+		return Result{Stdout: []byte("1\n")}, nil
+	})
+	m := &manifest.Manifest{Spec: manifest.Spec{
+		Limits:   manifest.Limits{CommandTimeout: "1s"},
+		Adapters: manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: executable, Database: database, InspectExecutable: "sqlite3"}},
+	}}
+	sources := &MissionSources{manifest: m, executor: executor}
+	observation, err := sources.Query(context.Background(), missioncontrol.SourceQuery{
+		SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr", ExpectedRevision: "v1",
+	})
+	if err != nil || observation.Quality != missioncontrol.QualityUnavailable {
+		t.Fatalf("changed database observation=%#v err=%v", observation, err)
+	}
+}
+
+type sourceExecutor func(context.Context, Invocation) (Result, error)
+
+func (run sourceExecutor) Run(ctx context.Context, invocation Invocation) (Result, error) {
+	return run(ctx, invocation)
+}
+
+const dagrCapabilityHelp = "workflow load stage list run start watch step-done step-fail"

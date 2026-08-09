@@ -244,10 +244,10 @@ func validateObservationPayload(observation SourceObservation) error {
 		allowed, required = []string{"resolutionNamespace", "sourceVersion", "evidenceDigest"}, []string{"resolutionNamespace", "sourceVersion", "evidenceDigest"}
 	case "platoon.receiving-capability/v1alpha1":
 		allowed, required = []string{"capabilityRevision", "authorityRevision", "actionRevision", "environment", "production", "destructive", "decisionDigest"},
-			[]string{"capabilityRevision", "authorityRevision", "environment", "production", "destructive", "decisionDigest"}
+			[]string{"capabilityRevision", "authorityRevision", "actionRevision", "environment", "production", "destructive", "decisionDigest"}
 	case "platoon.target-proof/v1alpha1":
-		allowed, required = []string{"issuer", "trustRootRevision", "adapterIdentityDigest", "actionId", "targetId", "endpointDigest", "environment", "production", "destructive", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt", "proofDigest"},
-			[]string{"issuer", "trustRootRevision", "adapterIdentityDigest", "targetId", "endpointDigest", "environment", "production", "destructive", "proofDigest"}
+		allowed, required = []string{"issuer", "trustRootRevision", "signature", "adapterIdentityDigest", "actionId", "targetId", "endpointDigest", "environment", "production", "destructive", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt", "proofDigest"},
+			[]string{"issuer", "trustRootRevision", "signature", "adapterIdentityDigest", "actionId", "targetId", "endpointDigest", "environment", "production", "destructive", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt", "proofDigest"}
 	case "platoon.validation-capability/v1alpha1":
 		allowed, required = []string{"profileDigest", "executableDigest", "sandboxDigest", "policyDigest"}, []string{"profileDigest", "executableDigest", "sandboxDigest", "policyDigest"}
 	case "platoon.policy/v1alpha1":
@@ -265,18 +265,11 @@ func validateObservationPayload(observation SourceObservation) error {
 	}
 	if observation.Schema == "platoon.receiving-capability/v1alpha1" {
 		stringFields = []string{"capabilityRevision", "authorityRevision", "environment", "decisionDigest"}
-		if _, present := observation.Payload["actionRevision"]; present {
-			stringFields = append(stringFields, "actionRevision")
-		}
+		stringFields = append(stringFields, "actionRevision")
 		boolFields = []string{"production", "destructive"}
 	}
 	if observation.Schema == "platoon.target-proof/v1alpha1" {
-		stringFields = []string{"issuer", "trustRootRevision", "adapterIdentityDigest", "targetId", "endpointDigest", "environment", "proofDigest"}
-		for _, optional := range []string{"actionId", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt"} {
-			if _, present := observation.Payload[optional]; present {
-				stringFields = append(stringFields, optional)
-			}
-		}
+		stringFields = []string{"issuer", "trustRootRevision", "signature", "adapterIdentityDigest", "actionId", "targetId", "endpointDigest", "environment", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt", "proofDigest"}
 		boolFields = []string{"production", "destructive"}
 	}
 	for _, field := range stringFields {
@@ -322,6 +315,13 @@ func validateObservationPayload(observation SourceObservation) error {
 		if !environmentOK || (environment != "development" && environment != "test" && environment != "staging") ||
 			!productionOK || production || !destructiveOK || destructive {
 			return errors.New("source observation target classification is invalid")
+		}
+	}
+	if observation.Schema == "platoon.target-proof/v1alpha1" {
+		issuedAt, issuedErr := time.Parse(time.RFC3339Nano, observation.Payload["issuedAt"].(string))
+		expiresAt, expiresErr := time.Parse(time.RFC3339Nano, observation.Payload["expiresAt"].(string))
+		if issuedErr != nil || expiresErr != nil || !expiresAt.After(issuedAt) {
+			return errors.New("source observation target proof time is invalid")
 		}
 	}
 	return nil

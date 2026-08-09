@@ -129,7 +129,7 @@ func gateSurvey(d *declaration, callerRole, stage string) error {
 		needed[sourceQueryEffect(declared.Kind)] = true
 	}
 	for _, stop := range d.Spec.Stops {
-		applicable := stop.Scope.Entry || (stage != "" && contains(stop.Scope.Stages, stage))
+		applicable := stage != "" && contains(stop.Scope.Stages, stage)
 		for _, effect := range stop.Scope.Effects {
 			applicable = applicable || needed[effect]
 		}
