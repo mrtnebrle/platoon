@@ -35,9 +35,8 @@ func CompileForApply(m *manifest.Manifest, manifestFile string, bundleBytes []by
 }
 
 func compileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []byte, evaluatedAt time.Time, checkFreshness bool) (Preview, error) {
-	preview, err := Compile(m, manifestFile)
-	if err != nil || preview.Mode != manifest.MissionDeclarationV1Alpha1 {
-		return preview, err
+	if m.Spec.MissionFormat != manifest.MissionDeclarationV1Alpha1 {
+		return Compile(m, manifestFile)
 	}
 	declarationBytes, err := readStable(declarationFile(m, manifestFile))
 	if err != nil {
@@ -47,6 +46,10 @@ func compileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []
 	if err != nil {
 		return Preview{}, compileFailure(classifyDecodeError(err))
 	}
+	if err := validate(d, m); err != nil {
+		return Preview{}, compileFailure(classifyValidationError(err))
+	}
+	preview := previewDeclaration(d, m)
 	var bundle SourceBundle
 	if checkFreshness {
 		bundle, err = DecodeSourceBundle(bundleBytes, evaluatedAt)

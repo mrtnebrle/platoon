@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"time"
 
 	"github.com/mrtnebrle/platoon/internal/manifest"
@@ -24,15 +25,16 @@ type RevalidationResult struct {
 }
 
 type RevalidateInput struct {
-	Manifest     *manifest.Manifest
-	ManifestFile string
-	BundleBytes  []byte
-	CallerRole   string
-	Stage        string
+	Manifest               *manifest.Manifest
+	ManifestFile           string
+	BundleBytes            []byte
+	CallerRole             string
+	Stage                  string
+	ExpectedIntentRevision string
 }
 
 func Revalidate(ctx context.Context, input RevalidateInput, registry SourceRegistry) (RevalidationResult, error) {
-	if input.Manifest == nil || input.ManifestFile == "" || len(input.BundleBytes) == 0 {
+	if input.Manifest == nil || input.ManifestFile == "" || len(input.BundleBytes) == 0 || input.ExpectedIntentRevision == "" {
 		return RevalidationResult{}, errors.New("source revalidation input is incomplete")
 	}
 	if input.Manifest.Spec.MissionFormat != manifest.MissionDeclarationV1Alpha1 {
@@ -54,14 +56,21 @@ func Revalidate(ctx context.Context, input RevalidateInput, registry SourceRegis
 	if err != nil || validate(d, input.Manifest) != nil {
 		return RevalidationResult{Status: RevalidationReplanRequired, Reason: "declaration changed or invalid"}, nil
 	}
+	intentPath := filepath.Join(filepath.Dir(input.ManifestFile), filepath.FromSlash(input.Manifest.Spec.Intent))
+	intentBytes, err := readStable(intentPath)
+	if err != nil || sha256Hex(intentBytes) != input.ExpectedIntentRevision {
+		return RevalidationResult{Status: RevalidationReplanRequired, Reason: "intent changed or unavailable"}, nil
+	}
 	result, err := revalidateValidated(ctx, d, declarationBytes, input.BundleBytes, input.CallerRole, input.Stage, registry)
 	if err != nil || result.Status != RevalidationValidated {
 		return result, err
 	}
 	manifestAfter, manifestErr := readStable(input.ManifestFile)
 	declarationAfter, declarationErr := readStable(declarationFile(input.Manifest, input.ManifestFile))
-	if manifestErr != nil || declarationErr != nil || !bytes.Equal(manifestBytes, manifestAfter) || !bytes.Equal(declarationBytes, declarationAfter) {
-		return RevalidationResult{Status: RevalidationReplanRequired, Reason: "manifest or declaration changed during requery"}, nil
+	intentAfter, intentErr := readStable(intentPath)
+	if manifestErr != nil || declarationErr != nil || intentErr != nil || !bytes.Equal(manifestBytes, manifestAfter) ||
+		!bytes.Equal(declarationBytes, declarationAfter) || !bytes.Equal(intentBytes, intentAfter) {
+		return RevalidationResult{Status: RevalidationReplanRequired, Reason: "manifest, declaration, or intent changed during requery"}, nil
 	}
 	return result, nil
 }

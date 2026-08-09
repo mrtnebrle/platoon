@@ -180,7 +180,11 @@ func Compile(m *manifest.Manifest, manifestFile string) (Preview, error) {
 	if err := validate(d, m); err != nil {
 		return Preview{}, compileFailure(classifyValidationError(err))
 	}
+	return previewDeclaration(d, m), nil
+}
 
+func previewDeclaration(d *declaration, m *manifest.Manifest) Preview {
+	preview := Preview{Mode: manifest.MissionDeclarationV1Alpha1, Ready: true}
 	preview.Schema = d.APIVersion
 	preview.Class = d.Spec.Class
 	for _, output := range d.Spec.Outputs {
@@ -224,7 +228,7 @@ func Compile(m *manifest.Manifest, manifestFile string) (Preview, error) {
 			preview.Sufficiency = append(preview.Sufficiency, SufficiencyDecision{Status: "not-ready", Reason: reason})
 		}
 	}
-	return preview, nil
+	return preview
 }
 
 func readStable(file string) ([]byte, error) {

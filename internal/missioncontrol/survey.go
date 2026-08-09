@@ -128,6 +128,15 @@ func gateSurvey(d *declaration, callerRole, stage string) error {
 	for _, declared := range d.Spec.Sources {
 		needed[sourceQueryEffect(declared.Kind)] = true
 	}
+	for _, stop := range d.Spec.Stops {
+		applicable := stop.Scope.Entry || (stage != "" && contains(stop.Scope.Stages, stage))
+		for _, effect := range stop.Scope.Effects {
+			applicable = applicable || needed[effect]
+		}
+		if applicable {
+			return errors.New("source survey gate refused an applicable stop")
+		}
+	}
 	for effect := range needed {
 		if !allowed[effect] || prohibited[effect] {
 			return errors.New("source survey gate refused an undeclared read or query effect")

@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,17 +54,27 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 		if !ok {
 			return unavailableObservation(base), nil
 		}
+		requestedRevision := query.ExpectedRevision
+		if requestedRevision == "" {
+			requestedRevision = "HEAD"
+		}
 		result, err := s.executor.Run(ctx, Invocation{
-			Executable: "git", Args: []string{"-C", repository.Path, "rev-parse", "--verify", query.ExpectedRevision},
+			Executable: "git", Args: []string{"-C", repository.Path, "rev-parse", "--verify", requestedRevision},
 			Timeout: s.manifest.Spec.Limits.CommandDuration(), MaxOutput: 4096,
 		})
 		objectID := strings.TrimSpace(string(result.Stdout))
-		if err != nil || len(result.Stderr) != 0 || objectID != query.ExpectedRevision {
+		if err != nil || len(result.Stderr) != 0 || (len(objectID) != 40 && len(objectID) != 64) ||
+			(query.ExpectedRevision != "" && objectID != query.ExpectedRevision) {
 			return unavailableObservation(base), nil
 		}
+		base.Revision = objectID
 		base.Payload = map[string]any{"repository": query.Locator, "objectId": objectID}
 	case "dagr":
-		base.AdapterVersion = "dagr-v1"
+		executableHash, err := executableDigest(s.manifest.Spec.Adapters.Dagr.Executable)
+		if err != nil {
+			return unavailableObservation(base), nil
+		}
+		base.AdapterVersion = "dagr-" + executableHash[:16]
 		info, err := os.Lstat(s.manifest.Spec.Adapters.Dagr.Database)
 		if err != nil || !info.Mode().IsRegular() {
 			return unavailableObservation(base), nil
@@ -86,24 +99,62 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 			"databaseIdentity": sourceDigest("dagr-database", identity), "schemaVersion": schemaVersion,
 			"operations": []string{"ack", "list", "load", "start", "watch"},
 		}
+		if base.Revision == "" {
+			base.Revision = sourceDigest(base.AdapterVersion, identity, schemaVersion)
+		}
 	case "platoon-policy":
 		base.AdapterVersion = "platoon-v1"
-		base.Payload = map[string]any{"policyDigest": sourceDigest(query.Kind, query.Locator, query.ExpectedRevision)}
-	case "validation-capability":
-		base.AdapterVersion = "platoon-v1"
-		base.Payload = map[string]any{
-			"profileDigest":    sourceDigest("validation-profile", query.Locator, query.ExpectedRevision),
-			"executableDigest": sourceDigest("validation-executables", query.Locator, query.ExpectedRevision),
-			"sandboxDigest":    sourceDigest("validation-sandbox", query.Locator, query.ExpectedRevision),
-			"policyDigest":     sourceDigest("validation-policy", query.Locator, query.ExpectedRevision),
+		policyBytes, err := json.Marshal(struct {
+			Schema string          `json:"schema"`
+			Limits manifest.Limits `json:"limits"`
+		}{Schema: "platoon.policy/v1alpha1", Limits: s.manifest.Spec.Limits})
+		if err != nil {
+			return unavailableObservation(base), nil
 		}
+		policyDigest := sourceDigest(string(policyBytes))
+		base.Payload = map[string]any{"policyDigest": policyDigest}
+		if base.Revision == "" {
+			base.Revision = policyDigest
+		}
+	case "validation-capability":
+		base.AdapterVersion = "unsupported-v1"
+		base.Quality = missioncontrol.QualityUnsupported
+		base.Payload = map[string]any{"status": "unsupported"}
 	default:
 		return unavailableObservation(base), nil
 	}
 	return base, nil
 }
 
+func executableDigest(executable string) (string, error) {
+	path := executable
+	if !strings.ContainsRune(executable, os.PathSeparator) {
+		resolved, err := exec.LookPath(executable)
+		if err != nil {
+			return "", err
+		}
+		path = resolved
+	}
+	handle, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	info, err := handle.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 64<<20 {
+		return "", errors.New("source executable is unavailable or oversized")
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, io.LimitReader(handle, 64<<20)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
 func unavailableObservation(observation missioncontrol.SourceObservation) missioncontrol.SourceObservation {
+	if observation.Revision == "" {
+		observation.Revision = "unavailable"
+	}
 	observation.Quality = missioncontrol.QualityUnavailable
 	observation.Payload = map[string]any{"status": "unavailable"}
 	return observation

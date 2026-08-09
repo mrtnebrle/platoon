@@ -30,8 +30,8 @@ func TestSourceBundleIdentitySeparatesContentFromProvenance(t *testing.T) {
 func TestSourceBundleCanonicalizesMapAndSetOrder(t *testing.T) {
 	left := testObservation("2026-08-08T10:00:00Z")
 	right := testObservation("2026-08-08T10:00:00Z")
-	left.Payload = map[string]any{"databaseIdentity": "synthetic-database", "schemaVersion": "v1", "operations": []any{"watch", "load"}}
-	right.Payload = map[string]any{"operations": []any{"load", "watch"}, "schemaVersion": "v1", "databaseIdentity": "synthetic-database"}
+	left.Payload = map[string]any{"databaseIdentity": "synthetic-database", "schemaVersion": "v1", "operations": []any{"watch", "start", "load", "list", "ack"}}
+	right.Payload = map[string]any{"operations": []any{"ack", "list", "load", "start", "watch"}, "schemaVersion": "v1", "databaseIdentity": "synthetic-database"}
 
 	first, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry", []SourceObservation{left})
 	if err != nil {
@@ -102,8 +102,9 @@ func TestSourceBundleRejectsSecretValuesAndAggregateOverflow(t *testing.T) {
 	}
 
 	large := make([]SourceObservation, 5)
-	operations := make([]any, 130000)
-	for index := range operations {
+	operations := make([]any, 130005)
+	copy(operations, []any{"ack", "list", "load", "start", "watch"})
+	for index := 5; index < len(operations); index++ {
 		operations[index] = "read"
 	}
 	for index := range large {
@@ -116,10 +117,28 @@ func TestSourceBundleRejectsSecretValuesAndAggregateOverflow(t *testing.T) {
 	}
 }
 
+func TestSourceBundleRejectsSecretMetadataAndWrongPayloadTypes(t *testing.T) {
+	secret := testObservation("2026-08-08T10:00:00Z")
+	secret.Revision = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+	if _, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", []SourceObservation{secret}); err == nil {
+		t.Fatal("accepted secret-like observation metadata")
+	}
+	malformed := testObservation("2026-08-08T10:00:00Z")
+	malformed.Payload["databaseIdentity"] = true
+	if _, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", []SourceObservation{malformed}); err == nil {
+		t.Fatal("accepted malformed capability field type")
+	}
+	missingCapability := testObservation("2026-08-08T10:00:00Z")
+	missingCapability.Payload["operations"] = []any{"load"}
+	if _, err := NewSourceBundle("declaration-digest", "catalog-digest", "operator", "entry-operator", []SourceObservation{missingCapability}); err == nil {
+		t.Fatal("accepted incomplete Dagr capability")
+	}
+}
+
 func testObservation(observedAt string) SourceObservation {
 	return SourceObservation{
 		SourceID: "dagr-authority", Kind: "dagr", Schema: "dagr.capability/v1", AdapterVersion: "v1",
 		Revision: "capability-v1", Quality: QualityVerified, ObservedAt: observedAt,
-		FreshnessPolicy: "max-age:5m", Payload: map[string]any{"databaseIdentity": "synthetic-database", "schemaVersion": "v1", "operations": []any{"load", "watch"}},
+		FreshnessPolicy: "max-age:5m", Payload: map[string]any{"databaseIdentity": "synthetic-database", "schemaVersion": "v1", "operations": []any{"ack", "list", "load", "start", "watch"}},
 	}
 }

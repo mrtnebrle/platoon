@@ -36,6 +36,19 @@ func TestSurveyGateRefusesBeforeQuery(t *testing.T) {
 	}
 }
 
+func TestSurveyApplicableStopRefusesBeforeQuery(t *testing.T) {
+	querier := &recordingSourceQuerier{}
+	d := surveyDeclaration()
+	d.Spec.Stops = []stop{{ID: "entry-stop", Scope: stopScope{Entry: true}}}
+	_, err := surveyValidated(context.Background(), d, []byte("synthetic declaration"), "operator", "", SourceRegistry{ByKind: map[string]SourceQuerier{"platoon-policy": querier}})
+	if err == nil || !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("survey error = %v", err)
+	}
+	if len(querier.queries) != 0 {
+		t.Fatalf("stopped survey reached adapter: %#v", querier.queries)
+	}
+}
+
 func TestSurveyRoutesTDOnlyThroughSergeantMissionSource(t *testing.T) {
 	generic := &recordingSourceQuerier{}
 	d := surveyDeclaration()

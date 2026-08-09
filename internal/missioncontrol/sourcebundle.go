@@ -26,6 +26,7 @@ const (
 var (
 	windowsAbsolutePath = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 	digestPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	secretValuePattern  = regexp.MustCompile(`(?i)(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})`)
 )
 
 type SourceQuality string
@@ -183,7 +184,7 @@ func readBoundedBundle(file string) ([]byte, error) {
 
 func normalizeObservation(observation *SourceObservation) error {
 	if !validSlug(observation.SourceID) || !sourceKinds[observation.Kind] || observation.Schema != sourceSchemas[observation.Kind] ||
-		!safeOpaque(observation.AdapterVersion) || !safeOpaque(observation.Revision) {
+		!safeOpaque(observation.AdapterVersion) || !safeOpaque(observation.Revision) || secretLike(observation.AdapterVersion) || secretLike(observation.Revision) {
 		return errors.New("source observation identity is invalid")
 	}
 	switch observation.Quality {
@@ -225,7 +226,8 @@ func validateObservationPayload(observation SourceObservation) error {
 		if err := validatePayloadFields(observation.Payload, []string{"status", "reasonCode"}, []string{"status"}); err != nil {
 			return err
 		}
-		if observation.Payload["status"] != string(observation.Quality) {
+		status, ok := observation.Payload["status"].(string)
+		if !ok || status != string(observation.Quality) {
 			return errors.New("source observation status does not match its quality")
 		}
 		return nil
@@ -256,6 +258,37 @@ func validateObservationPayload(observation SourceObservation) error {
 	if err := validatePayloadFields(observation.Payload, allowed, required); err != nil {
 		return err
 	}
+	stringFields := append([]string(nil), required...)
+	boolFields := []string{}
+	if observation.Schema == "dagr.capability/v1" {
+		stringFields = []string{"databaseIdentity", "schemaVersion"}
+	}
+	if observation.Schema == "platoon.receiving-capability/v1alpha1" {
+		stringFields = []string{"capabilityRevision", "authorityRevision", "environment", "decisionDigest"}
+		if _, present := observation.Payload["actionRevision"]; present {
+			stringFields = append(stringFields, "actionRevision")
+		}
+		boolFields = []string{"production", "destructive"}
+	}
+	if observation.Schema == "platoon.target-proof/v1alpha1" {
+		stringFields = []string{"issuer", "trustRootRevision", "adapterIdentityDigest", "targetId", "endpointDigest", "environment", "proofDigest"}
+		for _, optional := range []string{"actionId", "authorityRevision", "capabilityRevision", "issuedAt", "expiresAt"} {
+			if _, present := observation.Payload[optional]; present {
+				stringFields = append(stringFields, optional)
+			}
+		}
+		boolFields = []string{"production", "destructive"}
+	}
+	for _, field := range stringFields {
+		if _, ok := observation.Payload[field].(string); !ok {
+			return errors.New("source observation field has the wrong type")
+		}
+	}
+	for _, field := range boolFields {
+		if _, ok := observation.Payload[field].(bool); !ok {
+			return errors.New("source observation field has the wrong type")
+		}
+	}
 	if observation.Schema == "git.object/v1" {
 		objectID, _ := observation.Payload["objectId"].(string)
 		if !fullObjectIDPattern.MatchString(objectID) {
@@ -270,6 +303,15 @@ func validateObservationPayload(observation SourceObservation) error {
 		for _, operation := range operations {
 			if value, ok := operation.(string); !ok || !safeOpaque(value) {
 				return errors.New("Dagr observation operations are invalid")
+			}
+		}
+		for _, required := range []string{"ack", "list", "load", "start", "watch"} {
+			found := false
+			for _, operation := range operations {
+				found = found || operation == required
+			}
+			if !found {
+				return errors.New("Dagr observation omits a required operation")
 			}
 		}
 	}
@@ -369,7 +411,7 @@ func normalizeJSON(value any, field string) (any, error) {
 		return normalizeJSON(values, field)
 	case string:
 		lower := strings.ToLower(current)
-		if len(current) > maxObservationSize || hasControl(current) || strings.HasPrefix(current, "/") || strings.Contains(current, `\`) ||
+		if len(current) > maxObservationSize || hasControl(current) || strings.HasPrefix(current, "/") || strings.Contains(current, `\`) || secretLike(current) ||
 			windowsAbsolutePath.MatchString(current) || strings.Contains(lower, "token=") || strings.Contains(lower, "password=") ||
 			strings.Contains(lower, "secret=") || strings.Contains(lower, "authorization:") {
 			return nil, errors.New("source observation contains a private or invalid value")
@@ -385,6 +427,12 @@ func normalizeJSON(value any, field string) (any, error) {
 	default:
 		return nil, errors.New("source observation contains an unsupported value")
 	}
+}
+
+func secretLike(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "token=") || strings.Contains(lower, "password=") || strings.Contains(lower, "secret=") ||
+		strings.Contains(lower, "authorization:") || secretValuePattern.MatchString(value)
 }
 
 func containsForbiddenDagrIdentity(payload map[string]any) bool {

@@ -17,10 +17,14 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 	if err := os.WriteFile(database, []byte("synthetic"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	dagrExecutable := filepath.Join(t.TempDir(), "dagr")
+	if err := os.WriteFile(dagrExecutable, []byte("synthetic executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	revision := strings.Repeat("a", 40)
 	m := &manifest.Manifest{Spec: manifest.Spec{
 		Limits:       manifest.Limits{CommandTimeout: "1s"},
-		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Database: database, InspectExecutable: "sqlite3"}},
+		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: dagrExecutable, Database: database, InspectExecutable: "sqlite3"}},
 		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: t.TempDir()}},
 	}}
 	executor := &sequenceExecutor{results: []Result{{Stdout: []byte(revision + "\n")}, {Stdout: []byte("1\n")}}}
@@ -47,5 +51,34 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 	}
 	if len(executor.invocations) != 2 {
 		t.Fatalf("read-only adapter invocations=%#v", executor.invocations)
+	}
+}
+
+func TestMissionSourcesDeriveMutableNativeRevisions(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "dagr.db")
+	executable := filepath.Join(dir, "dagr")
+	for path, body := range map[string]string{database: "database", executable: "executable"} {
+		if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	objectID := strings.Repeat("b", 40)
+	m := &manifest.Manifest{Spec: manifest.Spec{
+		Limits:       manifest.Limits{CommandTimeout: "1s"},
+		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: executable, Database: database, InspectExecutable: "sqlite3"}},
+		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: dir}},
+	}}
+	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{results: []Result{{Stdout: []byte(objectID + "\n")}, {Stdout: []byte("2\n")}}}}
+	queries := []missioncontrol.SourceQuery{
+		{SourceID: "git-source", Kind: "git", Schema: "git.object/v1", Locator: "synthetic-repository"},
+		{SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr"},
+		{SourceID: "policy-source", Kind: "platoon-policy", Schema: "platoon.policy/v1alpha1", Locator: "synthetic-policy"},
+	}
+	for _, query := range queries {
+		observation, err := sources.Query(context.Background(), query)
+		if err != nil || observation.Quality != missioncontrol.QualityVerified || observation.Revision == "" {
+			t.Fatalf("query=%#v observation=%#v err=%v", query, observation, err)
+		}
 	}
 }

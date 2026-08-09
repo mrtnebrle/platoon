@@ -149,7 +149,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
 	}
-	mission, err := compileMissionPreview(m, *file, *bundleFile, false)
+	mission, err := compileMissionPreview(m, *file, *bundleFile, nil, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "plan: %v\n", err)
 		return 1
@@ -195,7 +195,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
 	}
-	mission, err := compileMissionPreview(m, *file, *bundleFile, *apply)
+	var bundleBytes []byte
+	if *bundleFile != "" && m.Spec.MissionFormat == manifest.MissionDeclarationV1Alpha1 {
+		bundleBytes, err = missioncontrol.ReadSourceBundleFile(*bundleFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "start: %v\n", err)
+			return 1
+		}
+	}
+	mission, err := compileMissionPreview(m, *file, *bundleFile, bundleBytes, *apply)
 	if err != nil {
 		fmt.Fprintf(stderr, "start: %v\n", err)
 		return 1
@@ -220,18 +228,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "start: typed mission apply requires a ready compiled source bundle")
 			return 1
 		}
-		bundleBytes, err := missioncontrol.ReadSourceBundleFile(*bundleFile)
-		if err != nil {
-			fmt.Fprintf(stderr, "start: %v\n", err)
-			return 1
-		}
 		runtimeManifest, err := manifest.ResolveRuntimePaths(m, *file)
 		if err != nil {
 			fmt.Fprintf(stderr, "start: %v\n", err)
 			return 1
 		}
 		result, err := missioncontrol.Revalidate(context.Background(), missioncontrol.RevalidateInput{
-			Manifest: m, ManifestFile: *file, BundleBytes: bundleBytes, CallerRole: "platoon",
+			Manifest: m, ManifestFile: *file, BundleBytes: bundleBytes, CallerRole: "platoon", ExpectedIntentRevision: mission.Packet.IntentRevision,
 		}, adapter.NewMissionSourceRegistry(runtimeManifest, adapter.OSExecutor{}, nil))
 		if err != nil {
 			fmt.Fprintf(stderr, "start: %v\n", err)
@@ -243,6 +246,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if result.Status != missioncontrol.RevalidationValidated {
 			fmt.Fprintln(stderr, "start: source revalidation requires a new plan")
+			return 1
+		}
+		if result.BundleID != mission.Packet.BundleID || result.ContentSetDigest != mission.Packet.ContentSetDigest {
+			fmt.Fprintln(stderr, "start: source revalidation does not match the compiled packet")
 			return 1
 		}
 		return 0
@@ -279,16 +286,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string, forApply bool) (missioncontrol.Preview, error) {
+func compileMissionPreview(m *manifest.Manifest, manifestFile, bundleFile string, bundleBytes []byte, forApply bool) (missioncontrol.Preview, error) {
 	if bundleFile == "" {
 		return missioncontrol.Compile(m, manifestFile)
 	}
 	if m.Spec.MissionFormat != manifest.MissionDeclarationV1Alpha1 {
 		return missioncontrol.Preview{}, fmt.Errorf("source bundles are unsupported for reference missions")
 	}
-	bundleBytes, err := missioncontrol.ReadSourceBundleFile(bundleFile)
-	if err != nil {
-		return missioncontrol.Preview{}, err
+	if bundleBytes == nil {
+		var err error
+		bundleBytes, err = missioncontrol.ReadSourceBundleFile(bundleFile)
+		if err != nil {
+			return missioncontrol.Preview{}, err
+		}
 	}
 	if forApply {
 		return missioncontrol.CompileForApply(m, manifestFile, bundleBytes)
