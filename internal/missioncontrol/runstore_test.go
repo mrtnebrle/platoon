@@ -31,21 +31,12 @@ func TestTypedRunStorePublishesVerifiedEffectDisabledGenesis(t *testing.T) {
 		t.Fatalf("compiled preview is not ready: %#v", preview)
 	}
 
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	published, err := store.PublishGenesis(GenesisInput{
 		RunID:       "synthetic-run",
 		Packet:      *preview.Packet,
 		PublishedAt: time.Date(2026, 8, 8, 10, 2, 0, 0, time.UTC),
-		Rollback: RollbackEvidence{
-			ArtifactVersion:  "v0.1.0-rollback",
-			ArtifactDigest:   strings.Repeat("a", 64),
-			FixtureDigest:    strings.Repeat("b", 64),
-			ReadableSchema:   TypedRunSchema,
-			CreationDisabled: true,
-		},
+		Rollback:    testRollbackEvidence(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,10 +81,7 @@ func TestTypedRunGenesisRetriesEveryPublicationBoundary(t *testing.T) {
 	} {
 		t.Run(string(boundary), func(t *testing.T) {
 			input := testGenesisInput(t, "retry-run")
-			store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 			injected := false
 			store.failpoint = func(current PublicationBoundary) error {
 				if !injected && current == boundary {
@@ -134,10 +122,7 @@ func TestTypedRunGenesisRetriesEveryPublicationBoundary(t *testing.T) {
 
 func TestTypedRunGenesisRequiresRollbackEvidenceBeforeCreatingRunFiles(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
-	store, err := OpenTypedRunStore(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, root)
 	input := testGenesisInput(t, "no-rollback")
 	input.Rollback = RollbackEvidence{}
 	if _, err := store.PublishGenesis(input); err == nil || !strings.Contains(err.Error(), "rollback evidence") {
@@ -148,11 +133,81 @@ func TestTypedRunGenesisRequiresRollbackEvidenceBeforeCreatingRunFiles(t *testin
 	}
 }
 
-func TestTypedRunRecoveryQuarantinesInvalidCurrentBeforeReconcileRequired(t *testing.T) {
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
+func TestTypedRunGenesisRejectsWellFormedUntrustedRollbackEvidence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := openTestTypedRunStore(t, root)
+	input := testGenesisInput(t, "untrusted-rollback")
+	input.Rollback.ArtifactDigest = strings.Repeat("c", 64)
+	if _, err := store.PublishGenesis(input); err == nil || !strings.Contains(err.Error(), "untrusted") {
+		t.Fatalf("untrusted rollback error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "typed-runs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("untrusted rollback evidence created state: %v", err)
+	}
+}
+
+func TestTypedRunGenesisRequiresTrustedRollbackVerifier(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store, err := OpenTypedRunStore(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.PublishGenesis(testGenesisInput(t, "no-verifier")); err == nil || !strings.Contains(err.Error(), "trusted rollback verifier") {
+		t.Fatalf("missing rollback verifier error = %v", err)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing rollback verifier created state: %v", err)
+	}
+}
+
+func TestTypedRunGenesisRejectsInvalidRunIDsBeforeCreatingFiles(t *testing.T) {
+	for _, runID := range []string{".", "with:colon", "with/slash", "../escape", strings.Repeat("a", 129)} {
+		t.Run(runID, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "state")
+			store := openTestTypedRunStore(t, root)
+			input := testGenesisInput(t, runID)
+			if _, err := store.PublishGenesis(input); err == nil {
+				t.Fatal("invalid run ID was accepted")
+			}
+			if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid run ID created state: %v", err)
+			}
+		})
+	}
+}
+
+func TestTypedRunGenesisRejectsBundleProvenanceDivergence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := openTestTypedRunStore(t, root)
+	input := testGenesisInput(t, "bundle-divergence")
+	bundle := input.Packet.compiled.Bundle
+	bundle.Observations[0].ObservedAt = "2026-08-08T10:00:01Z"
+	rebuilt, err := NewSourceBundle(bundle.DeclarationDigest, bundle.SourceCatalogDigest, bundle.CallerRole, bundle.QueryScope, bundle.Observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Packet.compiled.Bundle = rebuilt
+	if _, err := store.PublishGenesis(input); err == nil || !strings.Contains(err.Error(), "observation set") {
+		t.Fatalf("divergent bundle error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "typed-runs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("divergent bundle created state: %v", err)
+	}
+}
+
+func TestTypedObjectLimitsBoundEventsAndObservations(t *testing.T) {
+	event := eventObject{Schema: eventSchema, EvidenceDigests: []string{strings.Repeat("a", maxEventObjectSize)}}
+	if err := validateTypedObjectSize("events", event); err == nil {
+		t.Fatal("oversized event was accepted")
+	}
+	observation := observationObject{Schema: observationObjectSchema, Observation: SourceObservation{Payload: map[string]any{"value": strings.Repeat("a", maxObservationObjectSize)}}}
+	if err := validateTypedObjectSize("observations", observation); err == nil {
+		t.Fatal("oversized observation was accepted")
+	}
+}
+
+func TestTypedRunRecoveryQuarantinesInvalidCurrentBeforeReconcileRequired(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "repair-run"))
 	if err != nil {
 		t.Fatal(err)
@@ -216,15 +271,129 @@ func TestTypedRunRecoveryQuarantinesInvalidCurrentBeforeReconcileRequired(t *tes
 	}
 }
 
-func TestTypedRunGenesisRejectsUnsafeProjectionBeforeWritingObjects(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "state")
-	store, err := OpenTypedRunStore(root)
+func TestTypedRunPublishesFencedEffectDisabledSuccessorAndRetriesExactly(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	genesis, err := store.PublishGenesis(testGenesisInput(t, "successor-run"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	input := SuccessorInput{
+		RunID: "successor-run", Expected: genesis.Fence,
+		PublishedAt: time.Date(2026, 8, 8, 10, 3, 0, 0, time.UTC),
+	}
+	first, err := store.PublishSuccessor(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Fence.RepairEpoch != genesis.Fence.RepairEpoch || first.Fence.Generation != genesis.Fence.Generation+1 ||
+		first.Previous == nil || first.Previous.TransitionDigest != genesis.Fence.TransitionDigest || first.State.EffectsEnabled {
+		t.Fatalf("successor snapshot = %#v", first)
+	}
+	second, err := store.PublishSuccessor(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Fence != first.Fence {
+		t.Fatalf("exact successor retry changed authority: %#v != %#v", second.Fence, first.Fence)
+	}
+	stale := input
+	stale.Expected.TransitionDigest = strings.Repeat("e", 64)
+	if _, err := store.PublishSuccessor(stale); !errors.Is(err, ErrTypedRunFenced) {
+		t.Fatalf("stale successor error = %v", err)
+	}
+}
+
+func TestTypedRunSuccessorRetriesEveryPublicationBoundary(t *testing.T) {
+	for _, boundary := range []PublicationBoundary{
+		BoundaryEventPublished, BoundaryEventSynced, BoundaryTransitionPublished, BoundaryTransitionSynced,
+		BoundaryBeforePointerPublish, BoundaryAfterPointerPublish, BoundaryAfterPointerSync,
+	} {
+		t.Run(string(boundary), func(t *testing.T) {
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+			genesis, err := store.PublishGenesis(testGenesisInput(t, "successor-retry"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := SuccessorInput{
+				RunID: "successor-retry", Expected: genesis.Fence,
+				PublishedAt: time.Date(2026, 8, 8, 10, 3, 0, 0, time.UTC),
+			}
+			injected := false
+			store.failpoint = func(current PublicationBoundary) error {
+				if !injected && current == boundary {
+					injected = true
+					return errors.New("synthetic crash")
+				}
+				return nil
+			}
+			if _, err := store.PublishSuccessor(input); err == nil {
+				t.Fatal("successor crossed injected crash")
+			}
+			store.failpoint = nil
+			retried, err := store.PublishSuccessor(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if retried.Fence.Generation != 2 || retried.State.EffectsEnabled {
+				t.Fatalf("retried successor = %#v", retried)
+			}
+		})
+	}
+}
+
+func TestTypedRunRecoveryUsesVerifiedNonGenesisPredecessor(t *testing.T) {
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
+	genesis, err := store.PublishGenesis(testGenesisInput(t, "later-repair"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor, err := store.PublishSuccessor(SuccessorInput{
+		RunID: "later-repair", Expected: genesis.Fence,
+		PublishedAt: time.Date(2026, 8, 8, 10, 3, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := runPointer{
+		Schema: runPointerSchema, RunID: "later-repair", RepairEpoch: successor.Fence.RepairEpoch,
+		Current: TransitionReference{Generation: 3, TransitionDigest: strings.Repeat("c", 64), ResultingStateDigest: strings.Repeat("d", 64)},
+		Previous: &TransitionReference{
+			Generation: successor.Fence.Generation, TransitionDigest: successor.Fence.TransitionDigest,
+			ResultingStateDigest: successor.State.ResultingStateDigest,
+		},
+	}
+	writeTestPointer(t, store.pointerPath("later-repair"), invalid)
+	repaired, err := store.Recover("later-repair", TypedRunFence{Generation: 3, TransitionDigest: invalid.Current.TransitionDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.Fence.RepairEpoch != 1 || repaired.Fence.Generation != 5 || repaired.State.Status != TypedRunReconcileRequired || repaired.State.EffectsEnabled {
+		t.Fatalf("later repair snapshot = %#v", repaired)
+	}
+	invalidAgain := runPointer{
+		Schema: runPointerSchema, RunID: "later-repair", RepairEpoch: repaired.Fence.RepairEpoch,
+		Current: TransitionReference{Generation: 6, TransitionDigest: strings.Repeat("e", 64), ResultingStateDigest: strings.Repeat("f", 64)},
+		Previous: &TransitionReference{
+			Generation: repaired.Fence.Generation, TransitionDigest: repaired.Fence.TransitionDigest,
+			ResultingStateDigest: repaired.State.ResultingStateDigest,
+		},
+	}
+	writeTestPointer(t, store.pointerPath("later-repair"), invalidAgain)
+	repairedAgain, err := store.Recover("later-repair", TypedRunFence{RepairEpoch: 1, Generation: 6, TransitionDigest: invalidAgain.Current.TransitionDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repairedAgain.Fence.RepairEpoch != 2 || repairedAgain.Fence.Generation != 8 || repairedAgain.State.Status != TypedRunReconcileRequired {
+		t.Fatalf("repeated later repair snapshot = %#v", repairedAgain)
+	}
+}
+
+func TestTypedRunGenesisRejectsUnsafeProjectionBeforeWritingObjects(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := openTestTypedRunStore(t, root)
 	input := testGenesisInput(t, "unsafe-run")
-	input.Packet.compiled.Sources[0].Locator = "/private/synthetic/source"
-	if _, err := store.PublishGenesis(input); err == nil || !strings.Contains(err.Error(), "unsafe") {
+	input.Packet.compiled.Bundle.Observations[0].Revision = "/private/synthetic/source"
+	if _, err := store.PublishGenesis(input); err == nil {
 		t.Fatalf("unsafe projection error = %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "typed-runs", input.RunID)); !errors.Is(err, os.ErrNotExist) {
@@ -233,10 +402,7 @@ func TestTypedRunGenesisRejectsUnsafeProjectionBeforeWritingObjects(t *testing.T
 }
 
 func TestTypedRunRejectsConflictingRetryAndEveryStaleFenceComponent(t *testing.T) {
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	input := testGenesisInput(t, "fenced-run")
 	genesis, err := store.PublishGenesis(input)
 	if err != nil {
@@ -269,10 +435,7 @@ func TestTypedRunRejectsConflictingRetryAndEveryStaleFenceComponent(t *testing.T
 }
 
 func TestTypedRunRecoveryCASRejectsPointerChangeAtPublicationBoundary(t *testing.T) {
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "cas-run"))
 	if err != nil {
 		t.Fatal(err)
@@ -310,10 +473,7 @@ func TestTypedRunRecoveryCASRejectsPointerChangeAtPublicationBoundary(t *testing
 }
 
 func TestTypedRunLoadIgnoresUnreferencedPartialObjectsAndForks(t *testing.T) {
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	genesis, err := store.PublishGenesis(testGenesisInput(t, "fork-run"))
 	if err != nil {
 		t.Fatal(err)
@@ -377,10 +537,7 @@ func TestTypedRunLoadRejectsChangedMissingUnsupportedAndMalformedAuthority(t *te
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 			published, err := store.PublishGenesis(testGenesisInput(t, "invalid-run"))
 			if err != nil {
 				t.Fatal(err)
@@ -394,10 +551,7 @@ func TestTypedRunLoadRejectsChangedMissingUnsupportedAndMalformedAuthority(t *te
 }
 
 func TestTypedRunRejectsConflictingImmutableTransitionBytes(t *testing.T) {
-	store, err := OpenTypedRunStore(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestTypedRunStore(t, filepath.Join(t.TempDir(), "state"))
 	published, err := store.PublishGenesis(testGenesisInput(t, "immutable-run"))
 	if err != nil {
 		t.Fatal(err)
@@ -422,18 +576,15 @@ func TestTypedRunRejectsConflictingImmutableTransitionBytes(t *testing.T) {
 func TestTypedRunGenesisRejectsSecretAndOversizedContentBeforeWriting(t *testing.T) {
 	for name, mutate := range map[string]func(*GenesisInput){
 		"secret": func(input *GenesisInput) {
-			input.Packet.compiled.Sources[0].Reason = "token=synthetic-private-value"
+			input.Packet.compiled.Bundle.Observations[0].Revision = "token=synthetic-private-value"
 		},
 		"oversized": func(input *GenesisInput) {
-			input.Packet.compiled.Observations[0].Payload["operations"] = []any{"ack", "list", "load", "start", "watch", strings.Repeat("x", maxTypedObjectSize+1)}
+			input.Packet.compiled.Bundle.Observations[0].Payload["operations"] = []any{"ack", "list", "load", "start", "watch", strings.Repeat("x", maxTypedObjectSize+1)}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "state")
-			store, err := OpenTypedRunStore(root)
-			if err != nil {
-				t.Fatal(err)
-			}
+			store := openTestTypedRunStore(t, root)
 			input := testGenesisInput(t, "bounded-run")
 			mutate(&input)
 			if _, err := store.PublishGenesis(input); err == nil {
@@ -524,9 +675,33 @@ func testGenesisInput(t *testing.T, runID string) GenesisInput {
 	return GenesisInput{
 		RunID: runID, Packet: *preview.Packet,
 		PublishedAt: time.Date(2026, 8, 8, 10, 2, 0, 0, time.UTC),
-		Rollback: RollbackEvidence{
-			ArtifactVersion: "v0.1.0-rollback", ArtifactDigest: strings.Repeat("a", 64),
-			FixtureDigest: strings.Repeat("b", 64), ReadableSchema: TypedRunSchema, CreationDisabled: true,
-		},
+		Rollback:    testRollbackEvidence(),
 	}
+}
+
+type exactRollbackVerifier struct {
+	expected RollbackEvidence
+}
+
+func (v exactRollbackVerifier) VerifyRollback(evidence RollbackEvidence) error {
+	if evidence != v.expected {
+		return errors.New("unrecognized rollback evidence")
+	}
+	return nil
+}
+
+func testRollbackEvidence() RollbackEvidence {
+	return RollbackEvidence{
+		ArtifactVersion: "v0.1.0-rollback", ArtifactDigest: strings.Repeat("a", 64),
+		FixtureDigest: strings.Repeat("b", 64), ReadableSchema: TypedRunSchema, CreationDisabled: true,
+	}
+}
+
+func openTestTypedRunStore(t *testing.T, root string) *TypedRunStore {
+	t.Helper()
+	store, err := OpenTypedRunStore(root, exactRollbackVerifier{expected: testRollbackEvidence()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }

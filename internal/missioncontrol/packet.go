@@ -180,9 +180,8 @@ func compilePacket(m *manifest.Manifest, declarationBytes []byte, d *declaration
 			return PacketPreview{}, encodeErr
 		}
 		packet.compiled = &compiledPacket{
-			Envelope:     encoded,
-			Sources:      append([]source(nil), d.Spec.Sources...),
-			Observations: append([]SourceObservation(nil), bundle.Observations...),
+			Envelope: encoded,
+			Bundle:   bundle,
 		}
 	}
 	return packet, err

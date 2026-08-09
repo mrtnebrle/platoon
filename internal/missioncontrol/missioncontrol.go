@@ -148,14 +148,14 @@ type unattended struct {
 }
 
 type source struct {
-	ID                string `yaml:"id"`
-	Kind              string `yaml:"kind"`
-	Schema            string `yaml:"schema"`
-	Locator           string `yaml:"locator"`
-	Revision          string `yaml:"revision,omitempty"`
-	ObservationPolicy string `yaml:"observationPolicy,omitempty"`
-	Role              string `yaml:"role"`
-	Reason            string `yaml:"reason"`
+	ID                string `yaml:"id" json:"id"`
+	Kind              string `yaml:"kind" json:"kind"`
+	Schema            string `yaml:"schema" json:"schema"`
+	Locator           string `yaml:"locator" json:"locator"`
+	Revision          string `yaml:"revision,omitempty" json:"revision,omitempty"`
+	ObservationPolicy string `yaml:"observationPolicy,omitempty" json:"observationPolicy,omitempty"`
+	Role              string `yaml:"role" json:"role"`
+	Reason            string `yaml:"reason" json:"reason"`
 }
 
 func Compile(m *manifest.Manifest, manifestFile string) (Preview, error) {

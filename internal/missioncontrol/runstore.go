@@ -11,20 +11,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mrtnebrle/platoon/internal/opaqueid"
 )
 
 const (
-	TypedRunSchema          = "platoon.typed-run/v1alpha1"
-	observationObjectSchema = "platoon.observation/v1alpha1"
-	projectionSchema        = "platoon.projection/v1alpha1"
-	eventSchema             = "platoon.event/v1alpha1"
-	transitionSchema        = "platoon.transition-commit/v1alpha1"
-	runPointerSchema        = "platoon.run-pointer/v1alpha1"
-	maxTypedObjectSize      = 4 << 20
+	TypedRunSchema           = "platoon.typed-run/v1alpha1"
+	observationObjectSchema  = "platoon.observation/v1alpha1"
+	projectionSchema         = "platoon.projection/v1alpha1"
+	eventSchema              = "platoon.event/v1alpha1"
+	transitionSchema         = "platoon.transition-commit/v1alpha1"
+	runPointerSchema         = "platoon.run-pointer/v1alpha1"
+	maxTypedObjectSize       = 4 << 20
+	maxObservationObjectSize = 1 << 20
+	maxEventObjectSize       = 64 << 10
 )
 
 var ErrTypedRunFenced = errors.New("typed run mutation is fenced")
@@ -63,11 +66,30 @@ type RollbackEvidence struct {
 	CreationDisabled bool   `json:"creationDisabled"`
 }
 
+type RollbackVerifier interface {
+	VerifyRollback(RollbackEvidence) error
+}
+
+type SourceBundleBinding struct {
+	BundleID            string `json:"bundleId"`
+	DeclarationDigest   string `json:"declarationDigest"`
+	SourceCatalogDigest string `json:"sourceCatalogDigest"`
+	CallerRole          string `json:"callerRole"`
+	QueryScope          string `json:"queryScope"`
+	ContentSetDigest    string `json:"contentSetDigest"`
+}
+
 type GenesisInput struct {
 	RunID       string
 	Packet      PacketPreview
 	PublishedAt time.Time
 	Rollback    RollbackEvidence
+}
+
+type SuccessorInput struct {
+	RunID       string
+	Expected    TypedRunFence
+	PublishedAt time.Time
 }
 
 type TypedRunFence struct {
@@ -83,17 +105,18 @@ type TransitionReference struct {
 }
 
 type TypedRunState struct {
-	Schema               string           `json:"schema"`
-	RunID                string           `json:"runId"`
-	Status               TypedRunStatus   `json:"status"`
-	EffectsEnabled       bool             `json:"effectsEnabled"`
-	PacketDigest         string           `json:"packetDigest"`
-	ObservationDigests   []string         `json:"observationDigests"`
-	ProjectionDigest     string           `json:"projectionDigest"`
-	ProjectionRevision   uint64           `json:"projectionRevision"`
-	EventDigest          string           `json:"eventDigest"`
-	Rollback             RollbackEvidence `json:"rollbackEvidence"`
-	ResultingStateDigest string           `json:"resultingStateDigest"`
+	Schema               string              `json:"schema"`
+	RunID                string              `json:"runId"`
+	Status               TypedRunStatus      `json:"status"`
+	EffectsEnabled       bool                `json:"effectsEnabled"`
+	PacketDigest         string              `json:"packetDigest"`
+	ObservationDigests   []string            `json:"observationDigests"`
+	ProjectionDigest     string              `json:"projectionDigest"`
+	ProjectionRevision   uint64              `json:"projectionRevision"`
+	EventDigest          string              `json:"eventDigest"`
+	Rollback             RollbackEvidence    `json:"rollbackEvidence"`
+	SourceBundle         SourceBundleBinding `json:"sourceBundle"`
+	ResultingStateDigest string              `json:"resultingStateDigest"`
 }
 
 type TypedRunSnapshot struct {
@@ -104,13 +127,13 @@ type TypedRunSnapshot struct {
 
 type TypedRunStore struct {
 	root      string
+	rollback  RollbackVerifier
 	failpoint func(PublicationBoundary) error
 }
 
 type compiledPacket struct {
-	Envelope     json.RawMessage
-	Sources      []source
-	Observations []SourceObservation
+	Envelope json.RawMessage
+	Bundle   SourceBundle
 }
 
 type packetObject struct {
@@ -143,6 +166,7 @@ type observationObject struct {
 
 type projectionEntry struct {
 	Role              string `json:"role"`
+	SourceLabel       string `json:"sourceLabel"`
 	SourceID          string `json:"sourceId"`
 	Locator           string `json:"locator"`
 	Revision          string `json:"revision"`
@@ -205,7 +229,7 @@ type runPointer struct {
 	Previous    *TransitionReference `json:"previous"`
 }
 
-func OpenTypedRunStore(root string) (*TypedRunStore, error) {
+func OpenTypedRunStore(root string, rollback RollbackVerifier) (*TypedRunStore, error) {
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve typed state root: %w", err)
@@ -217,65 +241,64 @@ func OpenTypedRunStore(root string) (*TypedRunStore, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect typed state root: %w", err)
 	}
-	return &TypedRunStore{root: absolute}, nil
+	return &TypedRunStore{root: absolute, rollback: rollback}, nil
 }
 
 func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, error) {
-	if s == nil || !safeOpaque(input.RunID) || input.Packet.compiled == nil || input.Packet.ID == "" ||
+	if s == nil || !opaqueid.Valid(input.RunID) || input.Packet.compiled == nil || input.Packet.ID == "" ||
 		input.PublishedAt.IsZero() || input.PublishedAt.Location() != time.UTC {
 		return nil, errors.New("typed genesis input is invalid")
 	}
-	if err := validateRollbackEvidence(input.Rollback); err != nil {
+	if err := s.validateRollbackEvidence(input.Rollback); err != nil {
 		return nil, err
 	}
-	if len(input.Packet.compiled.Sources) == 0 || len(input.Packet.compiled.Observations) == 0 {
+	if len(input.Packet.compiled.Bundle.Observations) == 0 {
 		return nil, errors.New("compiled packet lacks source observations")
 	}
 	packetID := digestCanonicalBytes(PacketSchema, input.Packet.compiled.Envelope)
 	if packetID != input.Packet.ID {
 		return nil, fmt.Errorf("compiled packet binding is invalid: have %s want %s", packetID, input.Packet.ID)
 	}
-	if _, err := validatePacketEnvelope(input.Packet.compiled.Envelope); err != nil {
+	envelope, err := validatePacketEnvelope(input.Packet.compiled.Envelope)
+	if err != nil {
 		return nil, fmt.Errorf("compiled packet envelope is invalid: %w", err)
+	}
+	sources, err := packetSources(envelope)
+	if err != nil {
+		return nil, err
 	}
 	packet := packetObject{Schema: PacketSchema, ID: packetID, Envelope: bytes.Clone(input.Packet.compiled.Envelope)}
 
-	rebuiltBundle, err := NewSourceBundle("declaration", "catalog", "operator", "entry", input.Packet.compiled.Observations)
-	if err != nil || len(rebuiltBundle.Observations) != len(input.Packet.compiled.Observations) {
+	suppliedBundle := input.Packet.compiled.Bundle
+	rebuiltBundle, err := NewSourceBundle(suppliedBundle.DeclarationDigest, suppliedBundle.SourceCatalogDigest, suppliedBundle.CallerRole, suppliedBundle.QueryScope, suppliedBundle.Observations)
+	if err != nil || len(rebuiltBundle.Observations) != len(suppliedBundle.Observations) || rebuiltBundle.BundleID != suppliedBundle.BundleID ||
+		rebuiltBundle.ContentSetDigest != suppliedBundle.ContentSetDigest || rebuiltBundle.BundleID != envelope.BundleID ||
+		rebuiltBundle.ContentSetDigest != envelope.ContentSetDigest || rebuiltBundle.DeclarationDigest != envelope.DeclarationDigest {
 		return nil, errors.New("compiled observation set is invalid")
 	}
+	wantCatalog, err := sourceCatalogDigest(sources)
+	if err != nil || rebuiltBundle.SourceCatalogDigest != wantCatalog {
+		return nil, errors.New("compiled source catalog binding is invalid")
+	}
 	observations := make([]observationObject, 0, len(rebuiltBundle.Observations))
-	observationByID := make(map[string]SourceObservation, len(rebuiltBundle.Observations))
 	observationDigests := make([]string, 0, len(rebuiltBundle.Observations))
 	for index, observation := range rebuiltBundle.Observations {
-		supplied := input.Packet.compiled.Observations[index]
+		supplied := suppliedBundle.Observations[index]
 		if observation.SourceID != supplied.SourceID || observation.ContentDigest != supplied.ContentDigest ||
 			observation.EnvelopeDigest != supplied.EnvelopeDigest || !validDigest(observation.EnvelopeDigest) {
 			return nil, errors.New("compiled observation binding is invalid")
 		}
 		observations = append(observations, observationObject{Schema: observationObjectSchema, Digest: observation.EnvelopeDigest, Observation: observation})
-		observationByID[observation.SourceID] = observation
 		observationDigests = append(observationDigests, observation.EnvelopeDigest)
 	}
 	projection := projectionObject{
 		Schema: projectionSchema, RunID: input.RunID, PacketDigest: packetID, Revision: 0,
 		PreviousRevision: nil, PreviousEventDigest: nil,
 	}
-	for _, declared := range input.Packet.compiled.Sources {
-		observation, ok := observationByID[declared.ID]
-		if !ok || observation.Quality != QualityVerified {
-			return nil, errors.New("compiled projection source is not verified")
-		}
-		revision := observation.Revision
-		if declared.ObservationPolicy != "" {
-			revision = observation.ObservedAt
-		}
-		projection.Entries = append(projection.Entries, projectionEntry{
-			Role: declared.Role, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
-			Reason: declared.Reason, Exposure: "bound", ObservationDigest: observation.EnvelopeDigest,
-		})
+	projection.Entries, err = buildProjectionEntries(sources, rebuiltBundle.Observations)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(projection.Entries, func(i, j int) bool { return projection.Entries[i].SourceID < projection.Entries[j].SourceID })
 	if err := validateProjectionEntries(projection.Entries, observationDigests); err != nil {
 		return nil, err
 	}
@@ -296,6 +319,7 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 		Schema: TypedRunSchema, RunID: input.RunID, Status: TypedRunInitializing, EffectsEnabled: false,
 		PacketDigest: packetID, ObservationDigests: append([]string(nil), observationDigests...),
 		ProjectionDigest: projection.Digest, ProjectionRevision: 0, EventDigest: event.Digest, Rollback: input.Rollback,
+		SourceBundle: sourceBundleBinding(rebuiltBundle),
 	}
 	state.ResultingStateDigest, err = digestState(state)
 	if err != nil {
@@ -317,12 +341,20 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 		Current:  TransitionReference{Generation: 1, TransitionDigest: commit.Digest, ResultingStateDigest: state.ResultingStateDigest},
 		Previous: nil,
 	}
-	preflight := []any{packet, projection, event, state, commit, pointer}
+	preflight := []struct {
+		kind  string
+		value any
+	}{{"packets", packet}, {"projections", projection}, {"events", event}, {"transitions", commit}, {"pointer", pointer}}
 	for _, observation := range observations {
-		preflight = append(preflight, observation)
+		preflight = append(preflight, struct {
+			kind  string
+			value any
+		}{"observations", observation})
 	}
-	if err := validateTypedObjectSizes(preflight...); err != nil {
-		return nil, err
+	for _, candidate := range preflight {
+		if err := validateTypedObjectSize(candidate.kind, candidate.value); err != nil {
+			return nil, err
+		}
 	}
 	if existing, loadErr := s.Load(input.RunID); loadErr == nil {
 		if existing.Fence.RepairEpoch == 0 && existing.Fence.Generation == 1 && existing.Fence.TransitionDigest == commit.Digest {
@@ -358,7 +390,7 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 	if err := s.writeImmutable(input.RunID, "transitions", commit.Digest, commit); err != nil {
 		return nil, err
 	}
-	if err := createJSONFileWithHooks(s.pointerPath(input.RunID), pointer,
+	if err := createJSONFileWithHooks(s.pointerPath(input.RunID), pointer, maxTypedObjectSize,
 		func() error { return s.hit(BoundaryBeforePointerPublish) },
 		func() error { return s.hit(BoundaryAfterPointerPublish) },
 		func() error { return s.hit(BoundaryAfterPointerSync) }); err != nil {
@@ -367,8 +399,109 @@ func (s *TypedRunStore) PublishGenesis(input GenesisInput) (*TypedRunSnapshot, e
 	return s.Load(input.RunID)
 }
 
+func (s *TypedRunStore) PublishSuccessor(input SuccessorInput) (*TypedRunSnapshot, error) {
+	if s == nil || !opaqueid.Valid(input.RunID) || input.Expected.Generation == 0 || !validDigest(input.Expected.TransitionDigest) ||
+		input.PublishedAt.IsZero() || input.PublishedAt.Location() != time.UTC {
+		return nil, errors.New("typed successor input is invalid")
+	}
+	if err := s.validateRunDirectories(input.RunID); err != nil {
+		return nil, err
+	}
+	release, err := s.acquireWriterLock(input.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	pointerRaw, err := readBoundedRegular(s.pointerPath(input.RunID))
+	if err != nil {
+		return nil, err
+	}
+	var pointer runPointer
+	if err := decodeStrictJSON(pointerRaw, &pointer); err != nil {
+		return nil, errors.New("typed run pointer is malformed")
+	}
+	if pointer.RepairEpoch != input.Expected.RepairEpoch || pointer.Current.Generation != input.Expected.Generation ||
+		pointer.Current.TransitionDigest != input.Expected.TransitionDigest {
+		current, loadErr := s.Load(input.RunID)
+		if loadErr == nil && pointer.Previous != nil && pointer.RepairEpoch == input.Expected.RepairEpoch &&
+			pointer.Previous.Generation == input.Expected.Generation && pointer.Previous.TransitionDigest == input.Expected.TransitionDigest {
+			event, eventErr := s.loadEvent(input.RunID, current.State.EventDigest)
+			if eventErr == nil && event.Type == "typed_generation_published" && event.OccurredAt == input.PublishedAt.Format(time.RFC3339Nano) {
+				return current, nil
+			}
+		}
+		return nil, ErrTypedRunFenced
+	}
+	current, err := s.Load(input.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if current.State.Status != TypedRunInitializing && current.State.Status != TypedRunReconcileRequired {
+		return nil, errors.New("typed current state cannot publish a normal successor")
+	}
+	var predecessor transitionCommit
+	if err := s.readObject(input.RunID, "transitions", current.Fence.TransitionDigest, &predecessor); err != nil {
+		return nil, err
+	}
+	previousEvent, err := s.loadEvent(input.RunID, predecessor.EventDigest)
+	if err != nil {
+		return nil, err
+	}
+	event := eventObject{
+		Schema: eventSchema, RunID: input.RunID, Sequence: previousEvent.Sequence + 1, PreviousEventDigest: &predecessor.EventDigest,
+		RunGeneration: current.Fence.Generation + 1, ProjectionRevision: current.State.ProjectionRevision,
+		OccurredAt: input.PublishedAt.Format(time.RFC3339Nano), Type: "typed_generation_published", Subject: input.RunID,
+		EvidenceDigests: append([]string(nil), current.State.ObservationDigests...),
+	}
+	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
+	if err != nil {
+		return nil, err
+	}
+	state := current.State
+	state.EventDigest = event.Digest
+	state.ResultingStateDigest = ""
+	state.ResultingStateDigest, err = digestState(state)
+	if err != nil {
+		return nil, err
+	}
+	previousDigest, previousGeneration, previousState := current.Fence.TransitionDigest, current.Fence.Generation, current.State.ResultingStateDigest
+	previousEventDigest, previousProjectionRevision := predecessor.EventDigest, current.State.ProjectionRevision
+	commit := transitionCommit{
+		Schema: transitionSchema, RunID: input.RunID, RepairEpoch: current.Fence.RepairEpoch, Generation: current.Fence.Generation + 1,
+		PreviousTransitionDigest: &previousDigest, PreviousGeneration: &previousGeneration, PreviousResultingStateDigest: &previousState,
+		PreviousEventDigest: &previousEventDigest, PreviousProjectionRevision: &previousProjectionRevision,
+		PacketDigest: state.PacketDigest, ObservationDigests: append([]string(nil), state.ObservationDigests...),
+		ProjectionDigest: state.ProjectionDigest, EventDigest: event.Digest, ResultingState: state,
+	}
+	commit.Digest, err = digestWithoutField(transitionSchema, commit, func(value *transitionCommit) { value.Digest = "" })
+	if err != nil {
+		return nil, err
+	}
+	priorReference := pointer.Current
+	next := runPointer{
+		Schema: runPointerSchema, RunID: input.RunID, RepairEpoch: current.Fence.RepairEpoch,
+		Current:  TransitionReference{Generation: commit.Generation, TransitionDigest: commit.Digest, ResultingStateDigest: state.ResultingStateDigest},
+		Previous: &priorReference,
+	}
+	for _, candidate := range []struct {
+		kind  string
+		value any
+	}{{"events", event}, {"transitions", commit}, {"pointer", next}} {
+		if err := validateTypedObjectSize(candidate.kind, candidate.value); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.writeRecoveryObjects(input.RunID, event, commit); err != nil {
+		return nil, err
+	}
+	if err := s.replacePointer(input.RunID, pointerRaw, next); err != nil {
+		return nil, err
+	}
+	return s.Load(input.RunID)
+}
+
 func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRunSnapshot, error) {
-	if s == nil || !safeOpaque(runID) || expected.Generation == 0 || !validDigest(expected.TransitionDigest) {
+	if s == nil || !opaqueid.Valid(runID) || expected.Generation == 0 || !validDigest(expected.TransitionDigest) {
 		return nil, errors.New("typed recovery input is invalid")
 	}
 	if err := s.validateRunDirectories(runID); err != nil {
@@ -414,7 +547,7 @@ func (s *TypedRunStore) Recover(runID string, expected TypedRunFence) (*TypedRun
 	if pointer.Previous == nil {
 		return nil, fmt.Errorf("typed current transition is invalid without a verified predecessor: %w", loadErr)
 	}
-	base, err := s.loadGenesisReference(runID, *pointer.Previous)
+	base, err := s.loadVerifiedReference(runID, *pointer.Previous)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +570,7 @@ func (s *TypedRunStore) publishQuarantine(runID string, pointerRaw []byte, point
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, pointer.Current.Generation+1, 2, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
+	event := recoveryEvent(runID, pointer.Current.Generation+1, previousEvent.Sequence+1, "current_transition_quarantined", base.EventDigest, base.ObservationDigests, previousEvent.OccurredAt)
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -495,7 +628,7 @@ func (s *TypedRunStore) publishRepair(runID string, pointerRaw []byte, pointer r
 	if err != nil {
 		return nil, err
 	}
-	event := recoveryEvent(runID, pointer.Current.Generation+1, 3, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
+	event := recoveryEvent(runID, pointer.Current.Generation+1, previousEvent.Sequence+1, "reconcile_required", quarantine.EventDigest, quarantine.ObservationDigests, previousEvent.OccurredAt)
 	event.Digest, err = digestWithoutField(eventSchema, event, func(value *eventObject) { value.Digest = "" })
 	if err != nil {
 		return nil, err
@@ -574,7 +707,7 @@ func (s *TypedRunStore) loadEvent(runID, digest string) (eventObject, error) {
 }
 
 func (s *TypedRunStore) Load(runID string) (*TypedRunSnapshot, error) {
-	if s == nil || !safeOpaque(runID) {
+	if s == nil || !opaqueid.Valid(runID) {
 		return nil, errors.New("typed run id is invalid")
 	}
 	if err := s.validateRunDirectories(runID); err != nil {
@@ -596,26 +729,32 @@ func (s *TypedRunStore) Load(runID string) (*TypedRunSnapshot, error) {
 	if err := s.readObject(runID, "transitions", pointer.Current.TransitionDigest, &commit); err != nil {
 		return nil, fmt.Errorf("load current transition: %w", err)
 	}
-	switch commit.ResultingState.Status {
-	case TypedRunInitializing:
-		if err := s.validateGenesisCommit(runID, pointer, commit); err != nil {
-			return nil, err
-		}
-	case TypedRunQuarantined:
-		if err := s.validateQuarantineCommit(runID, pointer, commit); err != nil {
-			return nil, err
-		}
-	case TypedRunReconcileRequired:
-		if err := s.validateRepairCommit(runID, pointer, commit); err != nil {
-			return nil, err
-		}
-	default:
-		return nil, errors.New("typed run status is unsupported")
+	if err := s.validateCurrentCommit(runID, pointer, commit); err != nil {
+		return nil, err
 	}
 	return &TypedRunSnapshot{
 		Fence:    TypedRunFence{RepairEpoch: pointer.RepairEpoch, Generation: pointer.Current.Generation, TransitionDigest: pointer.Current.TransitionDigest},
 		Previous: pointer.Previous, State: commit.ResultingState,
 	}, nil
+}
+
+func (s *TypedRunStore) validateCurrentCommit(runID string, pointer runPointer, commit transitionCommit) error {
+	switch commit.ResultingState.Status {
+	case TypedRunInitializing:
+		if commit.Generation == 1 {
+			return s.validateGenesisCommit(runID, pointer, commit)
+		}
+		return s.validateSuccessorCommit(runID, pointer, commit)
+	case TypedRunQuarantined:
+		return s.validateQuarantineCommit(runID, pointer, commit)
+	case TypedRunReconcileRequired:
+		if commit.RecoveryBase != nil {
+			return s.validateRepairCommit(runID, pointer, commit)
+		}
+		return s.validateSuccessorCommit(runID, pointer, commit)
+	default:
+		return errors.New("typed run status is unsupported")
+	}
 }
 
 func (s *TypedRunStore) validateGenesisCommit(runID string, pointer runPointer, commit transitionCommit) error {
@@ -651,7 +790,7 @@ type eventExpectation struct {
 }
 
 func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCommit, expected eventExpectation) error {
-	if err := validateRollbackEvidence(commit.ResultingState.Rollback); err != nil {
+	if err := s.validateRollbackEvidence(commit.ResultingState.Rollback); err != nil {
 		return err
 	}
 	if !validUniqueDigests(commit.ObservationDigests) {
@@ -669,7 +808,11 @@ func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCom
 	if err != nil || wantPacket != packet.ID {
 		return errors.New("typed packet digest is invalid")
 	}
-	contentSet := make([]any, 0, len(commit.ObservationDigests))
+	sources, err := packetSources(envelope)
+	if err != nil {
+		return err
+	}
+	observations := make([]SourceObservation, 0, len(commit.ObservationDigests))
 	lastSourceID := ""
 	for _, digest := range commit.ObservationDigests {
 		var object observationObject
@@ -688,11 +831,17 @@ func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCom
 			return errors.New("typed observation set order is invalid")
 		}
 		lastSourceID = object.Observation.SourceID
-		contentSet = append(contentSet, map[string]any{"contentDigest": object.Observation.ContentDigest, "sourceId": object.Observation.SourceID})
+		observations = append(observations, object.Observation)
 	}
-	wantContentSet, err := canonicalDigest("platoon.source-content-set/v1alpha1", contentSet)
-	if err != nil || wantContentSet != envelope.ContentSetDigest {
+	binding := commit.ResultingState.SourceBundle
+	rebuiltBundle, err := NewSourceBundle(binding.DeclarationDigest, binding.SourceCatalogDigest, binding.CallerRole, binding.QueryScope, observations)
+	if err != nil || sourceBundleBinding(rebuiltBundle) != binding || rebuiltBundle.BundleID != envelope.BundleID ||
+		rebuiltBundle.ContentSetDigest != envelope.ContentSetDigest || rebuiltBundle.DeclarationDigest != envelope.DeclarationDigest {
 		return errors.New("typed packet observation set binding is invalid")
+	}
+	wantCatalog, err := sourceCatalogDigest(sources)
+	if err != nil || wantCatalog != binding.SourceCatalogDigest {
+		return errors.New("typed packet source catalog binding is invalid")
 	}
 	var projection projectionObject
 	if err := s.readObject(runID, "projections", commit.ProjectionDigest, &projection); err != nil {
@@ -706,6 +855,10 @@ func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCom
 	}
 	if err := validateProjectionEntries(projection.Entries, commit.ObservationDigests); err != nil {
 		return err
+	}
+	wantEntries, err := buildProjectionEntries(sources, observations)
+	if err != nil || !canonicalEqual(projection.Entries, wantEntries) {
+		return errors.New("typed projection does not match packet sources")
 	}
 	var event eventObject
 	if err := s.readObject(runID, "events", commit.EventDigest, &event); err != nil {
@@ -721,6 +874,47 @@ func (s *TypedRunStore) validateCommitObjects(runID string, commit transitionCom
 		return errors.New("typed event object is invalid")
 	}
 	return nil
+}
+
+func (s *TypedRunStore) validateSuccessorCommit(runID string, pointer runPointer, commit transitionCommit) error {
+	if pointer.Previous == nil || commit.Quarantined != nil || commit.RecoveryBase != nil || commit.Reason != "" ||
+		commit.Schema != transitionSchema || commit.RunID != runID || commit.RepairEpoch != pointer.RepairEpoch ||
+		commit.Generation != pointer.Current.Generation || commit.Digest != pointer.Current.TransitionDigest ||
+		commit.PreviousTransitionDigest == nil || *commit.PreviousTransitionDigest != pointer.Previous.TransitionDigest ||
+		commit.PreviousGeneration == nil || *commit.PreviousGeneration != pointer.Previous.Generation ||
+		commit.PreviousResultingStateDigest == nil || *commit.PreviousResultingStateDigest != pointer.Previous.ResultingStateDigest ||
+		commit.PreviousEventDigest == nil || commit.PreviousProjectionRevision == nil || pointer.Previous.Generation+1 != commit.Generation {
+		return errors.New("typed successor transition binding is invalid")
+	}
+	predecessor, err := s.loadVerifiedReference(runID, *pointer.Previous)
+	if err != nil {
+		return err
+	}
+	state := commit.ResultingState
+	priorState := predecessor.ResultingState
+	if predecessor.RepairEpoch != commit.RepairEpoch || state.Schema != TypedRunSchema || state.RunID != runID ||
+		state.Status != priorState.Status || state.EffectsEnabled || state.PacketDigest != priorState.PacketDigest ||
+		!sameStrings(state.ObservationDigests, priorState.ObservationDigests) || state.ProjectionDigest != priorState.ProjectionDigest ||
+		state.ProjectionRevision != priorState.ProjectionRevision || state.Rollback != priorState.Rollback || state.SourceBundle != priorState.SourceBundle ||
+		*commit.PreviousEventDigest != predecessor.EventDigest || *commit.PreviousProjectionRevision != priorState.ProjectionRevision {
+		return errors.New("typed successor resulting state is invalid")
+	}
+	wantState, err := digestState(state)
+	if err != nil || wantState != state.ResultingStateDigest || wantState != pointer.Current.ResultingStateDigest {
+		return errors.New("typed successor resulting state digest is invalid")
+	}
+	wantCommit, err := digestWithoutField(transitionSchema, commit, func(value *transitionCommit) { value.Digest = "" })
+	if err != nil || wantCommit != commit.Digest {
+		return errors.New("typed successor transition digest is invalid")
+	}
+	previousEvent, err := s.loadEvent(runID, predecessor.EventDigest)
+	if err != nil {
+		return err
+	}
+	previousDigest := predecessor.EventDigest
+	return s.validateCommitObjects(runID, commit, eventExpectation{
+		Sequence: previousEvent.Sequence + 1, Type: "typed_generation_published", PreviousDigest: &previousDigest,
+	})
 }
 
 func (s *TypedRunStore) validateQuarantineCommit(runID string, pointer runPointer, commit transitionCommit) error {
@@ -741,15 +935,19 @@ func (s *TypedRunStore) validateQuarantineCommit(runID string, pointer runPointe
 	if err != nil || wantCommit != commit.Digest {
 		return errors.New("typed quarantine transition digest is invalid")
 	}
-	base, err := s.loadGenesisReference(runID, *commit.RecoveryBase)
+	base, err := s.loadVerifiedReference(runID, *commit.RecoveryBase)
 	if err != nil {
 		return err
 	}
 	if *commit.PreviousEventDigest != base.EventDigest || *commit.PreviousProjectionRevision != base.ResultingState.ProjectionRevision {
 		return errors.New("typed quarantine recovery base is inconsistent")
 	}
+	baseEvent, err := s.loadEvent(runID, base.EventDigest)
+	if err != nil {
+		return err
+	}
 	previousEvent := base.ResultingState.EventDigest
-	return s.validateCommitObjects(runID, commit, eventExpectation{Sequence: 2, Type: "current_transition_quarantined", PreviousDigest: &previousEvent})
+	return s.validateCommitObjects(runID, commit, eventExpectation{Sequence: baseEvent.Sequence + 1, Type: "current_transition_quarantined", PreviousDigest: &previousEvent})
 }
 
 func (s *TypedRunStore) validateRepairCommit(runID string, pointer runPointer, commit transitionCommit) error {
@@ -784,8 +982,12 @@ func (s *TypedRunStore) validateRepairCommit(runID string, pointer runPointer, c
 	if *commit.PreviousEventDigest != quarantine.EventDigest || *commit.PreviousProjectionRevision != quarantine.ResultingState.ProjectionRevision {
 		return errors.New("typed repair predecessor is inconsistent")
 	}
+	quarantineEvent, err := s.loadEvent(runID, quarantine.EventDigest)
+	if err != nil {
+		return err
+	}
 	previousEvent := quarantine.ResultingState.EventDigest
-	return s.validateCommitObjects(runID, commit, eventExpectation{Sequence: 3, Type: "reconcile_required", PreviousDigest: &previousEvent})
+	return s.validateCommitObjects(runID, commit, eventExpectation{Sequence: quarantineEvent.Sequence + 1, Type: "reconcile_required", PreviousDigest: &previousEvent})
 }
 
 func (s *TypedRunStore) validateTransitionState(pointer runPointer, commit transitionCommit, status TypedRunStatus) error {
@@ -802,24 +1004,79 @@ func (s *TypedRunStore) validateTransitionState(pointer runPointer, commit trans
 	return nil
 }
 
-func (s *TypedRunStore) loadGenesisReference(runID string, reference TransitionReference) (transitionCommit, error) {
+func (s *TypedRunStore) loadVerifiedReference(runID string, reference TransitionReference) (transitionCommit, error) {
 	var commit transitionCommit
 	if err := s.readObject(runID, "transitions", reference.TransitionDigest, &commit); err != nil {
 		return transitionCommit{}, fmt.Errorf("load verified recovery base: %w", err)
 	}
-	pointer := runPointer{Schema: runPointerSchema, RunID: runID, Current: reference}
-	if err := s.validateGenesisCommit(runID, pointer, commit); err != nil {
+	pointer := runPointer{Schema: runPointerSchema, RunID: runID, RepairEpoch: commit.RepairEpoch, Current: reference}
+	if commit.ResultingState.Status == TypedRunQuarantined {
+		pointer.Previous = commit.RecoveryBase
+	} else if commit.PreviousTransitionDigest != nil && commit.PreviousGeneration != nil && commit.PreviousResultingStateDigest != nil {
+		pointer.Previous = &TransitionReference{
+			Generation: *commit.PreviousGeneration, TransitionDigest: *commit.PreviousTransitionDigest,
+			ResultingStateDigest: *commit.PreviousResultingStateDigest,
+		}
+	}
+	if err := s.validateCurrentCommit(runID, pointer, commit); err != nil {
 		return transitionCommit{}, fmt.Errorf("validate recovery base: %w", err)
 	}
 	return commit, nil
 }
 
-func validateRollbackEvidence(evidence RollbackEvidence) error {
+func (s *TypedRunStore) validateRollbackEvidence(evidence RollbackEvidence) error {
 	if !safeOpaque(evidence.ArtifactVersion) || !validDigest(evidence.ArtifactDigest) || !validDigest(evidence.FixtureDigest) ||
 		evidence.ReadableSchema != TypedRunSchema || !evidence.CreationDisabled {
 		return errors.New("typed publication requires verified creation-disabled rollback evidence")
 	}
+	if s.rollback == nil {
+		return errors.New("typed publication requires a trusted rollback verifier")
+	}
+	if err := s.rollback.VerifyRollback(evidence); err != nil {
+		return errors.New("typed publication rollback evidence is untrusted")
+	}
 	return nil
+}
+
+func packetSources(envelope packetEnvelope) ([]source, error) {
+	var sources []source
+	if err := decodeStrictJSON(envelope.Sources, &sources); err != nil || len(sources) == 0 {
+		return nil, errors.New("packet source descriptors are invalid")
+	}
+	if _, _, err := validateSources(sources); err != nil {
+		return nil, errors.New("packet source descriptors are invalid")
+	}
+	return sources, nil
+}
+
+func sourceBundleBinding(bundle SourceBundle) SourceBundleBinding {
+	return SourceBundleBinding{
+		BundleID: bundle.BundleID, DeclarationDigest: bundle.DeclarationDigest, SourceCatalogDigest: bundle.SourceCatalogDigest,
+		CallerRole: bundle.CallerRole, QueryScope: bundle.QueryScope, ContentSetDigest: bundle.ContentSetDigest,
+	}
+}
+
+func buildProjectionEntries(sources []source, observations []SourceObservation) ([]projectionEntry, error) {
+	observed := make(map[string]SourceObservation, len(observations))
+	for _, observation := range observations {
+		observed[observation.SourceID] = observation
+	}
+	entries := make([]projectionEntry, 0, len(sources))
+	for _, declared := range sources {
+		observation, ok := observed[declared.ID]
+		if !ok || observation.Quality != QualityVerified || !sourceMatchesDeclaration(declared, observation) {
+			return nil, errors.New("compiled projection source is not verified")
+		}
+		revision := observation.Revision
+		if declared.ObservationPolicy != "" {
+			revision = observation.ObservedAt
+		}
+		entries = append(entries, projectionEntry{
+			Role: declared.Role, SourceLabel: declared.ID, SourceID: declared.ID, Locator: declared.Locator, Revision: revision,
+			Reason: declared.Reason, Exposure: "bound", ObservationDigest: observation.EnvelopeDigest,
+		})
+	}
+	return entries, nil
 }
 
 func validateProjectionEntries(entries []projectionEntry, observations []string) error {
@@ -830,7 +1087,7 @@ func validateProjectionEntries(entries []projectionEntry, observations []string)
 	seenSources := make(map[string]bool, len(entries))
 	seenObservations := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		if !validSlug(entry.Role) || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
+		if !validSlug(entry.Role) || !validSlug(entry.SourceLabel) || entry.SourceLabel != entry.SourceID || !validSlug(entry.SourceID) || seenSources[entry.SourceID] || !safeOpaque(entry.Locator) ||
 			!safeOpaque(entry.Revision) || secretLike(entry.Locator) || secretLike(entry.Revision) || secretLike(entry.Reason) ||
 			entry.Reason == "" || len(entry.Reason) > 512 || hasControl(entry.Reason) || entry.Exposure != "bound" || !allowed[entry.ObservationDigest] {
 			return errors.New("typed projection entry is unsafe or unbound")
@@ -844,17 +1101,32 @@ func validateProjectionEntries(entries []projectionEntry, observations []string)
 	return nil
 }
 
-func validateTypedObjectSizes(values ...any) error {
-	for _, value := range values {
-		raw, err := canonicalJSON(value)
-		if err != nil {
-			return err
-		}
-		if len(raw) > maxTypedObjectSize {
-			return errors.New("typed state object exceeds its size limit")
-		}
+func validateTypedObjectSize(kind string, value any) error {
+	raw, err := canonicalJSON(value)
+	if err != nil {
+		return err
+	}
+	limit, err := typedObjectLimit(kind)
+	if err != nil {
+		return err
+	}
+	if len(raw) > limit {
+		return errors.New("typed state object exceeds its size limit")
 	}
 	return nil
+}
+
+func typedObjectLimit(kind string) (int, error) {
+	switch kind {
+	case "events":
+		return maxEventObjectSize, nil
+	case "observations":
+		return maxObservationObjectSize, nil
+	case "packets", "projections", "transitions", "pointer":
+		return maxTypedObjectSize, nil
+	default:
+		return 0, errors.New("typed object kind is invalid")
+	}
 }
 
 func validatePacketEnvelope(raw []byte) (packetEnvelope, error) {
@@ -916,6 +1188,12 @@ func rawValueMatches(raw []byte, value any) bool {
 	}
 	right, err := canonicalJSON(parsed)
 	return err == nil && bytes.Equal(left, right)
+}
+
+func canonicalEqual(left, right any) bool {
+	leftRaw, leftErr := canonicalJSON(left)
+	rightRaw, rightErr := canonicalJSON(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
 }
 
 func validateDurableValue(value any) error {
@@ -1071,7 +1349,11 @@ func (s *TypedRunStore) writeImmutable(runID, kind, digest string, value any) er
 	if err != nil {
 		return err
 	}
-	return createJSONFileWithHooks(path, value, nil,
+	limit, err := typedObjectLimit(kind)
+	if err != nil {
+		return err
+	}
+	return createJSONFileWithHooks(path, value, limit, nil,
 		func() error { return s.hit(published) },
 		func() error { return s.hit(synced) })
 }
@@ -1093,12 +1375,12 @@ func objectBoundaries(kind string) (PublicationBoundary, PublicationBoundary, er
 	}
 }
 
-func createJSONFileWithHooks(path string, value any, beforePublish, afterPublish, afterSync func() error) error {
+func createJSONFileWithHooks(path string, value any, limit int, beforePublish, afterPublish, afterSync func() error) error {
 	raw, err := canonicalJSON(value)
 	if err != nil {
 		return err
 	}
-	if len(raw) > maxTypedObjectSize {
+	if len(raw) > limit {
 		return errors.New("typed state object exceeds its size limit")
 	}
 	if existing, err := readBoundedRegular(path); err == nil {
@@ -1305,23 +1587,27 @@ func (s *TypedRunStore) acquireWriterLock(runID string) (func(), error) {
 }
 
 func readBoundedRegular(path string) ([]byte, error) {
-	first, err := readBoundedRegularOnce(path)
+	return readBoundedRegularLimit(path, maxTypedObjectSize)
+}
+
+func readBoundedRegularLimit(path string, limit int) ([]byte, error) {
+	first, err := readBoundedRegularOnce(path, limit)
 	if err != nil {
 		return nil, err
 	}
-	second, err := readBoundedRegularOnce(path)
+	second, err := readBoundedRegularOnce(path, limit)
 	if err != nil || !bytes.Equal(first, second) {
 		return nil, errors.New("typed state object changed while reading")
 	}
 	return first, nil
 }
 
-func readBoundedRegularOnce(path string) ([]byte, error) {
+func readBoundedRegularOnce(path string, limit int) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > maxTypedObjectSize {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > int64(limit) {
 		return nil, errors.New("typed state object is not a bounded restrictive regular file")
 	}
 	file, err := os.Open(path)
@@ -1333,8 +1619,8 @@ func readBoundedRegularOnce(path string) ([]byte, error) {
 	if err != nil || !os.SameFile(info, opened) {
 		return nil, errors.New("typed state object changed while opening")
 	}
-	raw, err := io.ReadAll(io.LimitReader(file, maxTypedObjectSize+1))
-	if err != nil || len(raw) > maxTypedObjectSize {
+	raw, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil || len(raw) > limit {
 		return nil, errors.New("typed state object exceeded its size limit")
 	}
 	after, err := os.Lstat(path)
@@ -1348,7 +1634,15 @@ func (s *TypedRunStore) readObject(runID, kind, digest string, destination any) 
 	if !validDigest(digest) {
 		return errors.New("typed object digest is invalid")
 	}
-	return readStrictJSON(filepath.Join(s.runDir(runID), "objects", kind, digest+".json"), destination)
+	limit, err := typedObjectLimit(kind)
+	if err != nil {
+		return err
+	}
+	raw, err := readBoundedRegularLimit(filepath.Join(s.runDir(runID), "objects", kind, digest+".json"), limit)
+	if err != nil {
+		return err
+	}
+	return decodeStrictJSON(raw, destination)
 }
 
 func syncTypedDirectory(path string) error {

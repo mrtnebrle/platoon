@@ -93,7 +93,9 @@ validates only; command-driven typed packet and run publication remains
 disabled. An internal Mission Control fixture seam exercises the next storage
 substrate without invoking dagr, Sergeant, or another effect. It accepts only a
 ready in-process compiled packet with verified observations and pinned
-creation-disabled rollback evidence; it is not a public creation API.
+creation-disabled rollback evidence accepted by an injected trust verifier; it
+is not a public creation API. The same fixture seam can publish an effect-disabled
+successor only from the full current fence.
 
 Ready declarations explicitly allow the required Dagr, Sergeant, and validation
 effects within their class ceiling and provide exact actor/source authority
@@ -219,13 +221,18 @@ verified transition. The pointer retains current and previous transition
 references and fences mutation by repair epoch, generation, and transition
 digest. Partial objects, exact unreferenced forks, and commits left before a
 pointer replacement are ignored; exact-byte retries re-sync and converge.
+Projection entries are derived from packet source descriptors, and loading
+recomputes the exact source-bundle identity from persisted observation
+envelopes before accepting packet, projection, or event bindings. Events are
+capped at 64 KiB and complete observation objects at 1 MiB.
 
 If a pointer names an invalid current transition but a verified previous
 transition, recovery first publishes a no-effect quarantine at `N+1` and
 `E+1`, then a no-effect `reconcile_required` successor at `N+2`. It never adopts
 the invalid state or chooses an orphan descendant. Publication is refused
-before creating run files unless rollback metadata pins a creation-disabled
-artifact and its synthetic compatibility-fixture digest for the typed schema.
+before creating run files unless a trusted verifier recognizes rollback metadata
+that pins a creation-disabled artifact and its synthetic compatibility-fixture
+digest for the typed schema.
 
 ## Safety
 
