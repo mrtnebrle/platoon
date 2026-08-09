@@ -148,6 +148,19 @@ func TestMissionSourcesRejectDagrExecutableChangeDuringCapabilityQuery(t *testin
 	}
 }
 
+func TestDagrCapabilityReceiptRejectsDuplicateAndTrailingJSON(t *testing.T) {
+	for name, raw := range map[string]string{
+		"duplicate": `{"schema":"wrong","schema":"platoon.dagr-capability/v1","operations":["ack","list","load","start","watch"]}`,
+		"trailing":  dagrCapabilityHelp + ` {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if dagrReceiptProvesOperations([]byte(raw)) {
+				t.Fatalf("accepted %s capability receipt", name)
+			}
+		})
+	}
+}
+
 type sourceExecutor func(context.Context, Invocation) (Result, error)
 
 func (run sourceExecutor) Run(ctx context.Context, invocation Invocation) (Result, error) {

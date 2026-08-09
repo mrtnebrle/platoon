@@ -143,17 +143,41 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 
 func dagrReceiptProvesOperations(raw []byte) bool {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	var receipt struct {
-		Schema     string   `json:"schema"`
-		Operations []string `json:"operations"`
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
 	}
-	if err := decoder.Decode(&receipt); err != nil || receipt.Schema != "platoon.dagr-capability/v1" || len(receipt.Operations) != 5 {
+	seen := map[string]bool{}
+	var schema string
+	var operations []string
+	for decoder.More() {
+		key, err := decoder.Token()
+		name, ok := key.(string)
+		if err != nil || !ok || seen[name] || (name != "schema" && name != "operations") {
+			return false
+		}
+		seen[name] = true
+		switch name {
+		case "schema":
+			err = decoder.Decode(&schema)
+		case "operations":
+			err = decoder.Decode(&operations)
+		}
+		if err != nil {
+			return false
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || schema != "platoon.dagr-capability/v1" || len(operations) != 5 {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return false
 	}
 	want := []string{"ack", "list", "load", "start", "watch"}
 	for index := range want {
-		if receipt.Operations[index] != want[index] {
+		if operations[index] != want[index] {
 			return false
 		}
 	}
