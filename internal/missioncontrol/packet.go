@@ -24,6 +24,7 @@ type PacketPreview struct {
 	IntentMediaType         string `json:"intentMediaType"`
 	BundleID                string `json:"bundleId"`
 	ContentSetDigest        string `json:"contentSetDigest"`
+	compiled                *compiledPacket
 }
 
 func CompileWithBundle(m *manifest.Manifest, manifestFile string, bundleBytes []byte, evaluatedAt time.Time) (Preview, error) {
@@ -168,10 +169,22 @@ func compilePacket(m *manifest.Manifest, declarationBytes []byte, d *declaration
 	envelope := map[string]any{
 		"schema": PacketSchema, "manifest": manifestValue, "declaration": declarationValue,
 		"manifestDigest": manifestDigest, "declarationDigest": declarationDigest,
+		"manifestSourceDigest": packet.ManifestSourceDigest, "declarationSourceDigest": packet.DeclarationSourceDigest,
 		"intentRevision": packet.IntentRevision, "intentMediaType": packet.IntentMediaType,
 		"handoffs": spec["handoffs"], "sources": spec["sources"], "bundleId": packet.BundleID, "contentSetDigest": packet.ContentSetDigest,
 	}
 	packet.ID, err = canonicalDigest(PacketSchema, envelope)
+	if err == nil {
+		encoded, encodeErr := canonicalJSON(envelope)
+		if encodeErr != nil {
+			return PacketPreview{}, encodeErr
+		}
+		packet.compiled = &compiledPacket{
+			Envelope:     encoded,
+			Sources:      append([]source(nil), d.Spec.Sources...),
+			Observations: append([]SourceObservation(nil), bundle.Observations...),
+		}
+	}
 	return packet, err
 }
 

@@ -53,6 +53,48 @@ func TestCompileWithBundleProducesDeterministicPacketAndConsumesNoSources(t *tes
 	}
 }
 
+func TestPacketIdentityBindsExactManifestAndDeclarationSourceBytes(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "examples", "platoon-typed.yaml")
+	m, err := manifest.LoadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declarationPath := filepath.Join(filepath.Dir(manifestPath), filepath.FromSlash(m.Spec.Mission))
+	declarationBytes, err := os.ReadFile(declarationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := decode(declarationBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentBytes, err := os.ReadFile(filepath.Join(filepath.Dir(manifestPath), filepath.FromSlash(m.Spec.Intent)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := bundleForManifest(t, m, manifestPath, "2026-08-08T10:00:00Z")
+
+	first, err := compilePacket(m, declarationBytes, d, manifestBytes, intentBytes, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := compilePacket(m, append(append([]byte(nil), declarationBytes...), '\n'), d, manifestBytes, intentBytes, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := compilePacket(m, declarationBytes, d, append(append([]byte(nil), manifestBytes...), '\n'), intentBytes, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID || first.ID == third.ID {
+		t.Fatalf("exact source-byte change did not change packet identity: %s %s %s", first.ID, second.ID, third.ID)
+	}
+}
+
 func TestCompileWithBundleReturnsNotReadyForMismatchedOrInconclusiveSource(t *testing.T) {
 	manifestPath := filepath.Join("..", "..", "examples", "platoon-typed.yaml")
 	m, err := manifest.LoadFile(manifestPath)

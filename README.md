@@ -89,7 +89,11 @@ bodies or resolved private paths. Typed applied start requires
 any state or effect. It returns `replan_required` when schema, revision, quality,
 content identity, or freshness differs. Matching content observed later is
 accepted because `observedAt` is provenance rather than content. This phase
-validates only; durable typed packet and run publication remains disabled.
+validates only; command-driven typed packet and run publication remains
+disabled. An internal Mission Control fixture seam exercises the next storage
+substrate without invoking dagr, Sergeant, or another effect. It accepts only a
+ready in-process compiled packet with verified observations and pinned
+creation-disabled rollback evidence; it is not a public creation API.
 
 Ready declarations explicitly allow the required Dagr, Sergeant, and validation
 effects within their class ceiling and provide exact actor/source authority
@@ -206,6 +210,22 @@ Run states are `initialized`, `active`, `drained`, `reconcile_required`,
 `completed`, and `failed`. Terminal runs cannot resume. See
 [architecture](docs/architecture.md) and [operations](docs/operations.md) for
 the complete stage, reservation, lease, and recovery model.
+
+Typed fixture state is separate from legacy `platoon.state/v1alpha1`. Packet,
+observation, projection-revision-zero, event, and transition objects are
+canonical, digest-addressed, restrictive files under one typed run directory.
+They are non-authoritative until `current.json` atomically names a fully
+verified transition. The pointer retains current and previous transition
+references and fences mutation by repair epoch, generation, and transition
+digest. Partial objects, exact unreferenced forks, and commits left before a
+pointer replacement are ignored; exact-byte retries re-sync and converge.
+
+If a pointer names an invalid current transition but a verified previous
+transition, recovery first publishes a no-effect quarantine at `N+1` and
+`E+1`, then a no-effect `reconcile_required` successor at `N+2`. It never adopts
+the invalid state or chooses an orphan descendant. Publication is refused
+before creating run files unless rollback metadata pins a creation-disabled
+artifact and its synthetic compatibility-fixture digest for the typed schema.
 
 ## Safety
 
