@@ -76,12 +76,22 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 			return unavailableObservation(base), nil
 		}
 		base.AdapterVersion = "dagr-" + executable.digest[:16]
-		help, err := s.executor.Run(ctx, Invocation{
-			Executable: executable.path, Args: []string{"capabilities", "--format", "platoon.dagr-capability/v1"},
-			Timeout: s.manifest.Spec.Limits.CommandDuration(), MaxOutput: 64 << 10,
-		})
-		if err != nil || len(help.Stderr) != 0 || !dagrReceiptProvesOperations(help.Stdout) || !executable.unchanged() {
-			return unavailableObservation(base), nil
+		requiredCommands := []struct {
+			group    string
+			required []string
+		}{
+			{group: "workflow", required: []string{"load"}},
+			{group: "stage", required: []string{"list"}},
+			{group: "run", required: []string{"start", "step-done", "step-fail", "watch"}},
+		}
+		for _, capability := range requiredCommands {
+			help, err := s.executor.Run(ctx, Invocation{
+				Executable: executable.path, Args: []string{capability.group, "--help"},
+				Timeout: s.manifest.Spec.Limits.CommandDuration(), MaxOutput: 64 << 10,
+			})
+			if err != nil || len(help.Stderr) != 0 || !dagrHelpProvesCommands(help.Stdout, capability.group, capability.required) || !executable.unchanged() {
+				return unavailableObservation(base), nil
+			}
 		}
 		info, err := os.Lstat(s.manifest.Spec.Adapters.Dagr.Database)
 		if err != nil || !info.Mode().IsRegular() {
@@ -141,43 +151,28 @@ func (s *MissionSources) Query(ctx context.Context, query missioncontrol.SourceQ
 	return base, nil
 }
 
-func dagrReceiptProvesOperations(raw []byte) bool {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	opening, err := decoder.Token()
-	if err != nil || opening != json.Delim('{') {
+func dagrHelpProvesCommands(raw []byte, group string, required []string) bool {
+	if !bytes.Contains(raw, []byte("Usage:\n  dagr "+group+" [command]\n")) {
 		return false
 	}
-	seen := map[string]bool{}
-	var schema string
-	var operations []string
-	for decoder.More() {
-		key, err := decoder.Token()
-		name, ok := key.(string)
-		if err != nil || !ok || seen[name] || (name != "schema" && name != "operations") {
+	text := string(raw)
+	start := strings.Index(text, "Available Commands:\n")
+	if start < 0 {
+		return false
+	}
+	commands := map[string]bool{}
+	for _, line := range strings.Split(text[start+len("Available Commands:\n"):], "\n") {
+		if line == "" {
+			break
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || commands[fields[0]] {
 			return false
 		}
-		seen[name] = true
-		switch name {
-		case "schema":
-			err = decoder.Decode(&schema)
-		case "operations":
-			err = decoder.Decode(&operations)
-		}
-		if err != nil {
-			return false
-		}
+		commands[fields[0]] = true
 	}
-	closing, err := decoder.Token()
-	if err != nil || closing != json.Delim('}') || schema != "platoon.dagr-capability/v1" || len(operations) != 5 {
-		return false
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return false
-	}
-	want := []string{"ack", "list", "load", "start", "watch"}
-	for index := range want {
-		if operations[index] != want[index] {
+	for _, command := range required {
+		if !commands[command] {
 			return false
 		}
 	}

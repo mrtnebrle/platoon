@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,7 +28,10 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: dagrExecutable, Database: database, InspectExecutable: "sqlite3"}},
 		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: t.TempDir()}},
 	}}
-	executor := &sequenceExecutor{results: []Result{{Stdout: []byte(revision + "\n")}, {Stdout: []byte(dagrCapabilityHelp)}, {Stdout: []byte("1\n")}}}
+	executor := &sequenceExecutor{results: []Result{
+		{Stdout: []byte(revision + "\n")}, {Stdout: []byte(dagrWorkflowHelp)}, {Stdout: []byte(dagrStageHelp)},
+		{Stdout: []byte(dagrRunHelp)}, {Stdout: []byte("1\n")},
+	}}
 	now := func() time.Time { return time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC) }
 	sources := &MissionSources{manifest: m, executor: executor, now: now}
 
@@ -49,7 +53,7 @@ func TestMissionSourcesObserveLocalGitAndDagrCapabilities(t *testing.T) {
 	if err != nil || policyObservation.Quality != missioncontrol.QualityVerified || len(policyObservation.Payload["policyDigest"].(string)) != 64 {
 		t.Fatalf("policy observation=%#v err=%v", policyObservation, err)
 	}
-	if len(executor.invocations) != 3 {
+	if len(executor.invocations) != 5 {
 		t.Fatalf("read-only adapter invocations=%#v", executor.invocations)
 	}
 }
@@ -69,7 +73,10 @@ func TestMissionSourcesDeriveMutableNativeRevisions(t *testing.T) {
 		Adapters:     manifest.Adapters{Dagr: manifest.DagrAdapter{Executable: executable, Database: database, InspectExecutable: "sqlite3"}},
 		Repositories: []manifest.Repository{{ID: "synthetic-repository", Path: dir}},
 	}}
-	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{results: []Result{{Stdout: []byte(objectID + "\n")}, {Stdout: []byte(dagrCapabilityHelp)}, {Stdout: []byte("2\n")}}}}
+	sources := &MissionSources{manifest: m, executor: &sequenceExecutor{results: []Result{
+		{Stdout: []byte(objectID + "\n")}, {Stdout: []byte(dagrWorkflowHelp)}, {Stdout: []byte(dagrStageHelp)},
+		{Stdout: []byte(dagrRunHelp)}, {Stdout: []byte("2\n")},
+	}}}
 	queries := []missioncontrol.SourceQuery{
 		{SourceID: "git-source", Kind: "git", Schema: "git.object/v1", Locator: "synthetic-repository"},
 		{SourceID: "dagr-source", Kind: "dagr", Schema: "dagr.capability/v1", Locator: "synthetic-dagr"},
@@ -95,8 +102,8 @@ func TestMissionSourcesRejectDagrDatabaseChangeDuringInspection(t *testing.T) {
 	calls := 0
 	executor := sourceExecutor(func(_ context.Context, _ Invocation) (Result, error) {
 		calls++
-		if calls == 1 {
-			return Result{Stdout: []byte(dagrCapabilityHelp)}, nil
+		if calls <= 3 {
+			return Result{Stdout: []byte([]string{dagrWorkflowHelp, dagrStageHelp, dagrRunHelp}[calls-1])}, nil
 		}
 		replacement := filepath.Join(dir, "replacement.db")
 		if err := os.WriteFile(replacement, []byte("second"), 0o600); err != nil {
@@ -133,7 +140,7 @@ func TestMissionSourcesRejectDagrExecutableChangeDuringCapabilityQuery(t *testin
 		if err := os.WriteFile(executable, []byte("second executable"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		return Result{Stdout: []byte(dagrCapabilityHelp)}, nil
+		return Result{Stdout: []byte(dagrWorkflowHelp)}, nil
 	})
 	m := &manifest.Manifest{Spec: manifest.Spec{
 		Limits:   manifest.Limits{CommandTimeout: "1s"},
@@ -148,16 +155,38 @@ func TestMissionSourcesRejectDagrExecutableChangeDuringCapabilityQuery(t *testin
 	}
 }
 
-func TestDagrCapabilityReceiptRejectsDuplicateAndTrailingJSON(t *testing.T) {
+func TestDagrHelpRejectsMalformedCommandEvidence(t *testing.T) {
 	for name, raw := range map[string]string{
-		"duplicate": `{"schema":"wrong","schema":"platoon.dagr-capability/v1","operations":["ack","list","load","start","watch"]}`,
-		"trailing":  dagrCapabilityHelp + ` {}`,
+		"duplicate":   "Manage workflows\n\nUsage:\n  dagr workflow [command]\n\nAvailable Commands:\n  load first\n  load second\n\n",
+		"wrong usage": strings.Replace(dagrWorkflowHelp, "dagr workflow", "dagr wrong", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if dagrReceiptProvesOperations([]byte(raw)) {
-				t.Fatalf("accepted %s capability receipt", name)
+			if dagrHelpProvesCommands([]byte(raw), "workflow", []string{"load"}) {
+				t.Fatalf("accepted %s capability help", name)
 			}
 		})
+	}
+}
+
+func TestInstalledDagrHelpMatchesCapabilityContract(t *testing.T) {
+	executable, err := exec.LookPath("dagr")
+	if err != nil {
+		t.Skip("dagr is not installed")
+	}
+	for _, check := range []struct {
+		group    string
+		required []string
+	}{
+		{group: "workflow", required: []string{"load"}},
+		{group: "stage", required: []string{"list"}},
+		{group: "run", required: []string{"start", "step-done", "step-fail", "watch"}},
+	} {
+		result, err := (OSExecutor{}).Run(context.Background(), Invocation{
+			Executable: executable, Args: []string{check.group, "--help"}, Timeout: time.Second, MaxOutput: 64 << 10,
+		})
+		if err != nil || !dagrHelpProvesCommands(result.Stdout, check.group, check.required) {
+			t.Fatalf("installed dagr %s capability error=%v output=%q", check.group, err, result.Stdout)
+		}
 	}
 }
 
@@ -167,4 +196,8 @@ func (run sourceExecutor) Run(ctx context.Context, invocation Invocation) (Resul
 	return run(ctx, invocation)
 }
 
-const dagrCapabilityHelp = `{"schema":"platoon.dagr-capability/v1","operations":["ack","list","load","start","watch"]}`
+const (
+	dagrWorkflowHelp = "Manage workflows\n\nUsage:\n  dagr workflow [command]\n\nAvailable Commands:\n  load        Load a workflow\n\nFlags:\n"
+	dagrStageHelp    = "Manage stages\n\nUsage:\n  dagr stage [command]\n\nAvailable Commands:\n  list        List stages\n\nFlags:\n"
+	dagrRunHelp      = "Manage runs\n\nUsage:\n  dagr run [command]\n\nAvailable Commands:\n  start       Start run\n  step-done   Complete step\n  step-fail   Fail step\n  watch       Watch run\n\nFlags:\n"
+)
